@@ -584,7 +584,7 @@ def run_training(
     
     if epochs_per_stage > 0:
         print("\n  Evaluating generation after Stage 3.5...")
-        gen_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=5)
+        gen_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=5, decoder_tokenizer=decoder_tokenizer)
         print_generation_results(gen_results, num_to_print=3)
         
         metrics = compute_aggregate_metrics(gen_results)
@@ -637,7 +637,7 @@ def run_training(
         # Periodic evaluation
         if (epoch + 1) % eval_every_n_epochs == 0 or (epoch + 1) == epochs_per_stage:
             print(f"\n  Evaluating generation after epoch {epoch+1}...")
-            gen_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=5)
+            gen_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=5, decoder_tokenizer=decoder_tokenizer)
             print_generation_results(gen_results, num_to_print=3)
             
             metrics = compute_aggregate_metrics(gen_results)
@@ -652,7 +652,7 @@ def run_training(
     print("\n" + "=" * 60)
     print("Final Generation Evaluation")
     print("=" * 60)
-    final_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=10)
+    final_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=10, decoder_tokenizer=decoder_tokenizer)
     print_generation_results(final_results, num_to_print=5)
     
     # Log final metrics
@@ -860,6 +860,14 @@ def main():
         "Did the teacher teach the students?"
     ]
     
+    # Load decoder tokenizer for generation if using pretrained decoder
+    decoder_tokenizer = None
+    if trained_model.use_pretrained_decoder:
+        decoder_model_name = trained_model.decoder.pretrained_model.config.name_or_path
+        decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_model_name)
+        if decoder_tokenizer.pad_token is None:
+            decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+    
     for test_input in test_inputs:
         generated = generate_response(
             trained_model,
@@ -867,7 +875,8 @@ def main():
             test_input,
             device=device,
             max_length=128,
-            do_sample=False
+            do_sample=False,
+            decoder_tokenizer=decoder_tokenizer
         )
         print(f"\nInput:     {test_input}")
         print(f"Generated: {generated}")

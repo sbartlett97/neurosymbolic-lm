@@ -294,6 +294,14 @@ class Stage3_Decoder_Trainer(BaseTrainer):
         if "decoder_input_ids" not in batch:
             return 0.0
         
+        labels = batch["decoder_labels"]
+        
+        # Check if there are any valid labels (not all -100)
+        valid_labels = (labels != -100).sum()
+        if valid_labels == 0:
+            # No valid labels to train on, skip this batch
+            return 0.0
+        
         with self._get_amp_context():
             out = self.model(
                 batch["input_ids"],
@@ -303,16 +311,25 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             )
             
             logits = out["logits"]
-            labels = batch["decoder_labels"]
             
             # Shift for next-token prediction
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             
+            # Double-check after shift
+            valid_after_shift = (shift_labels != -100).sum()
+            if valid_after_shift == 0:
+                return 0.0
+            
             decoder_loss = self.ce(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1)
             )
+            
+            # Check for NaN and skip if necessary
+            if torch.isnan(decoder_loss) or torch.isinf(decoder_loss):
+                print(f"Warning: NaN/Inf loss detected, skipping batch")
+                return 0.0
         
         self._backward_and_step(decoder_loss)
         return decoder_loss.item()
