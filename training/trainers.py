@@ -301,18 +301,28 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             return 0.0
         
         labels = batch["decoder_labels"]
+        decoder_input_ids = batch["decoder_input_ids"]
         
         # Check if there are any valid labels (not all -100)
         valid_labels = (labels != -100).sum()
         if valid_labels == 0:
             return 0.0
         
+        # Debug: Check for out-of-vocab tokens
+        vocab_size = self.model.decoder.vocab_size if hasattr(self.model.decoder, 'vocab_size') else None
+        if vocab_size is not None:
+            max_input_id = decoder_input_ids.max().item()
+            max_label_id = labels[labels != -100].max().item() if (labels != -100).any() else -1
+            if max_input_id >= vocab_size or max_label_id >= vocab_size:
+                print(f"WARNING: Token ID out of vocab! max_input={max_input_id}, max_label={max_label_id}, vocab_size={vocab_size}")
+                return 0.0
+        
         with self._get_amp_context():
             out = self.model(
                 batch["input_ids"],
                 batch["attention_mask"],
                 spans=None,
-                y_ids=batch["decoder_input_ids"]
+                y_ids=decoder_input_ids
             )
             
             logits = out["logits"]
@@ -328,7 +338,10 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             
             # Check for NaN and skip if necessary
             if torch.isnan(decoder_loss) or torch.isinf(decoder_loss):
-                print(f"Warning: NaN/Inf loss detected, skipping batch")
+                print(f"Warning: NaN/Inf loss detected")
+                print(f"  logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+                print(f"  logits has nan: {torch.isnan(logits).any()}, has inf: {torch.isinf(logits).any()}")
+                print(f"  valid labels: {valid_labels}, labels range: [{labels[labels != -100].min().item()}, {labels[labels != -100].max().item()}]")
                 return 0.0
         
         self._backward_and_step(decoder_loss)
