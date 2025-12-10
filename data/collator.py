@@ -216,6 +216,10 @@ class CognitiveCollator:
         For T5:
         - decoder_input_ids should start with pad_token_id (decoder_start_token_id)
         - labels are the actual target tokens
+        
+        For samples with should_respond=0:
+        - decoder_input_ids: [start_token]
+        - labels: [eos_token] - teaches model to output EOS immediately (stay silent)
         """
         responses = []
         should_respond_mask = []
@@ -225,9 +229,25 @@ class CognitiveCollator:
                 responses.append(x["response"])
                 should_respond_mask.append(True)
             else:
-                # For non-response samples, use a minimal placeholder
+                # For non-response samples, we'll override with EOS-only target later
                 responses.append("")
                 should_respond_mask.append(False)
+        
+        # Get special token IDs
+        decoder_start_token_id = getattr(
+            self.decoder_tokenizer, 'decoder_start_token_id', 
+            self.decoder_tokenizer.pad_token_id
+        )
+        if decoder_start_token_id is None:
+            decoder_start_token_id = 0
+        
+        eos_token_id = self._get_eos_token_id()
+        if eos_token_id is None:
+            eos_token_id = 1  # Default for T5
+        
+        pad_token_id = self.decoder_tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
         
         # Use decoder_tokenizer for response tokenization
         resp_tok = self.decoder_tokenizer(
@@ -242,15 +262,6 @@ class CognitiveCollator:
         # Labels are the tokenized responses
         decoder_labels = resp_tok["input_ids"].clone()
         
-        # For T5-style models, decoder_input_ids should be shifted right
-        # with decoder_start_token_id (usually pad_token_id) prepended
-        decoder_start_token_id = getattr(
-            self.decoder_tokenizer, 'decoder_start_token_id', 
-            self.decoder_tokenizer.pad_token_id
-        )
-        if decoder_start_token_id is None:
-            decoder_start_token_id = 0
-        
         # Create decoder_input_ids by shifting right and prepending start token
         batch_size, seq_len = decoder_labels.shape
         decoder_input_ids = torch.zeros_like(decoder_labels)
@@ -258,14 +269,19 @@ class CognitiveCollator:
         decoder_input_ids[:, 1:] = decoder_labels[:, :-1]
         
         # Set padding tokens to -100 in labels (ignore in loss)
-        pad_token_id = self.decoder_tokenizer.pad_token_id
         if pad_token_id is not None:
             decoder_labels[decoder_labels == pad_token_id] = -100
         
-        # Handle non-response samples - set all labels to -100
+        # Handle non-response samples: teach model to output EOS immediately
         for i, should_respond in enumerate(should_respond_mask):
             if not should_respond:
+                # decoder_input_ids: [start_token, pad, pad, ...]
+                decoder_input_ids[i] = pad_token_id
+                decoder_input_ids[i, 0] = decoder_start_token_id
+                
+                # labels: [eos_token, -100, -100, ...] - only predict EOS
                 decoder_labels[i] = -100
+                decoder_labels[i, 0] = eos_token_id
         
         return decoder_input_ids, decoder_labels
     
