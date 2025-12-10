@@ -3,3 +3,4 @@ torchvision
 numpy
 transformers
 networkx
+tensorboard  # Optional: for training visualization

@@ -1,6 +1,7 @@
 """Training utilities and stage trainers."""
 
 from .trainers import (
+    BaseTrainer,
     Stage1_MLM_Trainer,
     Stage2_Symbolic_Trainer,
     Stage3_Control_Trainer,
@@ -17,11 +18,16 @@ from .evaluation import (
     evaluate_generation,
     print_generation_results,
     generate_response,
+    compute_bleu_score,
+    compute_entity_f1,
+    compute_aggregate_metrics,
+    extract_entities_from_text,
 )
 from .kg_loader import load_kg_data_for_training
 
 __all__ = [
     # Trainers
+    "BaseTrainer",
     "Stage1_MLM_Trainer",
     "Stage2_Symbolic_Trainer",
     "Stage3_Control_Trainer",
@@ -36,6 +42,10 @@ __all__ = [
     "evaluate_generation",
     "print_generation_results",
     "generate_response",
+    "compute_bleu_score",
+    "compute_entity_f1",
+    "compute_aggregate_metrics",
+    "extract_entities_from_text",
     # KG
     "load_kg_data_for_training",
 ]

@@ -12,10 +12,11 @@ class ModelConfig:
     d_model: int = 768  # BERT-base hidden size
     n_entity_types: int = 8
     n_relations: int = 32
-    n_concepts: int = 512
+    n_concepts: int = 512  # Can be set dynamically based on dataset
     concept_dim: int = 256
     node_dim: int = 256
     max_nodes: int = 16
+    dropout: float = 0.1
     
     # Encoder settings
     use_pretrained_encoder: bool = True
@@ -63,6 +64,30 @@ class TrainingConfig:
     soft_logic_weight: float = 0.1
     skip_stage1_if_pretrained: bool = True
     
+    # Gradient clipping
+    grad_clip_norm: float = 1.0
+    
+    # Mixed precision
+    use_amp: bool = False
+    
+    # Learning rate scheduling
+    use_scheduler: bool = True
+    warmup_epochs: int = 2
+    
+    # Checkpointing
+    checkpoint_dir: Optional[str] = "checkpoints"
+    max_checkpoints: int = 3
+    save_best_only: bool = True
+    
+    # Early stopping
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.0
+    
+    # Logging
+    enable_tensorboard: bool = True
+    log_dir: str = "runs"
+    eval_every_n_epochs: int = 5
+    
     # Dataset
     dataset_file_path: Optional[str] = None
     
@@ -104,3 +129,14 @@ class SoftLogicConfig:
             }
             for r in self.rules
         ]
+
+
+@dataclass
+class EvaluationConfig:
+    """Configuration for evaluation."""
+    
+    num_eval_samples: int = 10
+    max_generation_length: int = 128
+    compute_bleu: bool = True
+    compute_entity_f1: bool = True
+    bleu_max_n: int = 4
