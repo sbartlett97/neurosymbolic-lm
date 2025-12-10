@@ -31,13 +31,13 @@ class BaseTrainer:
         self.use_amp = use_amp and torch.cuda.is_available()
         self.device = device
         
-        # Mixed precision scaler
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        # Mixed precision scaler (using updated API)
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
     
     def _get_amp_context(self):
         """Get appropriate autocast context for mixed precision."""
         if self.use_amp:
-            return torch.cuda.amp.autocast()
+            return torch.amp.autocast('cuda')
         return nullcontext()
     
     def _backward_and_step(self, loss: torch.Tensor):

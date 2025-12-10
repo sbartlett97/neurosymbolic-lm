@@ -46,7 +46,8 @@ class MultiQueryPool(nn.Module):
         scores = torch.matmul(Q, K.transpose(-1, -2)) / (H ** 0.5)  # (B, k, L)
         
         if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e9)
+            # Use -1e4 instead of -1e9 for float16 compatibility (max ~65504)
+            scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e4)
         
         attn = F.softmax(scores, dim=-1)
         pooled = torch.matmul(attn, V)  # (B, k, H)
