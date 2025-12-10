@@ -207,38 +207,59 @@ The training is organized into 4 main stages plus an intermediate stage:
 
 ```
 neurosymbolic_model/
-  model.py              # Complete model architecture (NeuroSymbolicLM)
-  main.py               # Training pipeline, dataset, and utilities
-  comprehensive_dataset.jsonl  # Extended dataset examples
-  requirements.txt      # Python dependencies
-  README.md            # This file
+  config.py                     # Configuration dataclasses
+  train.py                      # Main training entry point
+  kg_utils.py                   # Knowledge graph utilities
+  comprehensive_dataset.jsonl   # Extended dataset examples
+  requirements.txt              # Python dependencies
+  README.md                     # This file
+  
+  data/                         # Data handling modules
+    __init__.py
+    dataset.py                  # ToyCognitiveDataset class
+    collator.py                 # CognitiveCollator for batching
+    
+  model/                        # Model architecture modules
+    __init__.py
+    encoders.py                 # Encoder implementations
+    decoders.py                 # Decoder implementations
+    pooling.py                  # Pooling strategies
+    entity.py                   # Entity/concept handling
+    gnn.py                      # Graph neural networks
+    logic.py                    # Soft logic constraints
+    neurosymbolic.py            # Main NeuroSymbolicLM class
+    
+  training/                     # Training utilities
+    __init__.py
+    trainers.py                 # Stage trainers with gradient clipping
+    utils.py                    # Helper functions
+    evaluation.py               # Generation evaluation & metrics
+    kg_loader.py                # KG data loading
 ```
 
 ### 5.2 Key Classes and Functions
 
-**Model (`model.py`):**
-- `NeuroSymbolicLM`: Main model class
-- `SimpleTransformerEncoder`: Custom encoder implementation
-- `PretrainedEncoderWrapper`: Wrapper for pre-trained encoders (BERT)
-- `SimpleTransformerDecoder`: Custom decoder implementation
-- `PretrainedDecoderWrapper`: Wrapper for pre-trained decoders (T5, BART)
-- `TokenEntityClassifier`: Entity type classification head
-- `ConceptBank`: Learnable concept embeddings
-- `SimpleGNN`: Graph neural network for relation reasoning
-- `SoftLogicConstraints`: Differentiable rule enforcement
-- `Controller`: Response gating mechanism
+**Model (`model/`):**
+- `NeuroSymbolicLM`: Main model class (`neurosymbolic.py`)
+- `SimpleTransformerEncoder`, `PretrainedEncoderWrapper`: Encoder implementations (`encoders.py`)
+- `SimpleTransformerDecoder`, `PretrainedDecoderWrapper`: Decoder implementations (`decoders.py`)
+- `TokenEntityClassifier`, `ConceptBank`: Entity/concept handling (`entity.py`)
+- `SimpleGNN`, `KGAwareGNN`, `KGPathReasoner`: Graph neural networks (`gnn.py`)
+- `SoftLogicConstraints`, `Controller`: Logic and control (`logic.py`)
 
-**Training (`main.py`):**
-- `ToyCognitiveDataset`: In-memory dataset with question/statement pairs
-- `CognitiveCollator`: Batch collation with multi-label concept encoding
-- `Stage1_MLM_Trainer`: MLM pretraining
-- `Stage2_Symbolic_Trainer`: Entity and concept training
-- `Stage3_Control_Trainer`: Controller training
-- `Stage3_Decoder_Trainer`: Decoder training
-- `Stage4_Joint_Trainer`: Joint end-to-end training
-- `run_training()`: Main training orchestration function
-- `evaluate_generation()`: Generation evaluation function
-- `generate_response()`: Inference utility function
+**Data (`data/`):**
+- `ToyCognitiveDataset`: In-memory dataset with question/statement pairs (`dataset.py`)
+- `CognitiveCollator`: Batch collation with multi-label concept encoding (`collator.py`)
+
+**Training (`training/`):**
+- `Stage1_MLM_Trainer`: MLM pretraining with gradient clipping (`trainers.py`)
+- `Stage2_Symbolic_Trainer`: Entity and concept training (`trainers.py`)
+- `Stage3_Control_Trainer`: Controller training (`trainers.py`)
+- `Stage3_Decoder_Trainer`: Decoder training (`trainers.py`)
+- `Stage4_Joint_Trainer`: Joint end-to-end training (`trainers.py`)
+- `evaluate_generation()`, `compute_bleu_score()`, `compute_entity_f1()`: Evaluation functions (`evaluation.py`)
+- `generate_response()`: Inference utility (`evaluation.py`)
+- `run_training()`: Main training orchestration (`train.py`)
 
 ### 5.3 Loss Components
 
@@ -310,7 +331,7 @@ generated_ids = model.generate(
 
 **Inference Utility:**
 ```python
-from main import generate_response
+from training import generate_response
 
 response = generate_response(
     model, 
@@ -331,7 +352,7 @@ response = generate_response(
 ```python
 from transformers import AutoTokenizer
 from model import NeuroSymbolicLM
-from main import run_training
+from train import run_training
 
 # Initialize tokenizer
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -382,7 +403,7 @@ trained_model = run_training(
 ### Generation and Evaluation
 
 ```python
-from main import generate_response, evaluate_generation, print_generation_results
+from training import generate_response, evaluate_generation, print_generation_results
 
 # Generate a response
 response = generate_response(
@@ -408,7 +429,7 @@ print_generation_results(results, num_to_print=5)
 ### Running the Training Script
 
 ```bash
-python main.py
+python train.py
 ```
 
 The script will:
