@@ -3,6 +3,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
+from typing import Optional, Dict
 
 # Schema:
 # sample = {
@@ -1687,8 +1688,90 @@ class Stage4_Joint_Trainer:
         return loss.item()
 
 
+def load_kg_data_for_training(kg_embedding_path: Optional[str] = None,
+                              kg_triples_path: Optional[str] = None,
+                              entity_mapping: Optional[Dict[str, str]] = None,
+                              kg_type: str = "conceptnet"):
+    """
+    Load knowledge graph data for training.
+    
+    Args:
+        kg_embedding_path: Path to KG embeddings file
+            - ConceptNet: Path to ConceptNet Numberbatch embeddings (.txt)
+            - Wikidata: Path to Wikidata2Vec embeddings (.txt)
+            - Other: Should follow same format (entity <space-separated-vector>)
+        kg_triples_path: Path to KG triples file (for path reasoning)
+            - ConceptNet: Path to ConceptNet assertions (.jsonl)
+            - Wikidata: Path to Wikidata triples (format depends on source)
+            - Other: Should be list of (source, relation, target) tuples
+        entity_mapping: Optional manual mapping from text entities to KG entities
+        kg_type: Type of knowledge graph ("conceptnet", "wikidata", "wordnet", or "generic")
+    
+    Returns:
+        Tuple of (kg_loader, entity_linker, kg_graph) or (None, None, None) if KG unavailable
+    """
+    try:
+        from kg_utils import KGEmbeddingLoader, EntityLinker, KGGraph, load_conceptnet_triples
+    except ImportError:
+        print("Warning: kg_utils not available. KG integration disabled.")
+        return None, None, None
+    
+    if kg_embedding_path is None:
+        print("No KG embedding path provided. KG integration disabled.")
+        return None, None, None
+    
+    try:
+        # Load KG embeddings
+        kg_loader = KGEmbeddingLoader(kg_type=kg_type)
+        
+        # Load embeddings based on KG type
+        if kg_type.lower() == "conceptnet":
+            kg_embed_dim = kg_loader.load_conceptnet_embeddings(kg_embedding_path)
+        elif kg_type.lower() == "wikidata":
+            kg_embed_dim = kg_loader.load_wikidata_embeddings(kg_embedding_path)
+        else:
+            # Generic format: assume same format as ConceptNet
+            kg_embed_dim = kg_loader.load_conceptnet_embeddings(kg_embedding_path)
+        
+        print(f"Loaded {kg_type} KG embeddings: {len(kg_loader.entity_embeddings)} entities, dim={kg_embed_dim}")
+        
+        # Create entity linker
+        entity_linker = EntityLinker(kg_loader, entity_mapping)
+        
+        # Load KG graph if triples path provided
+        kg_graph = None
+        if kg_triples_path is not None:
+            try:
+                if kg_type.lower() == "conceptnet":
+                    triples = load_conceptnet_triples(kg_triples_path, max_triples=50000)
+                else:
+                    # For other KG types, assume generic format or implement custom loader
+                    print(f"Warning: Generic triple loading not yet implemented for {kg_type}")
+                    print("Path reasoning will be disabled.")
+                    triples = []
+                
+                if triples:
+                    kg_graph = KGGraph()
+                    kg_graph.load_from_triples(triples)
+                    print(f"Loaded KG graph: {len(triples)} triples")
+            except Exception as e:
+                print(f"Warning: Could not load KG triples: {e}")
+                print("Path reasoning will be disabled.")
+        
+        return kg_loader, entity_linker, kg_graph
+    
+    except Exception as e:
+        print(f"Warning: Could not load KG data: {e}")
+        print("Continuing without KG integration.")
+        return None, None, None
+
+
 def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1_if_pretrained=True, 
-                 soft_logic_weight=0.1, soft_logic_rules=None):
+                 soft_logic_weight=0.1, soft_logic_rules=None,
+                 kg_embedding_path: Optional[str] = None,
+                 kg_triples_path: Optional[str] = None,
+                 kg_entity_mapping: Optional[Dict[str, str]] = None,
+                 kg_type: str = "conceptnet"):
     """
     Run tiered training across 4 stages.
     
@@ -1703,9 +1786,61 @@ def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1
             - "concept_to_entity_type_map": dict mapping concept names to entity type indices
             - "relation_map": dict mapping relation names to relation indices (should match collator)
             - "rules": list of rule dicts (see configure_soft_logic_rules docstring)
+        kg_embedding_path: Optional path to KG embeddings file (enables KG integration)
+            - ConceptNet: Path to ConceptNet Numberbatch embeddings
+            - Wikidata: Path to Wikidata2Vec embeddings
+            - Other: Should follow same format
+        kg_triples_path: Optional path to KG triples file (enables path reasoning)
+            - ConceptNet: Path to ConceptNet assertions (.jsonl)
+            - Wikidata: Path to Wikidata triples
+        kg_entity_mapping: Optional mapping from text entities to KG entities
+        kg_type: Type of knowledge graph ("conceptnet", "wikidata", "wordnet", or "generic")
     """
     model = model.to(device)
     model.train()
+    
+    # Load KG data if model supports it and paths are provided
+    if model.use_kg and (kg_embedding_path is not None):
+        print("\n" + "=" * 60)
+        print("Loading Knowledge Graph Data")
+        print("=" * 60)
+        kg_loader, entity_linker, kg_graph = load_kg_data_for_training(
+            kg_embedding_path=kg_embedding_path,
+            kg_triples_path=kg_triples_path,
+            entity_mapping=kg_entity_mapping,
+            kg_type=kg_type
+        )
+        
+        if kg_loader is not None:
+            # Create entity mapping from dataset if not provided
+            if kg_entity_mapping is None:
+                ds_temp = ToyCognitiveDataset()
+                all_entities = []
+                for sample in ds_temp:
+                    all_entities.extend(sample.get("entities", []))
+                unique_entities = list(set(all_entities))
+                
+                try:
+                    from kg_utils import create_entity_mapping_from_dataset
+                    kg_entity_mapping = create_entity_mapping_from_dataset(unique_entities, kg_loader)
+                    print(f"Auto-generated entity mapping for {len(kg_entity_mapping)} entities")
+                except:
+                    kg_entity_mapping = {}
+            
+            # Load KG data into model
+            model.load_kg_data(
+                kg_loader=kg_loader,
+                entity_linker=entity_linker,
+                kg_graph=kg_graph,
+                entity_mapping=kg_entity_mapping
+            )
+            print("KG data loaded into model successfully")
+        else:
+            print("Warning: KG integration requested but data loading failed.")
+            print("Continuing without KG integration.")
+    elif model.use_kg:
+        print("\nWarning: Model has KG integration enabled but no KG data paths provided.")
+        print("Continuing without KG integration.")
     
     ds = ToyCognitiveDataset()
     # Expanded concept map to support multiple concepts per entity
@@ -1955,6 +2090,49 @@ if __name__ == "__main__":
     from model import NeuroSymbolicLM
     vocab_size = len(tokenizer)
     
+    # ========================================================================
+    # Knowledge Graph Integration Configuration
+    # ========================================================================
+    # To enable KG-aware GNN and multi-hop reasoning:
+    # 
+    # Supported KG types:
+    #   - "conceptnet": ConceptNet Numberbatch embeddings
+    #     Download from: https://github.com/commonsense/conceptnet-numberbatch
+    #     Triples from: https://github.com/commonsense/conceptnet5/wiki/Downloads
+    #   
+    #   - "wikidata": Wikidata2Vec embeddings
+    #     Download from: https://github.com/dice-group/wikidata2vec
+    #   
+    #   - "generic": Any KG with format: "entity <space-separated-vector>"
+    # 
+    # 1. Download KG embeddings for your chosen KG type
+    # 2. (Optional) Download KG triples for path reasoning
+    # 3. Set the paths below and enable the flags
+    # ========================================================================
+    USE_KG = False  # Set to True to enable KG integration
+    KG_TYPE = "conceptnet"  # Options: "conceptnet", "wikidata", "wordnet", "generic"
+    KG_EMBEDDING_PATH = None  # Path to KG embeddings file
+    KG_TRIPLES_PATH = None  # Path to KG triples file (for path reasoning)
+    USE_KG_GNN = False  # Use KG-aware GNN instead of simple GNN
+    USE_PATH_REASONING = False  # Enable multi-hop path reasoning
+    MAX_PATH_LENGTH = 3  # Maximum path length for reasoning
+    
+    # Example configuration for ConceptNet (uncomment and set to actual paths):
+    # KG_TYPE = "conceptnet"
+    # KG_EMBEDDING_PATH = "data/conceptnet-vectors-numberbatch-17.06.txt"
+    # KG_TRIPLES_PATH = "data/conceptnet_assertions.jsonl"
+    # USE_KG = True
+    # USE_KG_GNN = True  # Recommended: enables KG-guided message passing
+    # USE_PATH_REASONING = True  # Optional: enables multi-hop reasoning
+    # 
+    # Example configuration for Wikidata:
+    # KG_TYPE = "wikidata"
+    # KG_EMBEDDING_PATH = "data/wikidata2vec_embeddings.txt"
+    # KG_TRIPLES_PATH = "data/wikidata_triples.nt"  # May need custom loader
+    # USE_KG = True
+    # USE_KG_GNN = True
+    # ========================================================================
+    
     # Use pre-trained BERT encoder (hidden_size=768)
     # Set d_model to match BERT's hidden size
     # Optionally use pre-trained T5 decoder for better response generation
@@ -1971,7 +2149,13 @@ if __name__ == "__main__":
         freeze_encoder=True,  # Set to True to freeze encoder, False to fine-tune
         use_pretrained_decoder=True,  # Set to True to use T5 decoder
         pretrained_decoder_name="t5-small",  # Options: "t5-small", "t5-base", "facebook/bart-base"
-        freeze_decoder=False  # Set to True to freeze decoder, False to fine-tune
+        freeze_decoder=False,  # Set to True to freeze decoder, False to fine-tune
+        # KG integration parameters
+        use_kg=USE_KG,
+        kg_embed_dim=300,  # ConceptNet embedding dimension
+        use_kg_gnn=USE_KG_GNN,
+        use_path_reasoning=USE_PATH_REASONING,
+        max_path_length=MAX_PATH_LENGTH
     )
     
     # Configure soft logic rules
@@ -2008,6 +2192,17 @@ if __name__ == "__main__":
         print(f"Using pre-trained decoder: {model.decoder.pretrained_model.config.name_or_path}")
         print(f"Decoder frozen: {model.decoder.freeze_decoder}")
     
+    # Print KG integration status
+    if model.use_kg:
+        print(f"\nKG Integration: ENABLED")
+        print(f"  - KG-aware GNN: {model.use_kg_gnn}")
+        print(f"  - Path reasoning: {model.use_path_reasoning}")
+        print(f"  - Max path length: {model.max_path_length}")
+        print(f"  - KG embedding dim: {model.kg_embed_dim}")
+    else:
+        print(f"\nKG Integration: DISABLED")
+        print("  To enable: Set USE_KG=True and provide KG_EMBEDDING_PATH")
+    
     # Determine device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -2021,7 +2216,12 @@ if __name__ == "__main__":
         epochs_per_stage=10, 
         skip_stage1_if_pretrained=True,
         soft_logic_weight=0.1,  # Adjust this to balance soft logic vs other losses
-        soft_logic_rules=soft_logic_rules
+        soft_logic_rules=soft_logic_rules,
+        # KG integration parameters
+        kg_embedding_path=KG_EMBEDDING_PATH,
+        kg_triples_path=KG_TRIPLES_PATH,
+        kg_entity_mapping=None,  # Can provide manual mapping here if needed
+        kg_type=KG_TYPE
     )
     
     # Example: Generate responses for some test inputs

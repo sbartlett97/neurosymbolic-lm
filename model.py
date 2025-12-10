@@ -4,6 +4,12 @@ from typing import List, Tuple, Optional, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+try:
+    from kg_utils import KGEmbeddingLoader, EntityLinker, KGGraph
+    KG_AVAILABLE = True
+except ImportError:
+    KG_AVAILABLE = False
 
 def gelu(x): return F.gelu(x)
 
@@ -289,6 +295,221 @@ class SimpleGNN(nn.Module):
         return h  # (B,N,D)
 
 
+class KGAwareGNN(nn.Module):
+    """
+    GNN that incorporates knowledge graph structure and relation embeddings.
+    
+    Uses KG relation embeddings to guide message passing between nodes.
+    """
+    def __init__(self, node_dim: int, kg_embed_dim: int, n_layers: int = 2, use_kg: bool = True):
+        super().__init__()
+        self.use_kg = use_kg and KG_AVAILABLE
+        self.kg_embed_dim = kg_embed_dim
+        self.layers = nn.ModuleList()
+        
+        if self.use_kg:
+            # Project KG embeddings to node dimension
+            self.kg_proj = nn.Linear(kg_embed_dim, node_dim)
+            input_dim = node_dim * 3  # node_i, node_j, kg_relation
+        else:
+            input_dim = node_dim * 2  # node_i, node_j
+        
+        for _ in range(n_layers):
+            self.layers.append(nn.Sequential(
+                nn.Linear(input_dim, node_dim),
+                nn.ReLU(),
+                nn.Linear(node_dim, node_dim)
+            ))
+    
+    def forward(self, node_feats: torch.Tensor, 
+                kg_relation_embeddings: Optional[torch.Tensor] = None,
+                kg_adjacency: Optional[torch.Tensor] = None,
+                adj_mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            node_feats: (B, N, node_dim) node features
+            kg_relation_embeddings: (B, N, N, kg_embed_dim) relation embeddings from KG
+            kg_adjacency: (B, N, N) binary mask for KG edges (1 if edge exists, 0 otherwise)
+            adj_mask: (B, N, N) optional additional adjacency mask
+        """
+        B, N, D = node_feats.shape
+        h = node_feats
+        
+        for layer in self.layers:
+            # Standard GNN message passing
+            hi = h.unsqueeze(2).expand(-1, -1, N, -1)  # (B, N, N, D)
+            hj = h.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, N, D)
+            
+            # Incorporate KG relation embeddings if available
+            if self.use_kg and kg_relation_embeddings is not None:
+                kg_rel_proj = self.kg_proj(kg_relation_embeddings)  # (B, N, N, D)
+                pairs = torch.cat([hi, hj, kg_rel_proj], dim=-1)  # (B, N, N, 3D)
+            else:
+                pairs = torch.cat([hi, hj], dim=-1)  # (B, N, N, 2D)
+            
+            m = layer(pairs)  # (B, N, N, D)
+            
+            # Apply KG adjacency mask if available (only pass messages along KG edges)
+            if kg_adjacency is not None:
+                m = m * kg_adjacency.unsqueeze(-1)
+            
+            # Apply additional adjacency mask if provided
+            if adj_mask is not None:
+                m = m * adj_mask.unsqueeze(-1)
+            
+            msg = m.sum(dim=2)  # (B, N, D)
+            h = h + msg  # residual update
+        
+        return h  # (B, N, D)
+
+
+class KGPathReasoner(nn.Module):
+    """
+    Extracts and reasons over multi-hop paths from knowledge graph.
+    
+    Encodes paths between entity pairs and aggregates them for enhanced reasoning.
+    """
+    def __init__(self, node_dim: int, kg_embed_dim: int, max_path_length: int = 3, 
+                 path_aggregation: str = "attention"):
+        super().__init__()
+        self.max_path_length = max_path_length
+        self.path_aggregation = path_aggregation
+        self.kg_embed_dim = kg_embed_dim
+        
+        # Project KG embeddings to node dimension
+        self.kg_proj = nn.Linear(kg_embed_dim, node_dim)
+        
+        # Path encoder: LSTM to encode sequences of (relation, entity) pairs
+        self.path_encoder = nn.LSTM(
+            node_dim * 2,  # relation + entity embeddings
+            node_dim,
+            batch_first=True,
+            bidirectional=False
+        )
+        
+        if path_aggregation == "attention":
+            # Attention-based aggregation of multiple paths
+            self.path_attention = nn.MultiheadAttention(
+                embed_dim=node_dim,
+                num_heads=4,
+                batch_first=True
+            )
+        elif path_aggregation == "mean":
+            # Simple mean pooling
+            pass
+        else:
+            raise ValueError(f"Unknown path_aggregation: {path_aggregation}")
+        
+        # Project aggregated paths back to node dimension
+        self.path_proj = nn.Linear(node_dim, node_dim)
+    
+    def encode_path(self, path: List[Tuple[str, str]], 
+                   kg_entity_embeddings: Dict[str, torch.Tensor],
+                   kg_relation_embeddings: Dict[str, torch.Tensor],
+                   device: str = "cpu") -> torch.Tensor:
+        """
+        Encode a single path into an embedding.
+        
+        Args:
+            path: List of (relation, entity) tuples
+            kg_entity_embeddings: Dict mapping entity strings to embeddings
+            kg_relation_embeddings: Dict mapping relation strings to embeddings
+            device: Device to place tensors on
+        
+        Returns:
+            path_embedding: (node_dim,) tensor
+        """
+        if len(path) == 0:
+            return torch.zeros(self.path_encoder.hidden_size, device=device)
+        
+        # Encode each step in the path
+        path_steps = []
+        for relation, entity in path:
+            # Get embeddings
+            rel_emb = kg_relation_embeddings.get(relation)
+            ent_emb = kg_entity_embeddings.get(entity)
+            
+            if rel_emb is None:
+                rel_emb = torch.zeros(self.kg_embed_dim, device=device)
+            if ent_emb is None:
+                ent_emb = torch.zeros(self.kg_embed_dim, device=device)
+            
+            # Project to node dimension
+            rel_proj = self.kg_proj(rel_emb.unsqueeze(0))  # (1, node_dim)
+            ent_proj = self.kg_proj(ent_emb.unsqueeze(0))  # (1, node_dim)
+            
+            # Concatenate relation and entity
+            step = torch.cat([rel_proj, ent_proj], dim=-1)  # (1, node_dim*2)
+            path_steps.append(step)
+        
+        # Stack steps: (path_length, node_dim*2)
+        path_tensor = torch.cat(path_steps, dim=0).unsqueeze(0)  # (1, path_length, node_dim*2)
+        
+        # Encode with LSTM
+        path_encoded, (hidden, _) = self.path_encoder(path_tensor)
+        # Use final hidden state
+        path_embedding = hidden.squeeze(0)  # (node_dim,)
+        
+        return path_embedding
+    
+    def forward(self, entity_pairs: List[Tuple[int, int]], 
+                paths: List[List[List[Tuple[str, str]]]],
+                kg_entity_embeddings: Dict[str, torch.Tensor],
+                kg_relation_embeddings: Dict[str, torch.Tensor],
+                device: str = "cpu") -> torch.Tensor:
+        """
+        Encode and aggregate paths for entity pairs.
+        
+        Args:
+            entity_pairs: List of (entity_i, entity_j) index pairs
+            paths: List of lists of paths, one list per pair
+                   Each path is list of (relation, entity) tuples
+            kg_entity_embeddings: Dict mapping entity strings to embeddings
+            kg_relation_embeddings: Dict mapping relation strings to embeddings
+            device: Device to place tensors on
+        
+        Returns:
+            path_embeddings: (len(entity_pairs), node_dim) aggregated path embeddings
+        """
+        if len(entity_pairs) == 0:
+            return torch.zeros((0, self.path_encoder.hidden_size), device=device)
+        
+        all_path_embeddings = []
+        
+        for pair_paths in paths:
+            # Encode all paths for this pair
+            pair_embeddings = []
+            for path in pair_paths[:10]:  # Limit to 10 paths per pair
+                path_emb = self.encode_path(
+                    path, kg_entity_embeddings, kg_relation_embeddings, device
+                )
+                pair_embeddings.append(path_emb)
+            
+            if len(pair_embeddings) == 0:
+                # No paths found, use zero embedding
+                pair_embeddings = [torch.zeros(self.path_encoder.hidden_size, device=device)]
+            
+            # Stack: (n_paths, node_dim)
+            pair_embeddings_tensor = torch.stack(pair_embeddings).unsqueeze(0)  # (1, n_paths, node_dim)
+            
+            # Aggregate paths
+            if self.path_aggregation == "attention":
+                # Use self-attention to aggregate
+                aggregated, _ = self.path_attention(
+                    pair_embeddings_tensor, pair_embeddings_tensor, pair_embeddings_tensor
+                )
+                aggregated = aggregated.mean(dim=1)  # (1, node_dim)
+            else:  # mean
+                aggregated = pair_embeddings_tensor.mean(dim=1)  # (1, node_dim)
+            
+            # Project
+            aggregated = self.path_proj(aggregated)  # (1, node_dim)
+            all_path_embeddings.append(aggregated.squeeze(0))  # (node_dim,)
+        
+        # Stack all pairs: (n_pairs, node_dim)
+        return torch.stack(all_path_embeddings)
+
+
 def pair_logits_to_matrix(pair_logits_list: List[torch.Tensor], pairs_index_map: List[torch.Tensor], num_nodes: int, n_rel: int, device: Optional[torch.device] = None):
     """
     Convert sparse pair logits (per-batch variable-length lists) into dense (B, N, N, R) tensors.
@@ -417,7 +638,8 @@ class Controller(nn.Module):
 class NeuroSymbolicLM(nn.Module):
     def __init__(self, vocab_size:int, d_model:int=512, n_entity_types:int=8, n_concepts:int=512, concept_dim:int=256, node_dim:int=256, max_nodes:int=16, 
                  encoder=None, use_pretrained_encoder:bool=False, pretrained_model_name:str="bert-base-uncased", freeze_encoder:bool=False,
-                 decoder=None, use_pretrained_decoder:bool=False, pretrained_decoder_name:str="t5-small", freeze_decoder:bool=False):
+                 decoder=None, use_pretrained_decoder:bool=False, pretrained_decoder_name:str="t5-small", freeze_decoder:bool=False,
+                 use_kg:bool=False, kg_embed_dim:int=300, use_kg_gnn:bool=False, use_path_reasoning:bool=False, max_path_length:int=3):
         """
         Args:
             vocab_size: Vocabulary size (used for decoder, ignored if using pre-trained encoder/decoder)
@@ -430,6 +652,11 @@ class NeuroSymbolicLM(nn.Module):
             use_pretrained_decoder: If True, use pre-trained T5/BART decoder
             pretrained_decoder_name: Name of pre-trained decoder model to use
             freeze_decoder: If True, freeze pre-trained decoder parameters
+            use_kg: If True, enable knowledge graph integration
+            kg_embed_dim: Dimension of KG embeddings (default 300 for ConceptNet)
+            use_kg_gnn: If True, use KG-aware GNN instead of simple GNN
+            use_path_reasoning: If True, enable multi-hop path reasoning
+            max_path_length: Maximum length for multi-hop paths
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -440,6 +667,17 @@ class NeuroSymbolicLM(nn.Module):
         self.max_nodes = max_nodes
         self.use_pretrained_encoder = use_pretrained_encoder
         self.use_pretrained_decoder = use_pretrained_decoder
+        self.use_kg = use_kg and KG_AVAILABLE
+        self.kg_embed_dim = kg_embed_dim
+        self.use_kg_gnn = use_kg_gnn and self.use_kg
+        self.use_path_reasoning = use_path_reasoning and self.use_kg
+        self.max_path_length = max_path_length
+        
+        # KG components (initialized later via load_kg_data)
+        self.kg_loader: Optional[KGEmbeddingLoader] = None
+        self.entity_linker: Optional[EntityLinker] = None
+        self.kg_graph: Optional[KGGraph] = None
+        self.entity_mapping: Dict[str, str] = {}  # text entity -> KG entity
         
         # Initialize encoder
         if encoder is not None:
@@ -458,7 +696,20 @@ class NeuroSymbolicLM(nn.Module):
         self.concept_bank = ConceptBank(n_concepts, concept_dim)
         self.concept_proj = nn.Linear(self.d_model, concept_dim)
         self.node_proj = nn.Linear(self.d_model, node_dim)
-        self.gnn = SimpleGNN(node_dim, n_layers=2)
+        
+        # Choose GNN type
+        if self.use_kg_gnn:
+            self.gnn = KGAwareGNN(node_dim, kg_embed_dim, n_layers=2, use_kg=True)
+        else:
+            self.gnn = SimpleGNN(node_dim, n_layers=2)
+        
+        # Path reasoner for multi-hop reasoning
+        if self.use_path_reasoning:
+            self.path_reasoner = KGPathReasoner(
+                node_dim, kg_embed_dim, max_path_length=max_path_length
+            )
+        else:
+            self.path_reasoner = None
         
         # Initialize decoder
         if decoder is not None:
@@ -501,6 +752,92 @@ class NeuroSymbolicLM(nn.Module):
     def entity_head(self):
         """Entity classification head - used by Stage 2 trainer."""
         return self.token_ent
+    
+    def load_kg_data(self, kg_loader: KGEmbeddingLoader, entity_linker: Optional[EntityLinker] = None,
+                     kg_graph: Optional[KGGraph] = None, entity_mapping: Optional[Dict[str, str]] = None):
+        """
+        Load knowledge graph data for KG-aware processing.
+        
+        Args:
+            kg_loader: KGEmbeddingLoader instance with loaded embeddings
+            entity_linker: Optional EntityLinker for linking text entities to KG
+            kg_graph: Optional KGGraph for path finding
+            entity_mapping: Optional manual mapping from text entities to KG entities
+        """
+        if not self.use_kg:
+            print("Warning: use_kg=False, KG data will not be used")
+            return
+        
+        self.kg_loader = kg_loader
+        self.entity_mapping = entity_mapping or {}
+        
+        if entity_linker is None:
+            self.entity_linker = EntityLinker(kg_loader, entity_mapping)
+        else:
+            self.entity_linker = entity_linker
+        
+        self.kg_graph = kg_graph
+        print(f"Loaded KG data: {len(kg_loader.entity_embeddings)} entities")
+    
+    def _get_kg_embeddings_for_entities(self, entity_texts: List[str], device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get KG embeddings for a list of text entities.
+        
+        Returns:
+            entity_embeddings: (len(entity_texts), kg_embed_dim) tensor
+            kg_entity_ids: List of KG entity strings (None if not found)
+        """
+        if not self.use_kg or self.entity_linker is None:
+            return torch.zeros((len(entity_texts), self.kg_embed_dim), device=device), [None] * len(entity_texts)
+        
+        # Link entities to KG
+        kg_entity_ids = self.entity_linker.link_entities_batch(entity_texts)
+        
+        # Get embeddings
+        entity_embeddings = self.kg_loader.get_embedding_tensor(kg_entity_ids, device=device)
+        
+        return entity_embeddings, kg_entity_ids
+    
+    def _get_kg_relation_embeddings(self, entity_pairs: List[Tuple[int, int]], 
+                                    kg_entity_ids: List[Optional[str]],
+                                    device: str) -> torch.Tensor:
+        """
+        Get KG relation embeddings for entity pairs.
+        
+        Args:
+            entity_pairs: List of (i, j) entity index pairs
+            kg_entity_ids: List of KG entity IDs for each entity
+            device: Device to place tensors on
+        
+        Returns:
+            relation_embeddings: (len(entity_pairs), kg_embed_dim) tensor
+        """
+        if not self.use_kg or self.kg_graph is None:
+            return torch.zeros((len(entity_pairs), self.kg_embed_dim), device=device)
+        
+        relation_embeddings = []
+        for i, j in entity_pairs:
+            kg_i = kg_entity_ids[i] if i < len(kg_entity_ids) else None
+            kg_j = kg_entity_ids[j] if j < len(kg_entity_ids) else None
+            
+            if kg_i and kg_j and kg_i in self.kg_graph.edges:
+                # Find relation between entities
+                neighbors = self.kg_graph.get_neighbors(kg_i)
+                rel_emb = None
+                for rel, target in neighbors:
+                    if target == kg_j:
+                        # Found relation, get embedding
+                        rel_emb = self.kg_loader.get_embedding(rel)
+                        break
+                
+                if rel_emb is None:
+                    rel_emb = np.zeros(self.kg_embed_dim)
+            else:
+                rel_emb = np.zeros(self.kg_embed_dim)
+            
+            relation_embeddings.append(torch.tensor(rel_emb, dtype=torch.float32, device=device))
+        
+        return torch.stack(relation_embeddings)
     
     def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, 
                  max_length: int = 128, bos_token_id: int = 1, eos_token_id: int = 2, 
@@ -643,7 +980,111 @@ class NeuroSymbolicLM(nn.Module):
         concept_vec, concept_probs = self.concept_bank.soft_assign(concept_query)  # (B, cdim), (B, n_concepts)
 
         # Relation reasoning: run GNN on nodes, produce refined node KVs
-        node_feats_refined = self.gnn(node_feats)                   # (B, N, node_dim)
+        # Prepare KG information if available
+        kg_relation_embeddings = None
+        kg_adjacency = None
+        path_embeddings = None
+        
+        if self.use_kg and self.use_kg_gnn:
+            # Extract entity texts from spans if available, otherwise use placeholder
+            # In practice, you'd extract actual entity mentions from input_ids using spans
+            entity_texts = []
+            kg_entity_ids = None
+            
+            # Try to extract entity texts from spans or use placeholder
+            if spans is not None and len(spans) > 0:
+                # If spans are provided, we could decode entity texts from input_ids
+                # For now, use placeholder - in production, decode from tokenizer
+                entity_texts = [[f"entity_{j}" for j in range(min(self.max_nodes, len(spans[i])))] 
+                               for i in range(B)]
+            else:
+                # Use placeholder entity names
+                entity_texts = [[f"entity_{j}" for j in range(min(self.max_nodes, L))] for _ in range(B)]
+            
+            # Get KG embeddings for entities (use first batch as example)
+            if len(entity_texts) > 0:
+                kg_entity_embs, kg_entity_ids = self._get_kg_embeddings_for_entities(
+                    entity_texts[0], device=node_feats.device
+                )
+                
+                # Create KG relation embeddings matrix (B, N, N, kg_embed_dim)
+                if kg_entity_ids and any(kg_entity_ids):
+                    # Build relation embeddings for all pairs
+                    B_kg, N_kg = node_feats.shape[0], node_feats.shape[1]
+                    kg_rel_embs = torch.zeros(B_kg, N_kg, N_kg, self.kg_embed_dim, device=node_feats.device)
+                    kg_adj = torch.zeros(B_kg, N_kg, N_kg, device=node_feats.device)
+                    
+                    for b in range(B_kg):
+                        for i in range(N_kg):
+                            for j in range(N_kg):
+                                if i != j and kg_entity_ids[i] and kg_entity_ids[j]:
+                                    # Check if relation exists in KG
+                                    if self.kg_graph and kg_entity_ids[i] in self.kg_graph.edges:
+                                        neighbors = self.kg_graph.get_neighbors(kg_entity_ids[i])
+                                        for rel, target in neighbors:
+                                            if target == kg_entity_ids[j]:
+                                                rel_emb = self.kg_loader.get_embedding(rel)
+                                                if rel_emb is not None:
+                                                    kg_rel_embs[b, i, j] = torch.tensor(rel_emb, dtype=torch.float32, device=node_feats.device)
+                                                    kg_adj[b, i, j] = 1.0
+                    
+                    kg_relation_embeddings = kg_rel_embs
+                    kg_adjacency = kg_adj
+        
+        # Run GNN (with KG information if available)
+        if self.use_kg_gnn and kg_relation_embeddings is not None:
+            node_feats_refined = self.gnn(
+                node_feats, 
+                kg_relation_embeddings=kg_relation_embeddings,
+                kg_adjacency=kg_adjacency
+            )
+        else:
+            node_feats_refined = self.gnn(node_feats)  # (B, N, node_dim)
+        
+        # Multi-hop path reasoning (if enabled)
+        if self.use_path_reasoning and self.kg_graph and kg_entity_ids and any(kg_entity_ids):
+            # Extract paths for entity pairs
+            entity_pairs = []
+            paths_per_pair = []
+            
+            for i in range(min(self.max_nodes, len(kg_entity_ids))):
+                for j in range(i+1, min(self.max_nodes, len(kg_entity_ids))):
+                    if kg_entity_ids[i] and kg_entity_ids[j]:
+                        entity_pairs.append((i, j))
+                        # Find paths in KG
+                        kg_paths = self.kg_graph.find_paths(
+                            kg_entity_ids[i], 
+                            kg_entity_ids[j],
+                            max_length=self.max_path_length,
+                            max_paths=5
+                        )
+                        paths_per_pair.append(kg_paths)
+            
+            if len(entity_pairs) > 0:
+                # Get KG embeddings for path encoding
+                kg_entity_emb_dict = {}
+                kg_relation_emb_dict = {}
+                
+                for entity_id in set(kg_entity_ids):
+                    if entity_id:
+                        emb = self.kg_loader.get_embedding(entity_id)
+                        if emb is not None:
+                            kg_entity_emb_dict[entity_id] = torch.tensor(emb, dtype=torch.float32, device=node_feats.device)
+                
+                # Encode paths
+                path_embeddings = self.path_reasoner(
+                    entity_pairs,
+                    paths_per_pair,
+                    kg_entity_emb_dict,
+                    kg_relation_emb_dict,
+                    device=node_feats.device
+                )  # (n_pairs, node_dim)
+                
+                # Incorporate path embeddings into node features (simplified: add to node pairs)
+                # In practice, you might want a more sophisticated integration
+                if path_embeddings.shape[0] > 0:
+                    # For now, we'll add path information later in the relation scorer
+                    pass
 
         # compute pairwise relation logits (sparse / pooled)
         B, N, Dn = node_feats_refined.shape
