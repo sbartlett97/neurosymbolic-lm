@@ -128,7 +128,11 @@ class SoftLogicConstraints(nn.Module):
             else:
                 target = torch.zeros_like(expected_rel_given_types, device=device)
             
-            rule_loss = F.binary_cross_entropy(expected_rel_given_types, target)
+            # Cast to float32 for BCE (unsafe with autocast/float16)
+            rule_loss = F.binary_cross_entropy(
+                expected_rel_given_types.float(),
+                target.float()
+            )
             scaled = weight * rule_loss
             total_loss = total_loss + scaled
             
