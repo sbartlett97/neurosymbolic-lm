@@ -1651,13 +1651,24 @@ class Stage4_Joint_Trainer:
         con_loss = self.bce(concept_logits, target_labels)
         
         # Response controller loss
-        # Ensure should_respond is a tensor
+        # Ensure should_respond is a tensor with shape (B,)
         should_respond = batch["should_respond"]
         if not isinstance(should_respond, torch.Tensor):
             should_respond = torch.tensor(should_respond, dtype=torch.float, device=out["response_logit"].device)
         else:
             should_respond = should_respond.float()
-        resp_loss = self.bce(out["response_logit"].squeeze(-1), should_respond)
+        # Ensure should_respond has shape (B,) to match response_logit after squeeze
+        response_logit_squeezed = out["response_logit"].squeeze(-1)  # (B,)
+        B = response_logit_squeezed.shape[0]
+        if should_respond.dim() == 0:
+            # If it's a scalar, reshape to (1,) and expand to (B,)
+            should_respond = should_respond.unsqueeze(0).expand(B)
+        elif should_respond.shape[0] != B:
+            # If shape doesn't match, try to reshape
+            should_respond = should_respond.view(B)
+        # Ensure it's on the correct device
+        should_respond = should_respond.to(response_logit_squeezed.device)
+        resp_loss = self.bce(response_logit_squeezed, should_respond)
         
         # Decoder language modeling loss (if decoder was used)
         decoder_loss = torch.tensor(0.0, device=out["entity_logits"].device)
