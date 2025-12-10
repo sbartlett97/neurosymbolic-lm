@@ -156,6 +156,10 @@ class PretrainedDecoderWrapper(nn.Module):
         else:
             encoder_attention_mask = None
         
+        # T5/BART decoders can have issues with float16 in attention mask creation
+        # Ensure encoder_hidden_states is float32 for stability
+        encoder_hidden_states = encoder_hidden_states.float()
+        
         # Get decoder outputs
         decoder_outputs = self.decoder(
             input_ids=y_ids,
