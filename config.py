@@ -140,3 +140,81 @@ class EvaluationConfig:
     compute_bleu: bool = True
     compute_entity_f1: bool = True
     bleu_max_n: int = 4
+
+
+@dataclass
+class ContinualLearningConfig:
+    """Configuration for continual/online learning."""
+    
+    # Uncertainty estimation
+    uncertainty_threshold: float = 0.5
+    uncertainty_method: str = "mc_dropout"  # 'mc_dropout', 'ensemble', 'combined'
+    mc_samples: int = 10
+    
+    # Episodic memory
+    memory_size: int = 1000
+    memory_strategy: str = "hybrid"  # 'reservoir', 'uncertainty', 'diversity', 'balanced', 'hybrid'
+    diversity_weight: float = 0.3
+    
+    # Experience replay
+    replay_ratio: float = 0.3
+    replay_strategy: str = "random"  # 'random', 'weighted', 'uncertain', 'recent'
+    
+    # Regularization (anti-forgetting)
+    use_ewc: bool = True
+    use_si: bool = False
+    use_lwf: bool = True
+    ewc_weight: float = 1000.0
+    si_weight: float = 100.0
+    lwf_alpha: float = 0.5
+    lwf_temperature: float = 2.0
+    
+    # Safety filtering
+    enable_safety_filter: bool = True
+    safety_strictness: str = "medium"  # 'low', 'medium', 'high', 'maximum'
+    safety_log_path: Optional[str] = "safety_audit.jsonl"
+    
+    # Learning parameters
+    online_learning_rate: float = 1e-4
+    max_steps_per_event: int = 10
+    online_batch_size: int = 8
+    
+    # Knowledge consolidation
+    consolidate_every_n_events: int = 10
+    min_samples_for_consolidation: int = 50
+    
+    # Component freezing during online learning
+    freeze_encoder_online: bool = True
+    freeze_decoder_online: bool = False
+    
+    # Symbolic updates
+    enable_concept_expansion: bool = True
+    enable_rule_learning: bool = True
+    enable_kg_updates: bool = True
+    max_concepts: int = 2048
+    max_rules: int = 200
+
+
+@dataclass
+class SafetyConfig:
+    """Configuration for safety and content filtering."""
+    
+    # Strictness level
+    strictness: str = "medium"  # 'low', 'medium', 'high', 'maximum'
+    
+    # Component toggles
+    enable_keyword_filter: bool = True
+    enable_semantic_filter: bool = True
+    enable_ethical_filter: bool = True
+    enable_audit_logging: bool = True
+    
+    # Semantic filter settings
+    semantic_similarity_threshold: float = 0.7
+    
+    # Audit settings
+    log_path: Optional[str] = "safety_audit.jsonl"
+    log_all_checks: bool = False  # Log safe content too
+    
+    # Blocklist/allowlist paths (for loading from files)
+    blocklist_path: Optional[str] = None
+    allowlist_path: Optional[str] = None
