@@ -105,7 +105,6 @@ class SoftLogicConstraints(nn.Module):
         _, _, _, R = rel_logits_matrix.shape
         assert E == self.n_entity_types and R == self.n_relations
         
-        rel_probs = torch.sigmoid(rel_logits_matrix)
         total_loss = torch.tensor(0.0, device=device)
         details = {"rules": []}
         
@@ -117,22 +116,22 @@ class SoftLogicConstraints(nn.Module):
             p_b = entity_type_probs[:, :, etype_b].unsqueeze(1)   # (B, 1, N)
             type_pair_prob = (p_a * p_b).squeeze(-1)  # (B, N, N)
             
-            rel_p = rel_probs[:, :, :, rel_idx]  # (B, N, N)
+            # Work with logits directly for numerical stability
+            rel_logits = rel_logits_matrix[:, :, :, rel_idx]  # (B, N, N)
             
-            weighted_rel = (type_pair_prob * rel_p).sum(dim=(1, 2))
+            # Compute weighted average of logits
+            weighted_logits = (type_pair_prob * rel_logits).sum(dim=(1, 2))
             normalizer = type_pair_prob.sum(dim=(1, 2)).clamp(min=1e-6)
-            expected_rel_given_types = weighted_rel / normalizer
+            expected_logit = weighted_logits / normalizer  # (B,)
             
+            # Target: 1 for polarity=1 (encourage), 0 for polarity=-1 (discourage)
             if polarity == 1:
-                target = torch.ones_like(expected_rel_given_types, device=device)
+                target = torch.ones_like(expected_logit)
             else:
-                target = torch.zeros_like(expected_rel_given_types, device=device)
+                target = torch.zeros_like(expected_logit)
             
-            # Cast to float32 for BCE (unsafe with autocast/float16)
-            rule_loss = F.binary_cross_entropy(
-                expected_rel_given_types.float(),
-                target.float()
-            )
+            # Use BCEWithLogits - safe with autocast/AMP
+            rule_loss = F.binary_cross_entropy_with_logits(expected_logit, target)
             scaled = weight * rule_loss
             total_loss = total_loss + scaled
             
