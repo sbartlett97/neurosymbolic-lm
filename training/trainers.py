@@ -288,7 +288,13 @@ class Stage3_Decoder_Trainer(BaseTrainer):
         self.ce = nn.CrossEntropyLoss(ignore_index=-100)
     
     def train_step(self, batch: Dict[str, Any]) -> float:
-        """Execute one training step."""
+        """Execute one training step.
+        
+        Note: The collator already prepares decoder_input_ids and decoder_labels
+        such that they are aligned (no shift needed here):
+        - decoder_input_ids[t] is the input at timestep t
+        - decoder_labels[t] is the target prediction at timestep t
+        """
         self.optimizer.zero_grad()
         
         if "decoder_input_ids" not in batch:
@@ -299,7 +305,6 @@ class Stage3_Decoder_Trainer(BaseTrainer):
         # Check if there are any valid labels (not all -100)
         valid_labels = (labels != -100).sum()
         if valid_labels == 0:
-            # No valid labels to train on, skip this batch
             return 0.0
         
         with self._get_amp_context():
@@ -312,18 +317,13 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             
             logits = out["logits"]
             
-            # Shift for next-token prediction
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            
-            # Double-check after shift
-            valid_after_shift = (shift_labels != -100).sum()
-            if valid_after_shift == 0:
-                return 0.0
-            
+            # No shift needed - collator already aligned input_ids and labels:
+            # decoder_input_ids = [start, tok1, tok2, ...]
+            # decoder_labels    = [tok1,  tok2, tok3, ...]
+            # logits[t] predicts labels[t]
             decoder_loss = self.ce(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1)
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1)
             )
             
             # Check for NaN and skip if necessary
@@ -422,18 +422,15 @@ class Stage4_Joint_Trainer(BaseTrainer):
             should_respond = should_respond.to(response_logit_squeezed.device)
             resp_loss = self.bce(response_logit_squeezed, should_respond)
             
-            # Decoder loss
+            # Decoder loss (no shift - collator already aligned input_ids and labels)
             decoder_loss = torch.tensor(0.0, device=out["entity_logits"].device)
             if "logits" in out and decoder_input_ids is not None and "decoder_labels" in batch:
                 logits = out["logits"]
                 labels = batch["decoder_labels"]
                 
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_labels = labels[:, 1:].contiguous()
-                
                 decoder_loss = self.ce_ignore_neg100(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1)
                 )
             
             # Soft logic loss
