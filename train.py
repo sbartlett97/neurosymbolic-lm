@@ -400,16 +400,31 @@ def run_training(
             soft_logic_rules.get("rules", [])
         )
     
+    # Setup decoder tokenizer if using pretrained decoder (e.g., T5)
+    # This is needed because T5 expects T5 tokenizer tokens, not BERT tokens
+    decoder_tokenizer = None
+    if model.use_pretrained_decoder:
+        from transformers import AutoTokenizer
+        # Get the decoder model name from the config
+        decoder_model_name = model.decoder.pretrained_model.config.name_or_path
+        print(f"Loading decoder tokenizer for {decoder_model_name}...")
+        decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_model_name)
+        if decoder_tokenizer.pad_token is None:
+            decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+        print(f"Decoder vocab size: {len(decoder_tokenizer)}")
+    
     # Create collators
     collator_basic = CognitiveCollator(
         tokenizer, concept_map, relation_map,
         include_responses=False,
-        concept_to_entity_type_map=concept_to_entity_type_map or {}
+        concept_to_entity_type_map=concept_to_entity_type_map or {},
+        decoder_tokenizer=decoder_tokenizer
     )
     collator_with_responses = CognitiveCollator(
         tokenizer, concept_map, relation_map,
         include_responses=True,
-        concept_to_entity_type_map=concept_to_entity_type_map or {}
+        concept_to_entity_type_map=concept_to_entity_type_map or {},
+        decoder_tokenizer=decoder_tokenizer
     )
     
     # Create DataLoaders

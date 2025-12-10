@@ -18,19 +18,23 @@ class CognitiveCollator:
         concept_map: Dict[str, int], 
         relation_map: Dict[str, int], 
         include_responses: bool = False, 
-        concept_to_entity_type_map: Optional[Dict[str, int]] = None
+        concept_to_entity_type_map: Optional[Dict[str, int]] = None,
+        decoder_tokenizer=None
     ):
         """
         Initialize the collator.
         
         Args:
-            tokenizer: HuggingFace tokenizer
+            tokenizer: HuggingFace tokenizer for encoder
             concept_map: Mapping from concept names to indices (1-indexed)
             relation_map: Mapping from relation names to indices (1-indexed)
             include_responses: Whether to include decoder inputs/labels
             concept_to_entity_type_map: Mapping from concepts to entity type indices
+            decoder_tokenizer: Optional separate tokenizer for decoder (e.g., T5 tokenizer)
+                              If None, uses the same tokenizer as encoder
         """
         self.tokenizer = tokenizer
+        self.decoder_tokenizer = decoder_tokenizer if decoder_tokenizer is not None else tokenizer
         self.concept_map = concept_map
         self.relation_map = relation_map
         self.include_responses = include_responses
@@ -204,7 +208,11 @@ class CognitiveCollator:
         return (approx_token_start, approx_token_end)
     
     def _process_responses(self, batch: List[dict]):
-        """Process response texts for decoder training."""
+        """Process response texts for decoder training.
+        
+        Uses decoder_tokenizer which may be different from encoder tokenizer
+        (e.g., T5 tokenizer for T5 decoder, BERT tokenizer for encoder).
+        """
         responses = []
         should_respond_mask = []
         
@@ -217,7 +225,8 @@ class CognitiveCollator:
                 responses.append(eos_token)
                 should_respond_mask.append(False)
         
-        resp_tok = self.tokenizer(
+        # Use decoder_tokenizer for response tokenization
+        resp_tok = self.decoder_tokenizer(
             responses, 
             padding=True, 
             truncation=True, 
@@ -256,23 +265,23 @@ class CognitiveCollator:
         return decoder_input_ids, decoder_labels
     
     def _get_eos_token(self) -> str:
-        """Get the EOS token string."""
-        eos_token = self.tokenizer.eos_token
+        """Get the EOS token string from decoder tokenizer."""
+        eos_token = self.decoder_tokenizer.eos_token
         if eos_token is None:
-            eos_token = self.tokenizer.sep_token
+            eos_token = self.decoder_tokenizer.sep_token
         if eos_token is None:
-            eos_token = self.tokenizer.pad_token
+            eos_token = self.decoder_tokenizer.pad_token
         if eos_token is None:
             eos_token = "</s>"
         return eos_token
     
     def _get_eos_token_id(self) -> Optional[int]:
-        """Get the EOS token ID."""
-        eos_token_id = self.tokenizer.eos_token_id
+        """Get the EOS token ID from decoder tokenizer."""
+        eos_token_id = self.decoder_tokenizer.eos_token_id
         if eos_token_id is None:
-            eos_token_id = self.tokenizer.sep_token_id
+            eos_token_id = self.decoder_tokenizer.sep_token_id
         if eos_token_id is None:
-            eos_token_id = self.tokenizer.pad_token_id
+            eos_token_id = self.decoder_tokenizer.pad_token_id
         return eos_token_id
     
     def _process_entities(
