@@ -636,7 +636,7 @@ class Controller(nn.Module):
 
 
 class NeuroSymbolicLM(nn.Module):
-    def __init__(self, vocab_size:int, d_model:int=512, n_entity_types:int=8, n_concepts:int=512, concept_dim:int=256, node_dim:int=256, max_nodes:int=16, 
+    def __init__(self, vocab_size:int, d_model:int=512, n_entity_types:int=8, n_relations:int=32, n_concepts:int=512, concept_dim:int=256, node_dim:int=256, max_nodes:int=16, 
                  encoder=None, use_pretrained_encoder:bool=False, pretrained_model_name:str="bert-base-uncased", freeze_encoder:bool=False,
                  decoder=None, use_pretrained_decoder:bool=False, pretrained_decoder_name:str="t5-small", freeze_decoder:bool=False,
                  use_kg:bool=False, kg_embed_dim:int=300, use_kg_gnn:bool=False, use_path_reasoning:bool=False, max_path_length:int=3):
@@ -644,6 +644,8 @@ class NeuroSymbolicLM(nn.Module):
         Args:
             vocab_size: Vocabulary size (used for decoder, ignored if using pre-trained encoder/decoder)
             d_model: Model dimension (will be overridden if using pre-trained encoder)
+            n_entity_types: Number of entity types (e.g., animal, person, location)
+            n_relations: Number of relation types (e.g., chases, located_in, capital_of)
             encoder: Optional custom encoder (if None, will create SimpleTransformerEncoder or use pre-trained)
             use_pretrained_encoder: If True, use pre-trained BERT encoder
             pretrained_model_name: Name of pre-trained encoder model to use
@@ -661,6 +663,7 @@ class NeuroSymbolicLM(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_entity_types = n_entity_types
+        self.n_relations = n_relations
         self.n_concepts = n_concepts
         self.concept_dim = concept_dim
         self.node_dim = node_dim
@@ -726,8 +729,8 @@ class NeuroSymbolicLM(nn.Module):
         self.controller = Controller(d_model, node_dim)
         self.max_nodes = max_nodes
         # relation scorer for pairwise node relations: project pair -> R logits
-        self.rel_scorer = nn.Sequential(nn.Linear(node_dim*2, node_dim), nn.ReLU(), nn.Linear(node_dim, 32))
-        self.softlogic = SoftLogicConstraints(n_entity_types, 32)
+        self.rel_scorer = nn.Sequential(nn.Linear(node_dim*2, node_dim), nn.ReLU(), nn.Linear(node_dim, n_relations))
+        self.softlogic = SoftLogicConstraints(n_entity_types, n_relations)
         
         # MLM head for Stage 1 pretraining (only used if not using pre-trained encoder)
         if not use_pretrained_encoder:

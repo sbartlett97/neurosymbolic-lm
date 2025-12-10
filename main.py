@@ -1,6 +1,7 @@
 # Toy dataset template and tiered training scaffold
 
 import torch
+import json
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from typing import Optional, Dict
@@ -196,8 +197,35 @@ class ToyCognitiveDataset(Dataset):
     can belong to multiple categories simultaneously (e.g., a "doctor" is both
     a "person", a "professional", and has "medical" attributes).
     """
-    def __init__(self):
-        self.data = [
+    def __init__(self, jsonl_file_path=None):
+        """
+        Initialize dataset from JSONL file or use hardcoded toy data.
+        
+        Args:
+            jsonl_file_path: Path to JSONL file. If None, uses hardcoded toy dataset.
+        """
+        if jsonl_file_path is not None:
+            # Load from JSONL file
+            self.data = []
+            with open(jsonl_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entry = json.loads(line)
+                        # Convert entity_spans from list of lists to list of tuples if needed
+                        if "entity_spans" in entry and entry["entity_spans"]:
+                            if len(entry["entity_spans"]) > 0 and isinstance(entry["entity_spans"][0], list):
+                                entry["entity_spans"] = [tuple(span) if isinstance(span, list) else span 
+                                                         for span in entry["entity_spans"]]
+                        # Convert relations from list of lists to list of tuples if needed
+                        if "relations" in entry and entry["relations"]:
+                            if len(entry["relations"]) > 0 and isinstance(entry["relations"][0], list):
+                                entry["relations"] = [tuple(rel) if isinstance(rel, list) else rel 
+                                                     for rel in entry["relations"]]
+                        self.data.append(entry)
+        else:
+            # Use hardcoded toy dataset
+            self.data = [
             # Original samples
             {
                 "text": "The cat chased the mouse.",
@@ -1099,11 +1127,12 @@ class ToyCognitiveDataset(Dataset):
 # ------------------------
 
 class CognitiveCollator:
-    def __init__(self, tokenizer, concept_map, relation_map, include_responses=False):
+    def __init__(self, tokenizer, concept_map, relation_map, include_responses=False, concept_to_entity_type_map=None):
         self.tokenizer = tokenizer
         self.concept_map = concept_map
         self.relation_map = relation_map
         self.include_responses = include_responses
+        self.concept_to_entity_type_map = concept_to_entity_type_map or {}
         # Get number of concepts for multi-label encoding
         self.n_concepts = max(concept_map.values()) if concept_map else 0
 
@@ -1113,6 +1142,8 @@ class CognitiveCollator:
 
         max_entities = max(len(x["entities"]) for x in batch)
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
+        # Entity type labels: (B, max_entities) - maps each entity to its entity type index
+        entity_type_labels = torch.zeros(len(batch), max_entities, dtype=torch.long)
         # Multi-label concept encoding: (B, max_entities, n_concepts) binary matrix
         concept_labels = torch.zeros(len(batch), max_entities, self.n_concepts, dtype=torch.float)
 
@@ -1215,6 +1246,14 @@ class CognitiveCollator:
                     # Fallback: convert to list
                     entity_concepts = [entity_concepts]
                 
+                # Map entity to entity type: use first concept that's in concept_to_entity_type_map
+                entity_type = 0  # Default to 0 (padding/unknown)
+                for concept_name in entity_concepts:
+                    if concept_name in self.concept_to_entity_type_map:
+                        entity_type = self.concept_to_entity_type_map[concept_name]
+                        break  # Use first matching concept
+                entity_type_labels[i, j] = entity_type
+                
                 # Set binary labels for all concepts associated with this entity
                 for concept_name in entity_concepts:
                     concept_val = self.concept_map.get(concept_name, 0)
@@ -1226,6 +1265,7 @@ class CognitiveCollator:
             # Pad remaining slots with 0 (padding)
             for j in range(len(ents), max_entities):
                 entity_ids[i, j] = 0
+                entity_type_labels[i, j] = 0
                 # concept_labels already initialized to zeros
             
             rels = sample["relations"]
@@ -1238,6 +1278,7 @@ class CognitiveCollator:
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
             "entity_ids": entity_ids,
+            "entity_type_labels": entity_type_labels,  # Entity type indices (B, max_entities)
             "concept_labels": concept_labels,  # Multi-label binary matrix (B, max_entities, n_concepts)
             "relations": relation_triplets,
             "should_respond": should_respond,
@@ -1298,6 +1339,232 @@ class Stage1_MLM_Trainer:
         return loss.item()
 
 
+def extract_concept_to_entity_type_map(dataset, n_entity_types=None, base_concept_priority=None):
+    """
+    Dynamically extract concept-to-entity-type mapping from dataset.
+    
+    Args:
+        dataset: ToyCognitiveDataset instance
+        n_entity_types: Maximum number of entity types. If None, uses all unique base concepts found.
+        base_concept_priority: Optional list of base concept names in priority order.
+                             If None, uses common base types: ["animal", "person", "location", "object", "attribute"]
+    
+    Returns:
+        dict: Mapping from concept names to entity type indices (0-indexed)
+    """
+    if base_concept_priority is None:
+        base_concept_priority = ["animal", "person", "location", "object", "attribute"]
+    
+    # Extract all unique concepts from the dataset
+    all_concepts = set()
+    concept_frequencies = {}
+    
+    for sample in dataset:
+        concepts = sample.get("concepts", [])
+        for concept_list in concepts:
+            # Handle both single strings and lists
+            if isinstance(concept_list, str):
+                concept_list = [concept_list]
+            elif not isinstance(concept_list, list):
+                concept_list = [str(concept_list)]
+            
+            for concept in concept_list:
+                all_concepts.add(concept)
+                concept_frequencies[concept] = concept_frequencies.get(concept, 0) + 1
+    
+    # Create mapping: prioritize base concepts in order, then add others by frequency
+    concept_to_entity_type_map = {}
+    entity_type_idx = 0
+    
+    # First, map base concepts in priority order (if they exist in dataset)
+    for base_concept in base_concept_priority:
+        if base_concept in all_concepts:
+            if n_entity_types is None or entity_type_idx < n_entity_types:
+                concept_to_entity_type_map[base_concept] = entity_type_idx
+                entity_type_idx += 1
+    
+    # Then, add other high-frequency concepts (if we have room)
+    remaining_concepts = sorted(
+        [(concept, freq) for concept, freq in concept_frequencies.items() 
+         if concept not in concept_to_entity_type_map],
+        key=lambda x: x[1],
+        reverse=True
+    )
+    
+    for concept, freq in remaining_concepts:
+        if n_entity_types is None or entity_type_idx < n_entity_types:
+            concept_to_entity_type_map[concept] = entity_type_idx
+            entity_type_idx += 1
+        else:
+            break
+    
+    if len(concept_to_entity_type_map) == 0:
+        print("Warning: No concepts found in dataset. Using empty mapping.")
+    
+    return concept_to_entity_type_map
+
+
+def extract_relation_map_from_dataset(dataset):
+    """
+    Dynamically extract relation map from dataset.
+    
+    Args:
+        dataset: ToyCognitiveDataset instance
+    
+    Returns:
+        dict: Mapping from relation names to relation indices (1-indexed, 0 is padding)
+    """
+    all_relations = set()
+    
+    for sample in dataset:
+        relations = sample.get("relations", [])
+        for rel in relations:
+            if len(rel) >= 3:
+                rel_name = rel[2]
+                all_relations.add(rel_name)
+    
+    # Create mapping (1-indexed, 0 is reserved for padding)
+    relation_map = {rel: idx + 1 for idx, rel in enumerate(sorted(all_relations))}
+    
+    return relation_map
+
+
+def generate_soft_logic_rules_from_dataset(dataset, concept_to_entity_type_map, relation_map, 
+                                           min_frequency=2, min_confidence=0.3, 
+                                           max_rules=50, include_negative_rules=True):
+    """
+    Dynamically generate soft logic rules from dataset patterns.
+    
+    Args:
+        dataset: ToyCognitiveDataset instance
+        concept_to_entity_type_map: dict mapping concept names to entity type indices
+        relation_map: dict mapping relation names to relation indices
+        min_frequency: Minimum number of times a (concept_a, concept_b, relation) pattern 
+                      must appear to generate a positive rule (default 2)
+        min_confidence: Minimum confidence threshold for generating rules (default 0.3)
+                       Confidence = frequency / max_frequency_for_relation
+        max_rules: Maximum number of rules to generate (default 50)
+        include_negative_rules: If True, generate negative rules for rare/absent patterns (default True)
+    
+    Returns:
+        list: List of rule dicts with keys: concept_a, concept_b, relation, weight, polarity
+    """
+    # Extract all (concept_a, concept_b, relation) patterns from dataset
+    pattern_counts = {}  # (concept_a, concept_b, relation) -> count
+    relation_totals = {}  # relation -> total count (for confidence calculation)
+    concept_pair_totals = {}  # (concept_a, concept_b) -> total count
+    
+    for sample in dataset:
+        entities = sample.get("entities", [])
+        concepts = sample.get("concepts", [])
+        relations = sample.get("relations", [])
+        
+        # Normalize concepts: convert to lists
+        normalized_concepts = []
+        for concept_list in concepts:
+            if isinstance(concept_list, str):
+                normalized_concepts.append([concept_list])
+            elif isinstance(concept_list, list):
+                normalized_concepts.append(concept_list)
+            else:
+                normalized_concepts.append([str(concept_list)])
+        
+        # Process each relation
+        for rel in relations:
+            if len(rel) >= 3:
+                head_idx, tail_idx, rel_name = rel[0], rel[1], rel[2]
+                
+                # Skip if indices are out of range
+                if head_idx >= len(normalized_concepts) or tail_idx >= len(normalized_concepts):
+                    continue
+                
+                # Get concepts for head and tail entities
+                head_concepts = normalized_concepts[head_idx]
+                tail_concepts = normalized_concepts[tail_idx]
+                
+                # Count patterns for each concept pair
+                for head_concept in head_concepts:
+                    for tail_concept in tail_concepts:
+                        # Only consider concepts that are in the mapping
+                        if head_concept in concept_to_entity_type_map and tail_concept in concept_to_entity_type_map:
+                            pattern = (head_concept, tail_concept, rel_name)
+                            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+                            relation_totals[rel_name] = relation_totals.get(rel_name, 0) + 1
+                            concept_pair = (head_concept, tail_concept)
+                            concept_pair_totals[concept_pair] = concept_pair_totals.get(concept_pair, 0) + 1
+    
+    # Generate positive rules (encourage frequent patterns)
+    rules = []
+    sorted_patterns = sorted(pattern_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    for (concept_a, concept_b, relation), count in sorted_patterns:
+        if len(rules) >= max_rules:
+            break
+        
+        # Check if relation is in relation_map
+        if relation not in relation_map:
+            continue
+        
+        # Calculate confidence
+        rel_total = relation_totals.get(relation, 1)
+        confidence = count / rel_total if rel_total > 0 else 0
+        
+        # Generate positive rule if it meets thresholds
+        if count >= min_frequency and confidence >= min_confidence:
+            # Weight based on frequency and confidence (normalized)
+            weight = min(1.0, count / max(1, min_frequency * 2)) * confidence
+            
+            rules.append({
+                "concept_a": concept_a,
+                "concept_b": concept_b,
+                "relation": relation,
+                "weight": float(weight),
+                "polarity": 1
+            })
+    
+    # Generate negative rules (discourage rare/absent patterns) if requested
+    if include_negative_rules and len(rules) < max_rules:
+        # Find concept pairs that appear together but rarely/never with certain relations
+        all_concept_pairs = set(concept_pair_totals.keys())
+        all_relations = set(relation_map.keys())
+        
+        # For each concept pair, check relations that are rare or absent
+        for concept_a, concept_b in list(all_concept_pairs)[:20]:  # Limit to avoid too many rules
+            if len(rules) >= max_rules:
+                break
+            
+            pair_total = concept_pair_totals.get((concept_a, concept_b), 0)
+            if pair_total < 2:  # Skip if pair is too rare
+                continue
+            
+            # Check each relation
+            for relation in all_relations:
+                if len(rules) >= max_rules:
+                    break
+                
+                pattern = (concept_a, concept_b, relation)
+                count = pattern_counts.get(pattern, 0)
+                
+                # Generate negative rule if pattern is rare or absent
+                if count == 0 or (count == 1 and pair_total >= 3):
+                    # Only add if we have positive examples of this concept pair with other relations
+                    has_other_relations = any(
+                        pattern_counts.get((concept_a, concept_b, r), 0) > 0 
+                        for r in all_relations if r != relation
+                    )
+                    
+                    if has_other_relations:
+                        rules.append({
+                            "concept_a": concept_a,
+                            "concept_b": concept_b,
+                            "relation": relation,
+                            "weight": 0.3,  # Lower weight for negative rules
+                            "polarity": -1
+                        })
+    
+    return rules
+
+
 def configure_soft_logic_rules(model, concept_to_entity_type_map, relation_map, rules_config):
     """
     Configure soft logic rules for the model.
@@ -1324,10 +1591,18 @@ def configure_soft_logic_rules(model, concept_to_entity_type_map, relation_map, 
     for rule in rules_config:
         etype_a = concept_to_entity_type_map.get(rule["concept_a"])
         etype_b = concept_to_entity_type_map.get(rule["concept_b"])
-        rel_idx = relation_map.get(rule["relation"])
+        rel_idx_1indexed = relation_map.get(rule["relation"])
         
-        if etype_a is None or etype_b is None or rel_idx is None:
+        if etype_a is None or etype_b is None or rel_idx_1indexed is None:
             print(f"Warning: Skipping rule {rule} - invalid concept or relation mapping")
+            continue
+        
+        # Convert from 1-indexed (relation_map) to 0-indexed (model expects)
+        rel_idx = rel_idx_1indexed - 1
+        
+        # Check bounds: model expects 0 <= rel_idx < n_relations
+        if rel_idx < 0 or rel_idx >= model.softlogic.n_relations:
+            print(f"Warning: Skipping rule {rule} - relation index {rel_idx} out of bounds (n_relations={model.softlogic.n_relations})")
             continue
         
         weight = rule.get("weight", 1.0)
@@ -1360,21 +1635,24 @@ class Stage2_Symbolic_Trainer:
         
         # Entity classification: token-level predictions
         ent_logits = out["token_ent_logits"]  # (B, L, n_entity_types)
-        # For entity loss, we need to map entity_ids to token positions
-        # Since entity_ids are per-entity (not per-token), we'll use a simplified approach:
+        # For entity loss, we need to map entity types to token positions
+        # Since entity_type_labels are per-entity (not per-token), we'll use a simplified approach:
         # Use the first token of each entity span for supervision
-        # For now, use a pooled representation approach
         B, L, E = ent_logits.shape
         max_entities = batch["entity_ids"].shape[1]
         
-        # Create token-level entity labels (simplified: use entity_ids for first entity tokens)
+        # Create token-level entity type labels (simplified: use entity_type_labels for first entity tokens)
         # This is a simplified approach - in production, you'd use actual span alignments
         entity_token_labels = torch.zeros(B, L, dtype=torch.long, device=enc.device)
         for i in range(B):
             num_ents = (batch["entity_ids"][i] > 0).sum().item()
-            # Assign entity labels to first few tokens (simplified)
+            # Assign entity type labels to first few tokens (simplified)
             for j in range(min(num_ents, L)):
-                entity_token_labels[i, j] = batch["entity_ids"][i, j]
+                # Use entity_type_labels instead of entity_ids
+                entity_type = batch["entity_type_labels"][i, j].item()
+                # Clamp to valid range [0, E-1] to avoid out-of-bounds errors
+                entity_type = min(entity_type, E - 1)
+                entity_token_labels[i, j] = entity_type
         
         ent_loss = self.ce(ent_logits.view(-1, E), entity_token_labels.view(-1))
         
@@ -1608,7 +1886,11 @@ class Stage4_Joint_Trainer:
         for i in range(B):
             num_ents = (batch["entity_ids"][i] > 0).sum().item()
             for j in range(min(num_ents, L)):
-                entity_token_labels[i, j] = batch["entity_ids"][i, j]
+                # Use entity_type_labels instead of entity_ids
+                entity_type = batch["entity_type_labels"][i, j].item()
+                # Clamp to valid range [0, E-1] to avoid out-of-bounds errors
+                entity_type = min(entity_type, E - 1)
+                entity_token_labels[i, j] = entity_type
         ent_loss = self.ce(out["entity_logits"].view(-1, E), entity_token_labels.view(-1))
         
         # Concept loss: multi-label classification
@@ -1782,7 +2064,11 @@ def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1
                  kg_embedding_path: Optional[str] = None,
                  kg_triples_path: Optional[str] = None,
                  kg_entity_mapping: Optional[Dict[str, str]] = None,
-                 kg_type: str = "conceptnet"):
+                 kg_type: str = "conceptnet",
+                 dataset_file_path: Optional[str] = None,
+                 batch_size: int = 8,
+                 num_workers: int = 0,
+                 concept_to_entity_type_map: Optional[Dict[str, int]] = None):
     """
     Run tiered training across 4 stages.
     
@@ -1806,6 +2092,10 @@ def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1
             - Wikidata: Path to Wikidata triples
         kg_entity_mapping: Optional mapping from text entities to KG entities
         kg_type: Type of knowledge graph ("conceptnet", "wikidata", "wordnet", or "generic")
+        dataset_file_path: Optional path to JSONL dataset file. If None, uses hardcoded toy dataset.
+        batch_size: Batch size for training (default 8). Increase for faster training if you have enough memory.
+        num_workers: Number of worker processes for data loading (default 0 = main process only).
+                    Increase for faster data loading, but use 0 on Windows or if you encounter issues.
     """
     model = model.to(device)
     model.train()
@@ -1825,7 +2115,7 @@ def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1
         if kg_loader is not None:
             # Create entity mapping from dataset if not provided
             if kg_entity_mapping is None:
-                ds_temp = ToyCognitiveDataset()
+                ds_temp = ToyCognitiveDataset(jsonl_file_path=dataset_file_path)
                 all_entities = []
                 for sample in ds_temp:
                     all_entities.extend(sample.get("entities", []))
@@ -1853,28 +2143,46 @@ def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1
         print("\nWarning: Model has KG integration enabled but no KG data paths provided.")
         print("Continuing without KG integration.")
     
-    ds = ToyCognitiveDataset()
-    # Expanded concept map to support multiple concepts per entity
-    # When scaling, add all concepts that appear in your dataset here
-    concept_map = {
-        "animal": 1, "attribute": 2, "location": 3, "person": 4, "object": 5,
-        # Additional concepts for richer semantic representation
-        "predator": 6, "prey": 7, "city": 8, "country": 9,
-        "male": 10, "female": 11, "public_space": 12,
-        "professional": 13, "medical": 14, "educator": 15,
-        "subject": 16, "academic": 17, "learner": 18,
-        "building": 19, "knowledge": 20, "technology": 21, "electronic": 22
-    }
-    # Expand relation map to include all relations in dataset
-    relation_map = {
-        "chases": 1, "capital_of": 2, "barks_at": 3, "flies_over": 4, "hunts": 5,
-        "swims_in": 6, "located_in": 7, "flows_through": 8, "loves": 9, "teaches": 10,
-        "owns": 11, "cooks": 12, "met": 13, "on": 14, "fell_from": 15, "runs": 16,
-        "before": 17, "follows": 18, "starts_at": 19, "brings": 20, "leads_to": 21,
-        "galloped_across": 22, "lives_in": 23, "hopped_into": 24, "howled_at": 25,
-        "near": 26, "stands_on": 27, "outside": 28, "contains": 29, "displays": 30,
-        "stretches_along": 31
-    }
+    # Load dataset from file or use toy dataset
+    if dataset_file_path:
+        print(f"\nLoading dataset from: {dataset_file_path}")
+    else:
+        print("\nUsing hardcoded toy dataset")
+    ds = ToyCognitiveDataset(jsonl_file_path=dataset_file_path)
+    
+    # Dynamically extract concept map from dataset
+    # Collect all unique concepts and assign indices (1-indexed, 0 is padding)
+    all_concepts = set()
+    for sample in ds:
+        concepts = sample.get("concepts", [])
+        for concept_list in concepts:
+            if isinstance(concept_list, str):
+                concept_list = [concept_list]
+            elif not isinstance(concept_list, list):
+                concept_list = [str(concept_list)]
+            for concept in concept_list:
+                all_concepts.add(concept)
+    
+    concept_map = {concept: idx + 1 for idx, concept in enumerate(sorted(all_concepts))}
+    print(f"Extracted concept map: {len(concept_map)} concepts")
+    
+    # Dynamically extract relation map from dataset
+    relation_map = extract_relation_map_from_dataset(ds)
+    print(f"Extracted relation map: {len(relation_map)} relations")
+    
+    # Verify that model's n_relations matches the dataset (should match since it was set dynamically)
+    if len(relation_map) != model.softlogic.n_relations:
+        print(f"Warning: Dataset has {len(relation_map)} relations, but model has n_relations={model.softlogic.n_relations}")
+        print(f"  This may cause issues. Relations beyond index {model.softlogic.n_relations-1} will be ignored in soft logic rules")
+    
+    # Extract concept_to_entity_type_map if not provided
+    if concept_to_entity_type_map is None:
+        concept_to_entity_type_map = extract_concept_to_entity_type_map(
+            ds,
+            n_entity_types=model.n_entity_types,
+            base_concept_priority=["animal", "person", "location", "object", "attribute"]
+        )
+        print(f"Extracted concept-to-entity-type mapping: {concept_to_entity_type_map}")
     
     # Configure soft logic rules if provided
     if soft_logic_rules is not None:
@@ -1886,11 +2194,41 @@ def run_training(tokenizer, model, device="cpu", epochs_per_stage=1, skip_stage1
         )
     
     # Create collators: one without responses for early stages, one with for decoder training
-    collator_basic = CognitiveCollator(tokenizer, concept_map, relation_map, include_responses=False)
-    collator_with_responses = CognitiveCollator(tokenizer, concept_map, relation_map, include_responses=True)
+    # Pass concept_to_entity_type_map if available (for entity type labeling)
+    collator_basic = CognitiveCollator(
+        tokenizer, concept_map, relation_map, 
+        include_responses=False,
+        concept_to_entity_type_map=concept_to_entity_type_map or {}
+    )
+    collator_with_responses = CognitiveCollator(
+        tokenizer, concept_map, relation_map, 
+        include_responses=True,
+        concept_to_entity_type_map=concept_to_entity_type_map or {}
+    )
     
-    dl = DataLoader(ds, batch_size=2, shuffle=True, collate_fn=collator_basic)
-    dl_with_responses = DataLoader(ds, batch_size=2, shuffle=True, collate_fn=collator_with_responses)
+    # Create DataLoaders with configurable batch size and parallel loading
+    # Note: num_workers > 0 can speed up data loading but may cause issues on Windows
+    # Set num_workers=0 if you encounter any multiprocessing errors
+    # pin_memory speeds up GPU transfer but only works with CUDA
+    use_pin_memory = (device == "cuda" or (isinstance(device, torch.device) and device.type == 'cuda'))
+    dl = DataLoader(
+        ds, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=collator_basic,
+        num_workers=num_workers,
+        pin_memory=use_pin_memory
+    )
+    dl_with_responses = DataLoader(
+        ds, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=collator_with_responses,
+        num_workers=num_workers,
+        pin_memory=use_pin_memory
+    )
+    
+    print(f"DataLoader configured: batch_size={batch_size}, num_workers={num_workers}, dataset_size={len(ds)}")
     
     # Move batches to device helper
     def to_device(batch):
@@ -2120,7 +2458,7 @@ if __name__ == "__main__":
     # 2. (Optional) Download KG triples for path reasoning
     # 3. Set the paths below and enable the flags
     # ========================================================================
-    USE_KG = False  # Set to True to enable KG integration
+    USE_KG = True  # Set to True to enable KG integration
     KG_TYPE = "conceptnet"  # Options: "conceptnet", "wikidata", "wordnet", "generic"
     KG_EMBEDDING_PATH = None  # Path to KG embeddings file
     KG_TRIPLES_PATH = None  # Path to KG triples file (for path reasoning)
@@ -2144,13 +2482,45 @@ if __name__ == "__main__":
     # USE_KG_GNN = True
     # ========================================================================
     
+    # Load dataset first to infer n_entity_types dynamically
+    dataset_file_path = "comprehensive_dataset.jsonl"
+    print(f"\nLoading dataset to infer model parameters from: {dataset_file_path}")
+    ds_temp = ToyCognitiveDataset(jsonl_file_path=dataset_file_path)
+    
+    # Dynamically extract concept-to-entity-type mapping from dataset
+    # This maps base concepts (animal, person, location, etc.) to entity type indices
+    # Pass n_entity_types=None to use all unique base concepts found
+    concept_to_entity_type_map = extract_concept_to_entity_type_map(
+        ds_temp, 
+        n_entity_types=None,  # None = use all unique base concepts
+        base_concept_priority=["animal", "person", "location", "object", "attribute"]
+    )
+    
+    # Infer n_entity_types from the extracted mapping
+    n_entity_types = len(concept_to_entity_type_map)
+    if n_entity_types == 0:
+        print("Warning: No entity types found in dataset. Using default n_entity_types=8")
+        n_entity_types = 8
+    else:
+        print(f"Inferred n_entity_types={n_entity_types} from dataset")
+    
+    # Dynamically extract relation map from dataset to infer n_relations
+    relation_map = extract_relation_map_from_dataset(ds_temp)
+    n_relations = len(relation_map)
+    if n_relations == 0:
+        print("Warning: No relations found in dataset. Using default n_relations=32")
+        n_relations = 32
+    else:
+        print(f"Inferred n_relations={n_relations} from dataset")
+    
     # Use pre-trained BERT encoder (hidden_size=768)
     # Set d_model to match BERT's hidden size
     # Optionally use pre-trained T5 decoder for better response generation
     model = NeuroSymbolicLM(
         vocab_size=vocab_size,
         d_model=768,  # BERT-base hidden size
-        n_entity_types=8,
+        n_entity_types=n_entity_types,  # Dynamically inferred from dataset
+        n_relations=n_relations,  # Dynamically inferred from dataset
         n_concepts=512,
         concept_dim=256,
         node_dim=256,
@@ -2169,32 +2539,57 @@ if __name__ == "__main__":
         max_path_length=MAX_PATH_LENGTH
     )
     
-    # Configure soft logic rules
-    # Map concepts to entity types (0-indexed entity type IDs)
-    # Note: entity_types in model are 0-7, concepts in dataset are: animal, person, location, object, attribute
-    concept_to_entity_type_map = {
-        "animal": 0,
-        "person": 1, 
-        "location": 2,
-        "object": 3,
-        "attribute": 4
-    }
+    print(f"Extracted concept-to-entity-type mapping: {concept_to_entity_type_map}")
     
-    # Define soft logic rules
+    # Dynamically generate soft logic rules from dataset patterns
     # Rules specify: when entity type A and entity type B appear, relation R should (or shouldn't) be present
-    soft_logic_rules = {
-        "concept_to_entity_type_map": concept_to_entity_type_map,
-        "rules": [
-            # Encourage: animals can chase other animals
-            {"concept_a": "animal", "concept_b": "animal", "relation": "chases", "weight": 1.0, "polarity": 1},
-            # Encourage: locations can have capital_of relation
-            {"concept_a": "location", "concept_b": "location", "relation": "capital_of", "weight": 1.0, "polarity": 1},
-            # Encourage: animals can live in locations
-            {"concept_a": "animal", "concept_b": "location", "relation": "lives_in", "weight": 1.0, "polarity": 1},
-            # Discourage: attributes shouldn't have capital_of relation
-            {"concept_a": "attribute", "concept_b": "location", "relation": "capital_of", "weight": 0.5, "polarity": -1},
-        ]
-    }
+    # Parameters can be adjusted:
+    #   - min_frequency: Minimum occurrences to generate a positive rule (default 2)
+    #   - min_confidence: Minimum confidence threshold (default 0.3)
+    #   - max_rules: Maximum number of rules to generate (default 50)
+    #   - include_negative_rules: Whether to generate negative rules for rare patterns (default True)
+    USE_DYNAMIC_RULES = True  # Set to False to use manual rules below
+    
+    if USE_DYNAMIC_RULES:
+        print("\nGenerating soft logic rules dynamically from dataset patterns...")
+        generated_rules = generate_soft_logic_rules_from_dataset(
+            ds_temp,
+            concept_to_entity_type_map,
+            relation_map,
+            min_frequency=2,  # Pattern must appear at least 2 times
+            min_confidence=0.2,  # At least 20% confidence
+            max_rules=50,  # Generate up to 50 rules
+            include_negative_rules=True  # Include negative rules for rare patterns
+        )
+        print(f"Generated {len(generated_rules)} soft logic rules from dataset")
+        
+        # Show a few examples
+        if len(generated_rules) > 0:
+            print("Sample generated rules:")
+            for rule in generated_rules[:5]:
+                polarity_str = "ENCOURAGE" if rule["polarity"] == 1 else "DISCOURAGE"
+                print(f"  {polarity_str}: {rule['concept_a']} + {rule['concept_b']} -> {rule['relation']} (weight={rule['weight']:.2f})")
+        
+        soft_logic_rules = {
+            "concept_to_entity_type_map": concept_to_entity_type_map,
+            "rules": generated_rules
+        }
+    else:
+        # Manual rules (fallback option)
+        print("\nUsing manually defined soft logic rules...")
+        soft_logic_rules = {
+            "concept_to_entity_type_map": concept_to_entity_type_map,
+            "rules": [
+                # Encourage: animals can chase other animals (if "animal" is in the mapping)
+                {"concept_a": "animal", "concept_b": "animal", "relation": "chases", "weight": 1.0, "polarity": 1},
+                # Encourage: locations can have capital_of relation (if "location" is in the mapping)
+                {"concept_a": "location", "concept_b": "location", "relation": "capital_of", "weight": 1.0, "polarity": 1},
+                # Encourage: animals can live in locations
+                {"concept_a": "animal", "concept_b": "location", "relation": "lives_in", "weight": 1.0, "polarity": 1},
+                # Discourage: attributes shouldn't have capital_of relation (if "attribute" is in the mapping)
+                {"concept_a": "attribute", "concept_b": "location", "relation": "capital_of", "weight": 0.5, "polarity": -1},
+            ]
+        }
     
     print(f"Model initialized with pre-trained encoder")
     print(f"Encoder hidden size: {model.d_model}")
@@ -2218,6 +2613,22 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
+    # ========================================================================
+    # Training Configuration
+    # ========================================================================
+    # Batch size: Increase for faster training if you have enough GPU/CPU memory
+    # - Small models (BERT-base): try 16-32
+    # - Larger models: try 4-16
+    # - If you get OOM errors, reduce batch_size
+    BATCH_SIZE = 8
+    
+    # Number of workers for data loading: 
+    # - 0 = single process (safer, works on Windows)
+    # - 2-4 = faster loading on Linux/Mac (use if you have CPU cores available)
+    # - Set to 0 if you encounter multiprocessing errors
+    NUM_WORKERS = 0
+    # ========================================================================
+    
     # Run training (Stage 1 will be skipped automatically)
     # soft_logic_weight controls how much the soft logic constraint loss contributes (default 0.1)
     trained_model = run_training(
@@ -2232,7 +2643,14 @@ if __name__ == "__main__":
         kg_embedding_path=KG_EMBEDDING_PATH,
         kg_triples_path=KG_TRIPLES_PATH,
         kg_entity_mapping=None,  # Can provide manual mapping here if needed
-        kg_type=KG_TYPE
+        kg_type=KG_TYPE,
+        # Dataset file path
+        dataset_file_path=dataset_file_path,
+        # Batching parameters
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        # Concept to entity type mapping (for entity type labeling in collator)
+        concept_to_entity_type_map=concept_to_entity_type_map
     )
     
     # Example: Generate responses for some test inputs
