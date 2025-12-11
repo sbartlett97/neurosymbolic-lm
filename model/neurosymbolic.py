@@ -390,6 +390,8 @@ class NeuroSymbolicLM(nn.Module):
         Returns:
             Generated token IDs
         """
+        from transformers.modeling_outputs import BaseModelOutput
+        
         self.eval()
         
         with torch.no_grad():
@@ -408,9 +410,12 @@ class NeuroSymbolicLM(nn.Module):
             node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device)
             combined_mask = torch.cat([attention_mask, node_mask], dim=1)
             
+            # Wrap in BaseModelOutput for T5's generate method
+            encoder_outputs = BaseModelOutput(last_hidden_state=combined_memory)
+            
             # Use T5's generate method with enhanced encoder outputs
             generated = self.t5.generate(
-                encoder_outputs=(combined_memory,),
+                encoder_outputs=encoder_outputs,
                 attention_mask=combined_mask,
                 max_length=max_length,
                 num_beams=num_beams,
