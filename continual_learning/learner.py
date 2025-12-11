@@ -409,7 +409,8 @@ class ContinuousLearner:
             sample["text"],
             return_tensors="pt",
             padding=True,
-            truncation=True
+            truncation=True,
+            max_length=4096
         )
         input_ids = tokenized["input_ids"].to(self.device)
         attention_mask = tokenized["attention_mask"].to(self.device)
@@ -464,7 +465,8 @@ class ContinuousLearner:
                     sample_batch["text"],
                     return_tensors="pt",
                     padding=True,
-                    truncation=True
+                    truncation=True,
+                    max_length=4096
                 )
                 
                 reg_penalty = self.regularizer.penalty(
@@ -497,7 +499,8 @@ class ContinuousLearner:
             texts,
             return_tensors="pt",
             padding=True,
-            truncation=True
+            truncation=True,
+            max_length=4096
         )
         
         input_ids = tokenized["input_ids"].to(self.device)

@@ -489,7 +489,8 @@ class ProductionInference:
             text,
             return_tensors="pt",
             padding=True,
-            truncation=True
+            truncation=True,
+            max_length=4096  # Default max length
         )
         input_ids = tokenized["input_ids"].to(self.device)
         attention_mask = tokenized["attention_mask"].to(self.device)

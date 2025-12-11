@@ -179,7 +179,7 @@ def evaluate_generation(
     with torch.no_grad():
         for sample in eval_samples:
             input_text = sample["text"]
-            tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
+            tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
             input_ids = tokenized["input_ids"].to(device)
             attention_mask = tokenized["attention_mask"].to(device)
             
@@ -312,7 +312,7 @@ def generate_response(
     """
     model.eval()
     
-    tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
+    tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
     

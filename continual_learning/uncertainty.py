@@ -339,7 +339,8 @@ class UncertaintyEstimator:
                 sample["text"],
                 return_tensors="pt",
                 padding=True,
-                truncation=True
+                truncation=True,
+                max_length=4096
             )
             input_ids = tokenized["input_ids"].to(device)
             attention_mask = tokenized["attention_mask"].to(device)
