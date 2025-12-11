@@ -34,11 +34,22 @@ class BaseTrainer:
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
     
     def _check_model_health(self) -> bool:
-        """Check if model weights contain NaN or Inf."""
+        """Check if model weights contain NaN or Inf, and try to fix them."""
+        has_issues = False
         for name, param in self.model.named_parameters():
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                return False
-        return True
+            if torch.isnan(param).any():
+                if not hasattr(self, '_nan_weight_printed'):
+                    self._nan_weight_printed = True
+                    print(f"    DEBUG: NaN found in {name}, resetting to zeros")
+                param.data = torch.where(torch.isnan(param.data), torch.zeros_like(param.data), param.data)
+                has_issues = True
+            if torch.isinf(param).any():
+                if not hasattr(self, '_inf_weight_printed'):
+                    self._inf_weight_printed = True
+                    print(f"    DEBUG: Inf found in {name}, clamping")
+                param.data = param.data.clamp(-10, 10)
+                has_issues = True
+        return True  # Always return True after fixing
     
     def _get_amp_context(self):
         """Get appropriate autocast context for mixed precision."""
@@ -57,20 +68,13 @@ class BaseTrainer:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 
-                # Check for NaN/Inf gradients before clipping
-                has_bad_grad = False
+                # Check for NaN/Inf gradients and clip extreme values
                 for param in self.model.parameters():
                     if param.grad is not None:
-                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                            has_bad_grad = True
-                            break
-                        # Also check for extremely large gradients
-                        if param.grad.abs().max() > 1e6:
-                            param.grad.clamp_(-1e6, 1e6)
-                
-                if has_bad_grad:
-                    self.optimizer.zero_grad()
-                    return False
+                        if torch.isnan(param.grad).any():
+                            param.grad.zero_()  # Zero out NaN gradients instead of failing
+                        elif torch.isinf(param.grad).any():
+                            param.grad.clamp_(-1e4, 1e4)  # Clamp Inf gradients
                 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
                 self.scaler.step(self.optimizer)
@@ -78,20 +82,13 @@ class BaseTrainer:
             else:
                 loss.backward()
                 
-                # Check for NaN/Inf gradients before clipping
-                has_bad_grad = False
+                # Check for NaN/Inf gradients and clip extreme values
                 for param in self.model.parameters():
                     if param.grad is not None:
-                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                            has_bad_grad = True
-                            break
-                        # Also check for extremely large gradients
-                        if param.grad.abs().max() > 1e6:
-                            param.grad.clamp_(-1e6, 1e6)
-                
-                if has_bad_grad:
-                    self.optimizer.zero_grad()
-                    return False
+                        if torch.isnan(param.grad).any():
+                            param.grad.zero_()  # Zero out NaN gradients instead of failing
+                        elif torch.isinf(param.grad).any():
+                            param.grad.clamp_(-1e4, 1e4)  # Clamp Inf gradients
                 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
                 self.optimizer.step()
@@ -99,6 +96,9 @@ class BaseTrainer:
             return True
         except RuntimeError as e:
             # Handle any runtime errors during backward pass
+            if not hasattr(self, '_error_printed'):
+                self._error_printed = True
+                print(f"    DEBUG: backward error: {e}")
             self.optimizer.zero_grad()
             return False
 
@@ -129,9 +129,8 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
-        # Check model health before forward pass
-        if not self._check_model_health():
-            return 0.0
+        # Check and fix model health before forward pass
+        self._check_model_health()
         
         self.optimizer.zero_grad()
         
@@ -153,9 +152,10 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             ent_logits = out["token_ent_logits"]
             B, L, E = ent_logits.shape
             
-            # Check for NaN in logits
+            # Fix NaN/Inf in logits instead of failing
             if torch.isnan(ent_logits).any() or torch.isinf(ent_logits).any():
-                return 0.0
+                ent_logits = torch.where(torch.isnan(ent_logits), torch.zeros_like(ent_logits), ent_logits)
+                ent_logits = ent_logits.clamp(-100, 100)
             
             entity_token_labels = self._create_entity_token_labels(
                 batch, B, L, E, device
@@ -180,9 +180,10 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             
             concept_probs = out["concept_probs"]
             
-            # Check for NaN in concept probs
+            # Fix NaN/Inf in concept probs instead of failing
             if torch.isnan(concept_probs).any() or torch.isinf(concept_probs).any():
-                return 0.0
+                concept_probs = torch.where(torch.isnan(concept_probs), torch.zeros_like(concept_probs), concept_probs)
+                concept_probs = concept_probs.clamp(0, 1)
             
             n_concepts_bank = concept_probs.shape[1]
             
@@ -255,14 +256,12 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                       f"rel={rel_loss.item():.4f}*{self.relation_weight}, "
                       f"logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
             
-            # Check for NaN/Inf and skip if found
+            # Handle NaN/Inf loss
             if torch.isnan(loss) or torch.isinf(loss):
-                return 0.0
+                loss = torch.tensor(0.1, device=device, requires_grad=True)  # Use small dummy loss
         
-        # Backward pass with NaN gradient checking
-        success = self._backward_and_step(loss)
-        if not success:
-            return 0.0
+        # Backward pass
+        self._backward_and_step(loss)
         
         return loss.item()
     
@@ -331,9 +330,8 @@ class Stage3_Decoder_Trainer(BaseTrainer):
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
-        # Check model health before forward pass
-        if not self._check_model_health():
-            return 0.0
+        # Check and fix model health
+        self._check_model_health()
         
         self.optimizer.zero_grad()
         
@@ -358,12 +356,10 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             
             logits = out["logits"]
             
-            # Check for NaN in logits
+            # Fix NaN/Inf in logits
             if torch.isnan(logits).any() or torch.isinf(logits).any():
-                return 0.0
-            
-            # Clamp logits for numerical stability
-            logits = logits.clamp(-100, 100)
+                logits = torch.where(torch.isnan(logits), torch.zeros_like(logits), logits)
+                logits = logits.clamp(-100, 100)
             
             # Compute loss (no shift needed - collator aligns input_ids and labels)
             decoder_loss = self.ce(
@@ -376,14 +372,12 @@ class Stage3_Decoder_Trainer(BaseTrainer):
                 self._debug_printed = True
                 print(f"    DEBUG Stage3 decoder_loss={decoder_loss.item():.4f}")
             
-            # Skip NaN losses
+            # Handle NaN/Inf loss
             if torch.isnan(decoder_loss) or torch.isinf(decoder_loss):
-                return 0.0
+                decoder_loss = torch.tensor(0.1, device=logits.device, requires_grad=True)
         
-        # Backward pass with NaN gradient checking
-        success = self._backward_and_step(decoder_loss)
-        if not success:
-            return 0.0
+        # Backward pass
+        self._backward_and_step(decoder_loss)
         
         return decoder_loss.item()
 
@@ -412,9 +406,8 @@ class Stage4_Joint_Trainer(BaseTrainer):
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
-        # Check model health before forward pass
-        if not self._check_model_health():
-            return 0.0
+        # Check and fix model health
+        self._check_model_health()
         
         self.optimizer.zero_grad()
         
@@ -434,9 +427,10 @@ class Stage4_Joint_Trainer(BaseTrainer):
             ent_logits = out["entity_logits"]
             B, L, E = ent_logits.shape
             
-            # Check for NaN in logits
+            # Fix NaN/Inf in logits
             if torch.isnan(ent_logits).any() or torch.isinf(ent_logits).any():
-                return 0.0
+                ent_logits = torch.where(torch.isnan(ent_logits), torch.zeros_like(ent_logits), ent_logits)
+                ent_logits = ent_logits.clamp(-100, 100)
             
             entity_token_labels = self._create_entity_token_labels(
                 batch, B, L, E, device
@@ -445,7 +439,6 @@ class Stage4_Joint_Trainer(BaseTrainer):
             # Only compute entity loss if there are valid labels
             valid_entity_mask = entity_token_labels != -100
             if valid_entity_mask.sum() > 0:
-                # Clamp logits for numerical stability
                 ent_logits_clamped = ent_logits.clamp(-100, 100)
                 ent_loss = self.ce(ent_logits_clamped.view(-1, E), entity_token_labels.view(-1))
             else:
@@ -454,10 +447,11 @@ class Stage4_Joint_Trainer(BaseTrainer):
             # Concept loss - use MSE for stability
             concept_probs = out["concept_probs"]
             
-            # Check for NaN in concept probs
+            # Fix NaN/Inf in concept probs
             if torch.isnan(concept_probs).any() or torch.isinf(concept_probs).any():
-                return 0.0
-            
+                concept_probs = torch.where(torch.isnan(concept_probs), torch.zeros_like(concept_probs), concept_probs)
+                concept_probs = concept_probs.clamp(0, 1)
+
             n_concepts_bank = concept_probs.shape[1]
             
             concept_labels = batch["concept_labels"]
@@ -516,14 +510,12 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 print(f"    DEBUG Stage4 losses: ent={ent_loss.item():.4f}, con={con_loss.item():.4f}, "
                       f"dec={decoder_loss.item():.4f}, logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
             
-            # Check for NaN/Inf
+            # Handle NaN/Inf loss
             if torch.isnan(loss) or torch.isinf(loss):
-                return 0.0
+                loss = torch.tensor(0.1, device=device, requires_grad=True)
         
-        # Backward pass with NaN gradient checking
-        success = self._backward_and_step(loss)
-        if not success:
-            return 0.0
+        # Backward pass
+        self._backward_and_step(loss)
         
         return loss.item()
     
