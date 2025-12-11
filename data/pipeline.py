@@ -521,8 +521,11 @@ class DataPipeline:
     
     SUPPORTED_DATASETS = {
         "docred": {
-            "source": "huggingface",
-            "hf_path": "docred",
+            "source": "github",
+            "urls": {
+                "train": "https://raw.githubusercontent.com/thunlp/DocRED/master/data/train_annotated.json",
+                "dev": "https://raw.githubusercontent.com/thunlp/DocRED/master/data/dev.json",
+            },
             "converter": DocREDConverter,
         },
         "dolly": {
@@ -566,8 +569,49 @@ class DataPipeline:
         
         if config["source"] == "huggingface":
             return self._download_hf(config["hf_path"], max_samples)
+        elif config["source"] == "github":
+            return self._download_github(name, config["urls"], max_samples)
         else:
             raise ValueError(f"Unknown source: {config['source']}")
+    
+    def _download_github(self, name: str, urls: Dict[str, str], max_samples: Optional[int] = None) -> Dict[str, Any]:
+        """Download dataset directly from GitHub URLs."""
+        import urllib.request
+        
+        result = {}
+        
+        for split, url in urls.items():
+            print(f"Downloading {name}/{split} from {url}...")
+            
+            cache_file = self.cache_dir / f"{name}_{split}.json"
+            
+            # Check if cached
+            if cache_file.exists():
+                print(f"  Using cached file: {cache_file}")
+                with open(cache_file) as f:
+                    data = json.load(f)
+            else:
+                # Download
+                try:
+                    with urllib.request.urlopen(url, timeout=60) as response:
+                        content = response.read().decode('utf-8')
+                        data = json.loads(content)
+                        
+                        # Cache it
+                        with open(cache_file, 'w') as f:
+                            f.write(content)
+                        print(f"  Downloaded and cached: {len(data)} items")
+                except Exception as e:
+                    print(f"  Error downloading {split}: {e}")
+                    continue
+            
+            # Apply max_samples limit
+            if max_samples and len(data) > max_samples:
+                data = data[:max_samples]
+            
+            result[split] = data
+        
+        return result
     
     def _download_hf(self, path: str, max_samples: Optional[int] = None) -> Dict[str, Any]:
         """Download from HuggingFace."""
@@ -579,11 +623,28 @@ class DataPipeline:
         print(f"Downloading {path} from HuggingFace...")
         
         try:
-            dataset = load_dataset(path, cache_dir=str(self.cache_dir), trust_remote_code=True)
+            # Try without trust_remote_code first (newer datasets format)
+            dataset = load_dataset(path, cache_dir=str(self.cache_dir))
         except Exception as e:
-            print(f"Error loading dataset: {e}")
-            print("Trying with streaming...")
-            dataset = load_dataset(path, streaming=True, trust_remote_code=True)
+            print(f"Standard load failed: {e}")
+            try:
+                # Try streaming mode
+                print("Trying streaming mode...")
+                dataset = load_dataset(path, streaming=True)
+                # Convert streaming dataset to regular
+                result = {}
+                for split in dataset.keys():
+                    print(f"  Loading {split}...")
+                    data = []
+                    for i, item in enumerate(dataset[split]):
+                        data.append(item)
+                        if max_samples and i + 1 >= max_samples:
+                            break
+                    result[split] = data
+                return result
+            except Exception as e2:
+                print(f"Streaming also failed: {e2}")
+                raise RuntimeError(f"Could not load dataset {path}: {e}, {e2}")
         
         result = {}
         for split in dataset.keys():
@@ -591,6 +652,7 @@ class DataPipeline:
             if max_samples:
                 data = data[:max_samples]
             result[split] = data
+            print(f"  Loaded {split}: {len(data)} samples")
         
         return result
     
