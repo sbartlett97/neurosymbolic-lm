@@ -45,6 +45,15 @@ class NSLM(nn.Module):
         self.relation = EntityRelationHead(hidden, num_ent_labels, num_rel_labels)
         self.symbolic_projector = SymbolicProjector(hidden, num_ent_labels, num_rel_labels)
 
+    def tokenize(self, texts, max_length=512):
+        return self.tokenizer(
+            texts,
+            padding='max_length',
+            truncation=True,
+            max_length=max_length,
+            return_tensors='pt'
+        )
+
     def forward(self, input_ids, attention_mask=None, labels=None):
         enc_out = self.backbone.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
         h = enc_out.last_hidden_state
