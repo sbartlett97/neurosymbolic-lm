@@ -13,9 +13,23 @@ def statement_to_question(text: str) -> str:
     - "X is Y" -> "Is X Y?"
     - "X verb Y" -> "Did X verb Y?" or "Does X verb Y?"
     - "The X verb Y" -> "Did the X verb Y?" or "Does the X verb Y?"
+    
+    If text is already a question, returns it unchanged.
     """
     text = text.strip()
     if not text:
+        return text
+    
+    # Check if already a question - return as-is
+    question_starters = (
+        'Is ', 'Are ', 'Was ', 'Were ', 'Do ', 'Does ', 'Did ', 
+        'Can ', 'Could ', 'Would ', 'Should ', 'Will ', 'Have ', 'Has ', 'Had ',
+        'Where ', 'What ', 'Who ', 'When ', 'Why ', 'How ', 'Which '
+    )
+    if text.startswith(question_starters):
+        # Already a question - ensure it ends with ?
+        if not text.endswith('?'):
+            text = text.rstrip('.') + '?'
         return text
     
     # Remove trailing period
