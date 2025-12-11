@@ -216,16 +216,25 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             for i, (plogits, rels) in enumerate(zip(pair_logits, relations)):
                 if len(rels) == 0 or len(plogits) == 0:
                     continue
+                
+                # Fix NaN/Inf in pair logits before using them
+                if torch.isnan(plogits).any() or torch.isinf(plogits).any():
+                    plogits = torch.where(torch.isnan(plogits), torch.zeros_like(plogits), plogits)
+                    plogits = torch.where(torch.isinf(plogits), torch.zeros_like(plogits), plogits)
+                    plogits = plogits.clamp(-100, 100)
+                
                 for (head_idx, tail_idx, rel_type) in rels:
-                    if head_idx < tail_idx:
-                        pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
-                        # Ensure indices and rel_type are in valid range
-                        if pair_idx < plogits.shape[0] and 0 <= rel_type < plogits.shape[-1]:
-                            # Clamp logits for stability
-                            logits_clamped = plogits[pair_idx].clamp(-100, 100).unsqueeze(0)
-                            target = torch.tensor([rel_type], device=device)
-                            rel_loss = rel_loss + F.cross_entropy(logits_clamped, target)
-                            rel_count += 1
+                    # Skip self-loops
+                    if head_idx == tail_idx:
+                        continue
+                    pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
+                    # Ensure indices and rel_type are in valid range
+                    if pair_idx < plogits.shape[0] and 0 <= rel_type < plogits.shape[-1]:
+                        # Clamp logits for stability
+                        logits_clamped = plogits[pair_idx].clamp(-100, 100).unsqueeze(0)
+                        target = torch.tensor([rel_type], device=device)
+                        rel_loss = rel_loss + F.cross_entropy(logits_clamped, target)
+                        rel_count += 1
             
             # Normalize relation loss
             if rel_count > 0:
