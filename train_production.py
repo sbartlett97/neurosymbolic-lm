@@ -74,7 +74,8 @@ def parse_args():
     
     # Data settings
     parser.add_argument("--data-dir", type=str, default="data/processed", help="Processed data directory")
-    parser.add_argument("--dataset", type=str, default=None, help="Specific dataset file to use")
+    parser.add_argument("--dataset", type=str, default="comprehensive_dataset.jsonl", help="Training dataset file to use")
+    parser.add_argument("--eval-dataset", type=str, default=None, help="Evaluation/validation dataset file (same format as training dataset)")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit number of training samples")
     parser.add_argument("--prepare-data", action="store_true", help="Download and prepare datasets")
     parser.add_argument("--data-sources", type=str, nargs="+", default=["dolly"], 
@@ -310,7 +311,8 @@ def run_training(
     model_config: ModelConfig,
     args,
     logger: TrainingLogger,
-    checkpoint_manager: CheckpointManager
+    checkpoint_manager: CheckpointManager,
+    eval_dataset: Optional[Dataset] = None
 ):
     """Run the full training pipeline."""
     device = args.device
@@ -439,9 +441,10 @@ def run_training(
         
         # Evaluation
         if (epoch + 1) % args.eval_every == 0:
-            print("\n  Evaluating generation...")
+            eval_ds = eval_dataset if eval_dataset is not None else train_dataset
+            print(f"\n  Evaluating generation on {'validation' if eval_dataset else 'training'} set...")
             results = evaluate_generation(
-                model, tokenizer, train_dataset,
+                model, tokenizer, eval_ds,
                 device=device, num_samples=args.num_eval_samples,
                 max_length=model_config.max_output_length
             )
@@ -497,9 +500,10 @@ def run_training(
         
         # Evaluation
         if (epoch + 1) % args.eval_every == 0:
-            print("\n  Evaluating generation...")
+            eval_ds = eval_dataset if eval_dataset is not None else train_dataset
+            print(f"\n  Evaluating generation on {'validation' if eval_dataset else 'training'} set...")
             results = evaluate_generation(
-                model, tokenizer, train_dataset,
+                model, tokenizer, eval_ds,
                 device=device, num_samples=args.num_eval_samples,
                 max_length=model_config.max_output_length
             )
@@ -564,27 +568,37 @@ def main():
             return
     
     # Find training data
-    data_dir = Path(args.data_dir)
-    if args.dataset:
-        train_path = Path(args.dataset)
-    else:
-        # Look for merged or single dataset
-        candidates = [
-            data_dir / "merged_train.jsonl",
-            data_dir / "dolly_train.jsonl",
-            Path("comprehensive_dataset.jsonl"),
-        ]
-        train_path = None
-        for p in candidates:
-            if p.exists():
-                train_path = p
-                break
-        
-        if not train_path:
-            print("\nNo training data found. Run with --prepare-data first or specify --dataset")
-            sys.exit(1)
+    train_path = Path(args.dataset)
+    if not train_path.exists():
+        # Try relative to data_dir if not found
+        train_path = Path(args.data_dir) / args.dataset
+        if not train_path.exists():
+            # Try current directory
+            train_path = Path(args.dataset)
+            if not train_path.exists():
+                print(f"\nTraining dataset not found: {args.dataset}")
+                print("Please specify a valid dataset file with --dataset")
+                sys.exit(1)
     
     print(f"\nTraining data: {train_path}")
+    
+    # Find eval data if specified
+    eval_path = None
+    if args.eval_dataset:
+        eval_path = Path(args.eval_dataset)
+        if not eval_path.exists():
+            # Try relative to data_dir if not found
+            eval_path = Path(args.data_dir) / args.eval_dataset
+            if not eval_path.exists():
+                # Try current directory
+                eval_path = Path(args.eval_dataset)
+                if not eval_path.exists():
+                    print(f"\nWarning: Evaluation dataset not found: {args.eval_dataset}")
+                    print("Continuing without evaluation dataset")
+                    eval_path = None
+        
+        if eval_path:
+            print(f"Evaluation data: {eval_path}")
     
     # Load tokenizer
     print(f"\nLoading tokenizer: {model_config.model_name}")
@@ -592,17 +606,24 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load dataset
-    print(f"Loading dataset...")
+    # Load training dataset
+    print(f"Loading training dataset...")
     train_dataset = load_dataset(train_path, tokenizer, model_config, args.max_samples)
-    print(f"  Loaded {len(train_dataset)} samples")
+    print(f"  Loaded {len(train_dataset)} training samples")
+    
+    # Load eval dataset if provided
+    eval_dataset = None
+    if eval_path:
+        print(f"Loading evaluation dataset...")
+        eval_dataset = load_dataset(eval_path, tokenizer, model_config, None)
+        print(f"  Loaded {len(eval_dataset)} evaluation samples")
     
     # Infer dimensions from dataset
     n_entity_types = model_config.n_entity_types
     n_relations = model_config.n_relations
     n_concepts = model_config.n_concepts
     
-    # Count actual values in dataset
+    # Count actual values in dataset (include both train and eval)
     all_concepts = set()
     all_relations = set()
     for sample in train_dataset:
@@ -612,6 +633,16 @@ def main():
         for rel in sample.get("relations", []):
             if len(rel) >= 3:
                 all_relations.add(rel[2])
+    
+    # Also count from eval dataset if provided
+    if eval_dataset:
+        for sample in eval_dataset:
+            for concept_list in sample.get("concepts", []):
+                for c in concept_list:
+                    all_concepts.add(c)
+            for rel in sample.get("relations", []):
+                if len(rel) >= 3:
+                    all_relations.add(rel[2])
     
     n_concepts = max(n_concepts, len(all_concepts) + 100)
     n_relations = max(n_relations, len(all_relations) + 50)
@@ -674,7 +705,8 @@ def main():
     try:
         model = run_training(
             model, tokenizer, train_dataset,
-            model_config, args, logger, checkpoint_manager
+            model_config, args, logger, checkpoint_manager,
+            eval_dataset=eval_dataset
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
