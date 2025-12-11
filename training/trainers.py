@@ -57,50 +57,18 @@ class BaseTrainer:
             return torch.amp.autocast('cuda')
         return nullcontext()
     
-    def _backward_and_step(self, loss: torch.Tensor) -> bool:
-        """Perform backward pass with gradient clipping and optional AMP.
-        
-        Returns:
-            True if step was successful, False if NaN detected
-        """
-        try:
-            if self.use_amp and self.scaler is not None:
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                
-                # Check for NaN/Inf gradients and clip extreme values
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        if torch.isnan(param.grad).any():
-                            param.grad.zero_()  # Zero out NaN gradients instead of failing
-                        elif torch.isinf(param.grad).any():
-                            param.grad.clamp_(-1e4, 1e4)  # Clamp Inf gradients
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                
-                # Check for NaN/Inf gradients and clip extreme values
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        if torch.isnan(param.grad).any():
-                            param.grad.zero_()  # Zero out NaN gradients instead of failing
-                        elif torch.isinf(param.grad).any():
-                            param.grad.clamp_(-1e4, 1e4)  # Clamp Inf gradients
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-                self.optimizer.step()
-            
-            return True
-        except RuntimeError as e:
-            # Handle any runtime errors during backward pass
-            if not hasattr(self, '_error_printed'):
-                self._error_printed = True
-                print(f"    DEBUG: backward error: {e}")
-            self.optimizer.zero_grad()
-            return False
+    def _backward_and_step(self, loss: torch.Tensor):
+        """Perform backward pass with gradient clipping and optional AMP."""
+        if self.use_amp and self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            self.optimizer.step()
 
 
 class Stage2_Symbolic_Trainer(BaseTrainer):
@@ -111,27 +79,19 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         model,
         optimizer,
         soft_logic_weight: float = 0.1,
-        entity_weight: float = 1.0,
-        concept_weight: float = 1.0,
-        relation_weight: float = 0.5,  # Lower weight for relations initially
         grad_clip_norm: float = 1.0,
         use_amp: bool = False,
         device: str = "cpu"
     ):
         super().__init__(model, optimizer, grad_clip_norm, use_amp, device)
-        # Use ignore_index=-100 instead of 0, as 0 might be a valid entity type
-        self.ce = nn.CrossEntropyLoss(ignore_index=-100)
-        self.bce = nn.BCELoss()  # Use BCELoss since concept_probs are already probabilities
+        # Use ignore_index=0 - entity type 0 is padding/unknown
+        self.ce = nn.CrossEntropyLoss(ignore_index=0)
+        # Use BCEWithLogitsLoss for concept classification (applies sigmoid internally)
+        self.bce = nn.BCEWithLogitsLoss()
         self.soft_logic_weight = soft_logic_weight
-        self.entity_weight = entity_weight
-        self.concept_weight = concept_weight
-        self.relation_weight = relation_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
-        # Check and fix model health before forward pass
-        self._check_model_health()
-        
         self.optimizer.zero_grad()
         
         with self._get_amp_context():
@@ -146,29 +106,15 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             if enc is None:
                 enc = self.model.encode(batch["input_ids"], batch["attention_mask"])
             
-            device = enc.device
-            
             # Entity classification
             ent_logits = out["token_ent_logits"]
             B, L, E = ent_logits.shape
             
-            # Fix NaN/Inf in logits instead of failing
-            if torch.isnan(ent_logits).any() or torch.isinf(ent_logits).any():
-                ent_logits = torch.where(torch.isnan(ent_logits), torch.zeros_like(ent_logits), ent_logits)
-                ent_logits = ent_logits.clamp(-100, 100)
-            
             entity_token_labels = self._create_entity_token_labels(
-                batch, B, L, E, device
+                batch, B, L, E, enc.device
             )
             
-            # Only compute entity loss if there are valid labels
-            valid_entity_mask = entity_token_labels != -100
-            if valid_entity_mask.sum() > 0:
-                # Clamp logits for numerical stability
-                ent_logits_clamped = ent_logits.clamp(-100, 100)
-                ent_loss = self.ce(ent_logits_clamped.view(-1, E), entity_token_labels.view(-1))
-            else:
-                ent_loss = torch.tensor(0.0, device=device)
+            ent_loss = self.ce(ent_logits.view(-1, E), entity_token_labels.view(-1))
             
             # Concept classification
             concept_labels = batch["concept_labels"]
@@ -179,12 +125,6 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             aggregated_concept_labels = (concept_labels * entity_mask.unsqueeze(-1)).sum(dim=1) / num_valid_entities
             
             concept_probs = out["concept_probs"]
-            
-            # Fix NaN/Inf in concept probs instead of failing
-            if torch.isnan(concept_probs).any() or torch.isinf(concept_probs).any():
-                concept_probs = torch.where(torch.isnan(concept_probs), torch.zeros_like(concept_probs), concept_probs)
-                concept_probs = concept_probs.clamp(0, 1)
-            
             n_concepts_bank = concept_probs.shape[1]
             
             if n_concept_types == n_concepts_bank:
@@ -200,19 +140,16 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            # Clamp probabilities for numerical stability
-            concept_probs_clamped = concept_probs.clamp(min=1e-7, max=1-1e-7)
-            target_labels_clamped = target_labels.clamp(min=0.0, max=1.0)
-            
-            # Use MSE loss which is more stable for soft labels
-            con_loss = F.mse_loss(concept_probs_clamped, target_labels_clamped)
+            # Convert concept_probs to logits for BCEWithLogitsLoss
+            eps = 1e-8
+            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
+            con_loss = self.bce(concept_logits, target_labels)
             
             # Relation classification loss
-            rel_loss = torch.tensor(0.0, device=device)
+            rel_loss = torch.tensor(0.0, device=enc.device)
             pair_logits = out["pair_relation_logits"]
             relations = batch["relations"]
             
-            rel_count = 0
             for i, (plogits, rels) in enumerate(zip(pair_logits, relations)):
                 if len(rels) == 0 or len(plogits) == 0:
                     continue
@@ -220,25 +157,16 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                 # Fix NaN/Inf in pair logits before using them
                 if torch.isnan(plogits).any() or torch.isinf(plogits).any():
                     plogits = torch.where(torch.isnan(plogits), torch.zeros_like(plogits), plogits)
-                    plogits = torch.where(torch.isinf(plogits), torch.zeros_like(plogits), plogits)
                     plogits = plogits.clamp(-100, 100)
                 
                 for (head_idx, tail_idx, rel_type) in rels:
-                    # Skip self-loops
-                    if head_idx == tail_idx:
-                        continue
-                    pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
-                    # Ensure indices and rel_type are in valid range
-                    if pair_idx < plogits.shape[0] and 0 <= rel_type < plogits.shape[-1]:
-                        # Clamp logits for stability
-                        logits_clamped = plogits[pair_idx].clamp(-100, 100).unsqueeze(0)
-                        target = torch.tensor([rel_type], device=device)
-                        rel_loss = rel_loss + F.cross_entropy(logits_clamped, target)
-                        rel_count += 1
-            
-            # Normalize relation loss
-            if rel_count > 0:
-                rel_loss = rel_loss / rel_count
+                    if head_idx < tail_idx:
+                        pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
+                        if pair_idx < plogits.shape[0]:
+                            rel_loss = rel_loss + F.cross_entropy(
+                                plogits[pair_idx].unsqueeze(0),
+                                torch.tensor([rel_type], device=plogits.device)
+                            )
             
             # Soft logic loss
             soft_logic_loss = torch.tensor(0.0, device=enc.device)
@@ -249,29 +177,16 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                         out["rel_logits_matrix"]
                     )
             
-            # Apply loss weights
-            weighted_ent = self.entity_weight * ent_loss
-            weighted_con = self.concept_weight * con_loss
-            weighted_rel = self.relation_weight * rel_loss
-            weighted_logic = self.soft_logic_weight * soft_logic_loss
-            
-            loss = weighted_ent + weighted_con + weighted_rel + weighted_logic
+            loss = ent_loss + con_loss + rel_loss + self.soft_logic_weight * soft_logic_loss
             
             # Debug: print component losses on first step
             if not hasattr(self, '_debug_printed'):
                 self._debug_printed = True
-                print(f"    DEBUG Stage2 losses: ent={ent_loss.item():.4f}*{self.entity_weight}, "
-                      f"con={con_loss.item():.4f}*{self.concept_weight}, "
-                      f"rel={rel_loss.item():.4f}*{self.relation_weight}, "
+                print(f"    DEBUG Stage2 losses: ent={ent_loss.item():.4f}, "
+                      f"con={con_loss.item():.4f}, rel={rel_loss.item():.4f}, "
                       f"logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
-            
-            # Handle NaN/Inf loss
-            if torch.isnan(loss) or torch.isinf(loss):
-                loss = torch.tensor(0.1, device=device, requires_grad=True)  # Use small dummy loss
         
-        # Backward pass
         self._backward_and_step(loss)
-        
         return loss.item()
     
     def _get_pair_index(self, i: int, j: int, n: int) -> int:
@@ -288,12 +203,9 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         E: int,
         device: torch.device
     ) -> torch.Tensor:
-        """Create entity token labels aligned to actual token positions.
-        
-        Uses -100 as the ignore index for positions without entity labels.
-        """
-        # Initialize with -100 (ignore index)
-        entity_token_labels = torch.full((B, L), -100, dtype=torch.long, device=device)
+        """Create entity token labels aligned to actual token positions."""
+        # Initialize with 0 (padding - ignored by CrossEntropyLoss with ignore_index=0)
+        entity_token_labels = torch.zeros(B, L, dtype=torch.long, device=device)
         
         entity_token_spans = batch.get("entity_token_spans")
         
@@ -305,20 +217,17 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                     if j >= len(entity_types):
                         break
                     entity_type = entity_types[j].item()
-                    # Ensure entity type is in valid range [0, E-1]
-                    if entity_type >= 0:
-                        entity_type = min(entity_type, E - 1)
-                        for pos in range(start, min(end + 1, L)):
-                            entity_token_labels[i, pos] = entity_type
+                    entity_type = min(entity_type, E - 1)
+                    for pos in range(start, min(end + 1, L)):
+                        entity_token_labels[i, pos] = entity_type
         else:
             # Fallback: assign entity types to first N token positions
             for i in range(B):
                 num_ents = (batch["entity_ids"][i] > 0).sum().item()
                 for j in range(min(num_ents, L)):
                     etype = batch["entity_type_labels"][i, j].item()
-                    if etype >= 0:
-                        etype = min(etype, E - 1)
-                        entity_token_labels[i, j] = etype
+                    etype = min(etype, E - 1)
+                    entity_token_labels[i, j] = etype
         
         return entity_token_labels
 
@@ -409,15 +318,16 @@ class Stage4_Joint_Trainer(BaseTrainer):
         device: str = "cpu"
     ):
         super().__init__(model, optimizer, grad_clip_norm, use_amp, device)
-        self.ce = nn.CrossEntropyLoss(ignore_index=-100)
+        # Use ignore_index=0 for entity classification (0 = padding)
+        self.ce = nn.CrossEntropyLoss(ignore_index=0)
+        # Use ignore_index=-100 for decoder (standard HF convention)
         self.ce_ignore_neg100 = nn.CrossEntropyLoss(ignore_index=-100)
+        # Use BCEWithLogitsLoss for concept classification
+        self.bce = nn.BCEWithLogitsLoss()
         self.soft_logic_weight = soft_logic_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
-        # Check and fix model health
-        self._check_model_health()
-        
         self.optimizer.zero_grad()
         
         decoder_input_ids = batch.get("decoder_input_ids", None)
@@ -430,37 +340,15 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 y_ids=decoder_input_ids
             )
             
-            device = out["entity_logits"].device
-            
             # Entity loss
-            ent_logits = out["entity_logits"]
-            B, L, E = ent_logits.shape
-            
-            # Fix NaN/Inf in logits
-            if torch.isnan(ent_logits).any() or torch.isinf(ent_logits).any():
-                ent_logits = torch.where(torch.isnan(ent_logits), torch.zeros_like(ent_logits), ent_logits)
-                ent_logits = ent_logits.clamp(-100, 100)
-            
+            B, L, E = out["entity_logits"].shape
             entity_token_labels = self._create_entity_token_labels(
-                batch, B, L, E, device
+                batch, B, L, E, out["entity_logits"].device
             )
+            ent_loss = self.ce(out["entity_logits"].view(-1, E), entity_token_labels.view(-1))
             
-            # Only compute entity loss if there are valid labels
-            valid_entity_mask = entity_token_labels != -100
-            if valid_entity_mask.sum() > 0:
-                ent_logits_clamped = ent_logits.clamp(-100, 100)
-                ent_loss = self.ce(ent_logits_clamped.view(-1, E), entity_token_labels.view(-1))
-            else:
-                ent_loss = torch.tensor(0.0, device=device)
-            
-            # Concept loss - use MSE for stability
+            # Concept loss
             concept_probs = out["concept_probs"]
-            
-            # Fix NaN/Inf in concept probs
-            if torch.isnan(concept_probs).any() or torch.isinf(concept_probs).any():
-                concept_probs = torch.where(torch.isnan(concept_probs), torch.zeros_like(concept_probs), concept_probs)
-                concept_probs = concept_probs.clamp(0, 1)
-
             n_concepts_bank = concept_probs.shape[1]
             
             concept_labels = batch["concept_labels"]
@@ -483,10 +371,10 @@ class Stage4_Joint_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            # Clamp values and use MSE for stability
-            concept_probs_clamped = concept_probs.clamp(min=1e-7, max=1-1e-7)
-            target_labels_clamped = target_labels.clamp(min=0.0, max=1.0)
-            con_loss = F.mse_loss(concept_probs_clamped, target_labels_clamped)
+            # Convert concept_probs to logits for BCEWithLogitsLoss
+            eps = 1e-8
+            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
+            con_loss = self.bce(concept_logits, target_labels)
             
             # Decoder loss (includes EOS-based abstention learning)
             decoder_loss = torch.tensor(0.0, device=out["entity_logits"].device)
@@ -494,13 +382,10 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 logits = out["logits"]
                 labels = batch["decoder_labels"]
                 
-                # Only compute if there are valid labels
-                valid_labels = (labels != -100).sum()
-                if valid_labels > 0:
-                    decoder_loss = self.ce_ignore_neg100(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1)
-                    )
+                decoder_loss = self.ce_ignore_neg100(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1)
+                )
             
             # Soft logic loss
             soft_logic_loss = torch.tensor(0.0, device=out["entity_logits"].device)
@@ -518,14 +403,8 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 self._debug_printed = True
                 print(f"    DEBUG Stage4 losses: ent={ent_loss.item():.4f}, con={con_loss.item():.4f}, "
                       f"dec={decoder_loss.item():.4f}, logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
-            
-            # Handle NaN/Inf loss
-            if torch.isnan(loss) or torch.isinf(loss):
-                loss = torch.tensor(0.1, device=device, requires_grad=True)
         
-        # Backward pass
         self._backward_and_step(loss)
-        
         return loss.item()
     
     def _create_entity_token_labels(
@@ -536,12 +415,9 @@ class Stage4_Joint_Trainer(BaseTrainer):
         E: int,
         device: torch.device
     ) -> torch.Tensor:
-        """Create entity token labels aligned to actual token positions.
-        
-        Uses -100 as the ignore index for positions without entity labels.
-        """
-        # Initialize with -100 (ignore index)
-        entity_token_labels = torch.full((B, L), -100, dtype=torch.long, device=device)
+        """Create entity token labels aligned to actual token positions."""
+        # Initialize with 0 (padding - ignored by CrossEntropyLoss with ignore_index=0)
+        entity_token_labels = torch.zeros(B, L, dtype=torch.long, device=device)
         
         entity_token_spans = batch.get("entity_token_spans")
         
@@ -553,19 +429,16 @@ class Stage4_Joint_Trainer(BaseTrainer):
                     if j >= len(entity_types):
                         break
                     entity_type = entity_types[j].item()
-                    # Ensure entity type is in valid range [0, E-1]
-                    if entity_type >= 0:
-                        entity_type = min(entity_type, E - 1)
-                        for pos in range(start, min(end + 1, L)):
-                            entity_token_labels[i, pos] = entity_type
+                    entity_type = min(entity_type, E - 1)
+                    for pos in range(start, min(end + 1, L)):
+                        entity_token_labels[i, pos] = entity_type
         else:
             # Fallback: assign entity types to first N token positions
             for i in range(B):
                 num_ents = (batch["entity_ids"][i] > 0).sum().item()
                 for j in range(min(num_ents, L)):
                     etype = batch["entity_type_labels"][i, j].item()
-                    if etype >= 0:
-                        etype = min(etype, E - 1)
-                        entity_token_labels[i, j] = etype
+                    etype = min(etype, E - 1)
+                    entity_token_labels[i, j] = etype
         
         return entity_token_labels
