@@ -169,6 +169,12 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             
             loss = ent_loss + con_loss + rel_loss + self.soft_logic_weight * soft_logic_loss
             
+            # Debug: print component losses on first step
+            if not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"    DEBUG Stage2 losses: ent={ent_loss.item():.4f}, con={con_loss.item():.4f}, "
+                      f"rel={rel_loss.item():.4f}, logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
+            
             # Check for NaN/Inf and skip if found
             if torch.isnan(loss) or torch.isinf(loss):
                 return 0.0
@@ -269,6 +275,11 @@ class Stage3_Decoder_Trainer(BaseTrainer):
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1)
             )
+            
+            # Debug: print loss on first step
+            if not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"    DEBUG Stage3 decoder_loss={decoder_loss.item():.4f}")
             
             # Skip NaN losses
             if torch.isnan(decoder_loss) or torch.isinf(decoder_loss):
@@ -380,6 +391,12 @@ class Stage4_Joint_Trainer(BaseTrainer):
                     )
             
             loss = ent_loss + con_loss + decoder_loss + self.soft_logic_weight * soft_logic_loss
+            
+            # Debug: print component losses on first step
+            if not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"    DEBUG Stage4 losses: ent={ent_loss.item():.4f}, con={con_loss.item():.4f}, "
+                      f"dec={decoder_loss.item():.4f}, logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
             
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):

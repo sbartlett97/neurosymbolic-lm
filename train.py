@@ -375,20 +375,42 @@ def train_stage(
     model.train()
     global_step = 0
     best_loss = float('inf')
+    zero_loss_count = 0
     
     for epoch in range(num_epochs):
         total_loss = 0.0
         num_batches = 0
+        epoch_zero_losses = 0
         
         for step, batch in enumerate(train_loader):
             # Move to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                      for k, v in batch.items()}
             
+            # Debug first batch of first epoch
+            if debug and epoch == 0 and step == 0:
+                print(f"\n  DEBUG - First batch contents:")
+                print(f"    input_ids shape: {batch['input_ids'].shape}")
+                print(f"    entity_ids shape: {batch['entity_ids'].shape}")
+                print(f"    entity_ids sample: {batch['entity_ids'][0][:5]}")
+                print(f"    entity_type_labels shape: {batch['entity_type_labels'].shape}")
+                print(f"    entity_type_labels sample: {batch['entity_type_labels'][0][:5]}")
+                print(f"    concept_labels shape: {batch['concept_labels'].shape}")
+                print(f"    concept_labels sum per sample: {batch['concept_labels'].sum(dim=(1,2))}")
+                print(f"    relations sample: {batch['relations'][0][:3] if batch['relations'][0] else 'empty'}")
+                if 'decoder_input_ids' in batch:
+                    print(f"    decoder_input_ids shape: {batch['decoder_input_ids'].shape}")
+                    print(f"    decoder_labels shape: {batch['decoder_labels'].shape}")
+                    valid_labels = (batch['decoder_labels'] != -100).sum()
+                    print(f"    valid decoder labels: {valid_labels}")
+            
             loss = trainer.train_step(batch)
             
-            # Skip invalid losses
+            # Track zero losses
             if loss == 0.0 or loss != loss:
+                epoch_zero_losses += 1
+                if epoch == 0 and step < 3:
+                    print(f"    WARNING: Step {step} returned loss=0.0")
                 continue
             
             total_loss += loss
@@ -404,7 +426,7 @@ def train_stage(
                 print(f"  Step {step}: loss={loss:.4f}")
         
         avg_loss = total_loss / max(num_batches, 1)
-        print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f} (valid batches: {num_batches}/{len(train_loader)}, zero losses: {epoch_zero_losses})")
         
         # Save checkpoint
         if (epoch + 1) % save_every == 0:
