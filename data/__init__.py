@@ -23,7 +23,7 @@ from .staged_pipeline import (
     EntityRelationDataset,
     InstructionSample,
     InstructionDataset,
-    DocREDLoader,
+    REBELLoader,
     DollyLoader,
     AlpacaLoader,
 )
@@ -50,7 +50,7 @@ __all__ = [
     "EntityRelationDataset",
     "InstructionSample",
     "InstructionDataset",
-    "DocREDLoader",
+    "REBELLoader",
     "DollyLoader",
     "AlpacaLoader",
 ]

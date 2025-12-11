@@ -110,137 +110,154 @@ class InstructionDataset(Dataset):
 # Data Loaders
 # =============================================================================
 
-class DocREDLoader:
-    """Load DocRED for entity/relation training."""
+class REBELLoader:
+    """Load REBEL dataset for entity/relation training.
     
-    URLS = {
-        "train": "https://raw.githubusercontent.com/thunlp/DocRED/master/data/train_annotated.json",
-        "dev": "https://raw.githubusercontent.com/thunlp/DocRED/master/data/dev.json",
-    }
+    REBEL (Relation Extraction By End-to-end Language generation) is a large-scale
+    dataset linking Wikipedia text to Wikidata relations. It's cleaner and easier
+    to load than DocRED.
     
-    ENTITY_TYPE_MAP = {
-        "PER": "person",
-        "ORG": "organization",
-        "LOC": "location",
-        "TIME": "temporal",
-        "NUM": "quantity",
-        "MISC": "object",
-    }
-    
-    RELATION_MAP = {
-        "P17": "country", "P19": "place_of_birth", "P20": "place_of_death",
-        "P26": "spouse", "P27": "nationality", "P36": "capital",
-        "P50": "author", "P57": "director", "P69": "educated_at",
-        "P108": "employer", "P112": "founded_by", "P127": "owned_by",
-        "P131": "located_in", "P159": "headquarters", "P161": "cast_member",
-        "P170": "creator", "P175": "performer", "P176": "manufacturer",
-        "P178": "developer", "P276": "location", "P495": "country_of_origin",
-        "P569": "birth_date", "P570": "death_date", "P571": "inception",
-        "P577": "publication_date", "P740": "place_of_formation",
-    }
+    Format: Each sample has context text and linearized triplets like:
+        <triplet> Subject <subj> Relation <obj> Object <triplet> ...
+    """
     
     def __init__(self, cache_dir: str = "data/cache"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
     
-    def load(self, split: str = "train", max_samples: Optional[int] = None) -> List[EntityRelationSample]:
-        """Load DocRED and convert to EntityRelationSample format."""
-        if split not in self.URLS:
-            raise ValueError(f"Unknown split: {split}")
+    def load(
+        self, 
+        split: str = "train", 
+        max_samples: Optional[int] = None
+    ) -> List[EntityRelationSample]:
+        """Load REBEL and convert to EntityRelationSample format."""
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("Please install datasets: pip install datasets")
         
-        # Download or use cache
-        cache_file = self.cache_dir / f"docred_{split}.json"
+        print(f"Loading REBEL dataset ({split}) from HuggingFace...")
         
-        if cache_file.exists():
-            print(f"Loading DocRED {split} from cache...")
-            with open(cache_file) as f:
-                raw_data = json.load(f)
-        else:
-            print(f"Downloading DocRED {split}...")
-            url = self.URLS[split]
-            with urllib.request.urlopen(url, timeout=120) as response:
-                content = response.read().decode('utf-8')
-                raw_data = json.loads(content)
-                with open(cache_file, 'w') as f:
-                    f.write(content)
+        dataset = load_dataset(
+            "Babelscape/rebel-dataset",
+            split=split,
+            cache_dir=str(self.cache_dir)
+        )
         
-        # Convert to samples
         samples = []
-        for doc in raw_data:
-            sample = self._convert_document(doc)
+        skipped = 0
+        
+        for item in dataset:
+            sample = self._convert_item(item)
             if sample:
                 samples.append(sample)
                 if max_samples and len(samples) >= max_samples:
                     break
+            else:
+                skipped += 1
         
-        print(f"Loaded {len(samples)} samples from DocRED {split}")
+        print(f"Loaded {len(samples)} samples from REBEL {split} (skipped {skipped})")
         return samples
     
-    def _convert_document(self, doc: Dict) -> Optional[EntityRelationSample]:
-        """Convert a DocRED document to EntityRelationSample."""
-        # Combine sentences into text
-        sentences = doc.get("sents", [])
-        text = " ".join([" ".join(sent) for sent in sentences])
+    def _parse_triplets(self, triplet_str: str) -> List[Tuple[str, str, str]]:
+        """Parse linearized triplet string into (subject, relation, object) tuples.
         
-        # Extract entities
+        Format: <triplet> Subject <subj> Relation <obj> Object <triplet> ...
+        """
+        triplets = []
+        
+        # Split by <triplet> marker
+        parts = triplet_str.split("<triplet>")
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            # Parse: Subject <subj> Relation <obj> Object
+            if "<subj>" in part and "<obj>" in part:
+                try:
+                    # Split at <subj>
+                    subj_split = part.split("<subj>")
+                    if len(subj_split) < 2:
+                        continue
+                    
+                    subject = subj_split[0].strip()
+                    rest = subj_split[1]
+                    
+                    # Split at <obj>
+                    obj_split = rest.split("<obj>")
+                    if len(obj_split) < 2:
+                        continue
+                    
+                    relation = obj_split[0].strip()
+                    obj = obj_split[1].strip()
+                    
+                    # Clean up any trailing markers
+                    obj = obj.split("<")[0].strip()
+                    
+                    if subject and relation and obj:
+                        triplets.append((subject, relation, obj))
+                        
+                except Exception:
+                    continue
+        
+        return triplets
+    
+    def _find_entity_span(self, text: str, entity: str) -> Tuple[int, int]:
+        """Find character span of entity in text."""
+        text_lower = text.lower()
+        entity_lower = entity.lower()
+        
+        idx = text_lower.find(entity_lower)
+        if idx >= 0:
+            return (idx, idx + len(entity))
+        
+        # Fallback: return placeholder span
+        return (0, min(len(entity), len(text)))
+    
+    def _convert_item(self, item: Dict) -> Optional[EntityRelationSample]:
+        """Convert a REBEL item to EntityRelationSample."""
+        context = item.get("context", "")
+        triplet_str = item.get("triplets", "")
+        
+        if not context or not triplet_str:
+            return None
+        
+        # Parse triplets
+        triplets = self._parse_triplets(triplet_str)
+        
+        if not triplets:
+            return None
+        
+        # Extract unique entities and build index
+        entity_to_idx = {}
         entities = []
         entity_types = []
         entity_spans = []
         
-        # Track sentence offsets for span calculation
-        sent_offsets = [0]
-        for sent in sentences:
-            sent_offsets.append(sent_offsets[-1] + len(" ".join(sent)) + 1)
+        for subj, rel, obj in triplets:
+            for ent in [subj, obj]:
+                if ent not in entity_to_idx:
+                    entity_to_idx[ent] = len(entities)
+                    entities.append(ent)
+                    # Infer basic entity type (REBEL doesn't provide types)
+                    entity_types.append("entity")
+                    entity_spans.append(self._find_entity_span(context, ent))
         
-        for vertex in doc.get("vertexSet", []):
-            if not vertex:
-                continue
-            
-            # Use first mention
-            mention = vertex[0]
-            name = mention.get("name", "")
-            etype = mention.get("type", "MISC")
-            sent_id = mention.get("sent_id", 0)
-            pos = mention.get("pos", [0, 1])
-            
-            entities.append(name)
-            entity_types.append(self.ENTITY_TYPE_MAP.get(etype, "object"))
-            
-            # Calculate character span (approximate)
-            if sent_id < len(sentences):
-                sent_text = " ".join(sentences[sent_id])
-                word_start = pos[0]
-                word_end = pos[1]
-                
-                # Convert word indices to character indices
-                words = sentences[sent_id]
-                char_start = sum(len(w) + 1 for w in words[:word_start])
-                char_end = sum(len(w) + 1 for w in words[:word_end]) - 1
-                
-                # Add sentence offset
-                char_start += sent_offsets[sent_id]
-                char_end += sent_offsets[sent_id]
-                
-                entity_spans.append((char_start, char_end))
-            else:
-                entity_spans.append((0, len(name)))
-        
-        # Extract relations
+        # Build relations with entity indices
         relations = []
-        for label in doc.get("labels", []):
-            head_idx = label.get("h", 0)
-            tail_idx = label.get("t", 0)
-            rel_id = label.get("r", "")
-            
-            if head_idx < len(entities) and tail_idx < len(entities):
-                rel_name = self.RELATION_MAP.get(rel_id, rel_id)
-                relations.append((head_idx, tail_idx, rel_name))
+        for subj, rel, obj in triplets:
+            head_idx = entity_to_idx.get(subj, -1)
+            tail_idx = entity_to_idx.get(obj, -1)
+            if head_idx >= 0 and tail_idx >= 0:
+                relations.append((head_idx, tail_idx, rel))
         
-        if not entities:
+        if not entities or not relations:
             return None
         
         return EntityRelationSample(
-            text=text,
+            text=context,
             entities=entities,
             entity_types=entity_types,
             entity_spans=entity_spans,
@@ -343,24 +360,26 @@ class StagedDataPipeline:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        self.docred_loader = DocREDLoader(str(self.cache_dir))
+        self.rebel_loader = REBELLoader(str(self.cache_dir))
         self.dolly_loader = DollyLoader(str(self.cache_dir))
         self.alpaca_loader = AlpacaLoader(str(self.cache_dir))
     
     def prepare_stage1_data(
         self,
         max_samples: Optional[int] = None,
+        split: str = "train",
         save: bool = True
     ) -> EntityRelationDataset:
         """Prepare data for Stage 1: Entity/Relation training.
         
-        Uses DocRED for entity and relation extraction training.
+        Uses REBEL dataset for entity and relation extraction training.
+        REBEL is cleaner and easier to load than DocRED.
         """
         print("\n" + "=" * 60)
-        print("Preparing Stage 1: Entity/Relation Dataset")
+        print("Preparing Stage 1: Entity/Relation Dataset (REBEL)")
         print("=" * 60)
         
-        samples = self.docred_loader.load("train", max_samples)
+        samples = self.rebel_loader.load(split, max_samples)
         
         if save:
             path = self.output_dir / "stage1_entity_relation.jsonl"

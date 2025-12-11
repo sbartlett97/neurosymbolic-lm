@@ -2,7 +2,7 @@
 """Staged training script following modern LLM training paradigm.
 
 Training Stages:
-1. Entity/Relation Training - Uses DocRED for entity extraction, relation 
+1. Entity/Relation Training - Uses REBEL for entity extraction, relation 
    classification, concept mapping, and GNN training
 2. Instruction Tuning - Uses Dolly/Alpaca for decoder training with simple
    input/output pairs (no entity annotations needed)
@@ -312,7 +312,7 @@ def main():
     # ========================================================================
     if args.stage in ["1", "all"] and has_stage1:
         print("\n" + "=" * 60)
-        print("Stage 1: Entity/Relation Training (DocRED)")
+        print("Stage 1: Entity/Relation Training (REBEL)")
         print("=" * 60)
         print("Training: Entity classifier, Concept bank, GNN, Relation scorer")
         
