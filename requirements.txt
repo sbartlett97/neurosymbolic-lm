@@ -1,6 +1,29 @@
+# Core dependencies
 torch
-torchvision
 numpy
 transformers
+
+# For LongT5 and advanced models
+sentencepiece
+protobuf
+
+# Data handling
+datasets
+jsonlines
+
+# Knowledge graph utilities
 networkx
-tensorboard  # Optional: for training visualization
+
+# Evaluation metrics
+sacrebleu
+rouge-score
+
+# Training utilities
+tensorboard
+tqdm
+
+# Optional: For faster attention (requires CUDA)
+# flash-attn  # pip install flash-attn --no-build-isolation
+
+# Optional: Memory profiling
+# memory-profiler

@@ -1,6 +1,200 @@
 """Training utilities for extraction and configuration."""
 
 from typing import Dict, List, Optional
+from pathlib import Path
+from datetime import datetime
+import torch
+
+# Optional TensorBoard support
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+    SummaryWriter = None
+
+
+class EarlyStopping:
+    """Early stopping to prevent overfitting."""
+    
+    def __init__(self, patience: int = 5, min_delta: float = 0.0, mode: str = "min"):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+    
+    def __call__(self, score: float) -> bool:
+        if self.best_score is None:
+            self.best_score = score
+            return False
+        
+        if self.mode == "min":
+            improved = score < self.best_score - self.min_delta
+        else:
+            improved = score > self.best_score + self.min_delta
+        
+        if improved:
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        
+        return self.early_stop
+    
+    def reset(self):
+        """Reset the early stopping state."""
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+
+class CheckpointManager:
+    """Manage model checkpoints during training."""
+    
+    def __init__(
+        self,
+        save_dir: str = "checkpoints",
+        max_checkpoints: int = 3,
+        save_best_only: bool = False
+    ):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.max_checkpoints = max_checkpoints
+        self.save_best_only = save_best_only
+        self.best_score = None
+        self.checkpoints: List[Path] = []
+    
+    def save(
+        self,
+        model,
+        optimizer,
+        epoch: int,
+        stage: str,
+        score: float,
+        config: Optional[Dict] = None
+    ) -> Optional[Path]:
+        """Save a checkpoint.
+        
+        Args:
+            model: The model to save
+            optimizer: The optimizer (can be None)
+            epoch: Current epoch number
+            stage: Training stage name
+            score: Current score/loss value
+            config: Optional config dict to save
+        
+        Returns:
+            Path to saved checkpoint or None if not saved
+        """
+        if self.save_best_only:
+            if self.best_score is not None and score >= self.best_score:
+                return None
+            self.best_score = score
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"checkpoint_{stage}_epoch{epoch}_{timestamp}.pt"
+        filepath = self.save_dir / filename
+        
+        checkpoint = {
+            "epoch": epoch,
+            "stage": stage,
+            "model_state_dict": model.state_dict(),
+            "score": score,
+            "config": config
+        }
+        
+        if optimizer is not None:
+            checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+        
+        torch.save(checkpoint, filepath)
+        self.checkpoints.append(filepath)
+        
+        # Remove old checkpoints
+        while len(self.checkpoints) > self.max_checkpoints:
+            old_checkpoint = self.checkpoints.pop(0)
+            if old_checkpoint.exists():
+                old_checkpoint.unlink()
+        
+        print(f"Saved checkpoint: {filepath}")
+        return filepath
+    
+    def load_latest(self, model, optimizer=None) -> Optional[Dict]:
+        """Load the most recent checkpoint."""
+        if not self.checkpoints:
+            existing = sorted(self.save_dir.glob("checkpoint_*.pt"))
+            if existing:
+                self.checkpoints = existing
+        
+        if not self.checkpoints:
+            return None
+        
+        latest = self.checkpoints[-1]
+        return self.load(latest, model, optimizer)
+    
+    def load(self, filepath: Path, model, optimizer=None) -> Dict:
+        """Load a specific checkpoint."""
+        checkpoint = torch.load(filepath, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        print(f"Loaded checkpoint: {filepath}")
+        return checkpoint
+
+
+class TrainingLogger:
+    """TensorBoard logging wrapper with fallback."""
+    
+    def __init__(
+        self,
+        log_dir: str = "runs",
+        experiment_name: Optional[str] = None,
+        enable_tensorboard: bool = True
+    ):
+        self.enabled = enable_tensorboard and TENSORBOARD_AVAILABLE
+        self.writer = None
+        
+        if self.enabled:
+            if experiment_name:
+                log_path = f"{log_dir}/{experiment_name}"
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_path = f"{log_dir}/{timestamp}"
+            
+            self.writer = SummaryWriter(log_dir=log_path)
+            print(f"TensorBoard logging to: {log_path}")
+        elif enable_tensorboard:
+            print("TensorBoard not available. Install with: pip install tensorboard")
+    
+    def log_scalar(self, tag: str, value: float, step: int):
+        """Log a scalar value."""
+        if self.enabled and self.writer:
+            self.writer.add_scalar(tag, value, step)
+    
+    def log_scalars(self, main_tag: str, tag_scalar_dict: Dict[str, float], step: int):
+        """Log multiple scalars."""
+        if self.enabled and self.writer:
+            self.writer.add_scalars(main_tag, tag_scalar_dict, step)
+    
+    def log_histogram(self, tag: str, values, step: int):
+        """Log a histogram."""
+        if self.enabled and self.writer:
+            self.writer.add_histogram(tag, values, step)
+    
+    def log_text(self, tag: str, text: str, step: int):
+        """Log text."""
+        if self.enabled and self.writer:
+            self.writer.add_text(tag, text, step)
+    
+    def close(self):
+        """Close the logger."""
+        if self.writer:
+            self.writer.close()
 
 
 def extract_concept_to_entity_type_map(

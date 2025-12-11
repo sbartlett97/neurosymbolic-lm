@@ -6,31 +6,36 @@ from typing import Optional, List, Dict
 
 @dataclass
 class ModelConfig:
-    """Configuration for the NeuroSymbolicLM model."""
+    """Configuration for the NeuroSymbolicLM model.
     
-    vocab_size: int = 30522  # BERT default
-    d_model: int = 768  # BERT-base hidden size
-    n_entity_types: int = 8
-    n_relations: int = 32
-    n_concepts: int = 512  # Can be set dynamically based on dataset
+    Supports both standard T5 and LongT5 for extended context windows.
+    
+    For RTX 4090 (24GB VRAM) recommendations:
+    - Standard T5-base: up to ~4k context with gradient checkpointing
+    - LongT5-base (TGlobal): up to ~16k context with gradient checkpointing
+    - LongT5-large: up to ~8k context with gradient checkpointing
+    """
+    
+    # Model backbone
+    model_name: str = "google/long-t5-tglobal-base"  # Long context by default
+    
+    # Context lengths
+    max_input_length: int = 4096  # Start conservative, scale up
+    max_output_length: int = 1024  # Output typically shorter
+    
+    # Architecture settings
+    d_model: int = 768  # Will be set from model config
+    n_entity_types: int = 16  # Expanded for production
+    n_relations: int = 128  # Expanded for production
+    n_concepts: int = 1024  # Expanded for production
     concept_dim: int = 256
     node_dim: int = 256
-    max_nodes: int = 16
+    max_nodes: int = 32  # More nodes for longer documents
     dropout: float = 0.1
     
-    # Encoder settings
-    use_pretrained_encoder: bool = True
-    pretrained_model_name: str = "bert-base-uncased"
-    freeze_encoder: bool = True
-    encoder_nhead: int = 8
-    encoder_nlayer: int = 6
-    
-    # Decoder settings
-    use_pretrained_decoder: bool = True
-    pretrained_decoder_name: str = "t5-small"
+    # Freeze options
+    freeze_encoder: bool = False
     freeze_decoder: bool = False
-    decoder_nhead: int = 8
-    decoder_nlayer: int = 6
     
     # Knowledge graph settings
     use_kg: bool = False
@@ -38,6 +43,62 @@ class ModelConfig:
     use_kg_gnn: bool = False
     use_path_reasoning: bool = False
     max_path_length: int = 3
+    
+    # Memory efficiency
+    gradient_checkpointing: bool = True
+    use_flash_attention: bool = True  # If available
+    
+    @classmethod
+    def for_4090_16k(cls) -> "ModelConfig":
+        """Optimized config for RTX 4090 with 16k context."""
+        return cls(
+            model_name="google/long-t5-tglobal-base",
+            max_input_length=16384,
+            max_output_length=2048,
+            n_entity_types=16,
+            n_relations=128,
+            n_concepts=1024,
+            max_nodes=48,
+            gradient_checkpointing=True,
+            use_flash_attention=True,
+        )
+    
+    @classmethod
+    def for_4090_8k(cls) -> "ModelConfig":
+        """Conservative config for RTX 4090 with 8k context."""
+        return cls(
+            model_name="google/long-t5-tglobal-base",
+            max_input_length=8192,
+            max_output_length=2048,
+            n_entity_types=16,
+            n_relations=128,
+            n_concepts=1024,
+            max_nodes=32,
+            gradient_checkpointing=True,
+            use_flash_attention=True,
+        )
+    
+    @classmethod
+    def for_testing(cls) -> "ModelConfig":
+        """Small config for testing and development."""
+        return cls(
+            model_name="google/long-t5-tglobal-base",
+            max_input_length=512,
+            max_output_length=256,
+            n_entity_types=8,
+            n_relations=32,
+            n_concepts=256,
+            max_nodes=16,
+            gradient_checkpointing=False,
+        )
+
+
+# Preset configurations for common hardware
+MODEL_PRESETS = {
+    "4090-16k": ModelConfig.for_4090_16k,
+    "4090-8k": ModelConfig.for_4090_8k,
+    "testing": ModelConfig.for_testing,
+}
 
 
 @dataclass
@@ -97,6 +158,92 @@ class TrainingConfig:
     min_rule_confidence: float = 0.2
     max_rules: int = 50
     include_negative_rules: bool = True
+
+
+@dataclass
+class ProductionTrainingConfig:
+    """Configuration for production-scale training with memory efficiency.
+    
+    Optimized for single RTX 4090 (24GB VRAM) with gradient accumulation
+    and mixed precision training.
+    """
+    
+    # Hardware
+    device: str = "cuda"
+    num_workers: int = 4
+    
+    # Batch settings - effective batch = batch_size * gradient_accumulation
+    batch_size: int = 2  # Per-device batch size
+    gradient_accumulation_steps: int = 8  # Effective batch size = 16
+    
+    # Training duration
+    epochs_per_stage: int = 10
+    max_steps: Optional[int] = None  # Override epochs if set
+    
+    # Optimizer settings
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+    max_grad_norm: float = 1.0
+    
+    # Memory efficiency
+    use_amp: bool = True  # Mixed precision
+    gradient_checkpointing: bool = True
+    
+    # Checkpointing
+    checkpoint_dir: str = "checkpoints"
+    save_every_n_epochs: int = 1
+    max_checkpoints: int = 5
+    
+    # Evaluation
+    eval_every_n_epochs: int = 2
+    num_eval_samples: int = 10
+    
+    # Logging
+    log_dir: str = "runs"
+    enable_tensorboard: bool = True
+    
+    # Early stopping
+    early_stopping_patience: int = 3
+    
+    # Data
+    data_dir: str = "data/processed"
+    max_samples: Optional[int] = None
+    
+    @classmethod
+    def for_4090(cls) -> "ProductionTrainingConfig":
+        """Optimized settings for RTX 4090."""
+        return cls(
+            batch_size=2,
+            gradient_accumulation_steps=8,
+            use_amp=True,
+            gradient_checkpointing=True,
+            num_workers=4,
+        )
+    
+    @classmethod
+    def for_a100(cls) -> "ProductionTrainingConfig":
+        """Optimized settings for A100 (40GB/80GB)."""
+        return cls(
+            batch_size=8,
+            gradient_accumulation_steps=4,
+            use_amp=True,
+            gradient_checkpointing=True,
+            num_workers=8,
+        )
+    
+    @classmethod
+    def for_testing(cls) -> "ProductionTrainingConfig":
+        """Quick testing configuration."""
+        return cls(
+            batch_size=2,
+            gradient_accumulation_steps=1,
+            epochs_per_stage=2,
+            eval_every_n_epochs=1,
+            max_samples=100,
+            use_amp=False,
+            gradient_checkpointing=False,
+        )
 
 
 @dataclass

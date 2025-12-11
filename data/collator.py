@@ -18,7 +18,9 @@ class CognitiveCollator:
         concept_map: Dict[str, int], 
         relation_map: Dict[str, int], 
         include_responses: bool = False, 
-        concept_to_entity_type_map: Optional[Dict[str, int]] = None
+        concept_to_entity_type_map: Optional[Dict[str, int]] = None,
+        max_length: int = 512,
+        max_output_length: int = 256
     ):
         """
         Initialize the collator.
@@ -29,6 +31,8 @@ class CognitiveCollator:
             relation_map: Mapping from relation names to indices (1-indexed)
             include_responses: Whether to include decoder inputs/labels
             concept_to_entity_type_map: Mapping from concepts to entity type indices
+            max_length: Maximum input sequence length
+            max_output_length: Maximum output/response sequence length
         """
         self.tokenizer = tokenizer
         self.concept_map = concept_map
@@ -36,6 +40,8 @@ class CognitiveCollator:
         self.include_responses = include_responses
         self.concept_to_entity_type_map = concept_to_entity_type_map or {}
         self.n_concepts = max(concept_map.values()) if concept_map else 0
+        self.max_length = max_length
+        self.max_output_length = max_output_length
     
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
         """
@@ -48,7 +54,13 @@ class CognitiveCollator:
             Dictionary with batched tensors
         """
         texts = [x["text"] for x in batch]
-        tok = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+        tok = self.tokenizer(
+            texts, 
+            padding=True, 
+            truncation=True, 
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
         
         max_entities = max(len(x["entities"]) for x in batch) if batch else 1
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
@@ -137,7 +149,7 @@ class CognitiveCollator:
             responses, 
             padding=True, 
             truncation=True, 
-            max_length=128,
+            max_length=self.max_output_length,
             return_tensors="pt",
             add_special_tokens=True
         )

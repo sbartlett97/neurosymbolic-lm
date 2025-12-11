@@ -1,10 +1,16 @@
 """Main NeuroSymbolicLM model combining all components.
 
-This implementation uses T5 as a unified encoder-decoder backbone,
+This implementation uses T5/LongT5 as a unified encoder-decoder backbone,
 avoiding tokenizer mismatches between separate encoder/decoder models.
+
+Supports:
+- Standard T5 (t5-small, t5-base, t5-large)
+- LongT5 with transient global attention (google/long-t5-tglobal-base)
+- Gradient checkpointing for memory efficiency
+- Flash attention where available
 """
 
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,17 +23,21 @@ from .logic import SoftLogicConstraints, pair_logits_to_matrix
 
 class NeuroSymbolicLM(nn.Module):
     """
-    Neurosymbolic Language Model using T5 as unified encoder-decoder backbone.
+    Neurosymbolic Language Model using T5/LongT5 as unified encoder-decoder backbone.
     
     This design uses a single model and tokenizer throughout, avoiding the
     complexity of mixing different encoder/decoder architectures.
     
+    For long context (8k-16k tokens), use LongT5 models:
+    - google/long-t5-tglobal-base (recommended for RTX 4090)
+    - google/long-t5-tglobal-large (requires more VRAM)
+    
     Components:
-    - T5 encoder for text understanding
+    - T5/LongT5 encoder for text understanding
     - Entity/concept extraction from encoder outputs
     - Graph neural network for relational reasoning
     - Soft logic constraints for symbolic reasoning
-    - T5 decoder for response generation
+    - T5/LongT5 decoder for response generation
     
     Abstention Behavior:
     The model learns when to abstain through the decoder generating EOS tokens.
@@ -35,11 +45,16 @@ class NeuroSymbolicLM(nn.Module):
     immediately, effectively learning to "stay silent" without needing a
     separate decision head. This is simpler and more effective than using
     a separate Controller head for abstention decisions.
+    
+    Memory Efficiency:
+    - Supports gradient checkpointing to reduce VRAM usage
+    - Compatible with mixed precision training (AMP)
+    - LongT5's transient global attention is more efficient than full attention
     """
     
     def __init__(
         self,
-        model_name: str = "t5-small",
+        model_name: str = "google/long-t5-tglobal-base",
         n_entity_types: int = 8,
         n_relations: int = 32,
         n_concepts: int = 512,
@@ -52,16 +67,37 @@ class NeuroSymbolicLM(nn.Module):
         kg_embed_dim: int = 300,
         use_kg_gnn: bool = False,
         use_path_reasoning: bool = False,
-        max_path_length: int = 3
+        max_path_length: int = 3,
+        gradient_checkpointing: bool = False,
+        max_input_length: int = 4096,
+        max_output_length: int = 1024,
     ):
         super().__init__()
-        from transformers import T5ForConditionalGeneration, T5Config
         
-        # Load T5 model
-        self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
+        # Determine model type and load appropriately
+        self.model_name = model_name
+        self.is_long_t5 = "long-t5" in model_name.lower()
+        self.max_input_length = max_input_length
+        self.max_output_length = max_output_length
+        
+        # Load the appropriate model
+        if self.is_long_t5:
+            from transformers import LongT5ForConditionalGeneration
+            print(f"Loading LongT5 model: {model_name}")
+            self.t5 = LongT5ForConditionalGeneration.from_pretrained(model_name)
+        else:
+            from transformers import T5ForConditionalGeneration
+            print(f"Loading T5 model: {model_name}")
+            self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
+        
         self.config = self.t5.config
         self.d_model = self.config.d_model
         self.vocab_size = self.config.vocab_size
+        
+        # Enable gradient checkpointing for memory efficiency
+        if gradient_checkpointing:
+            self.t5.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled")
         
         # Store configuration
         self.n_entity_types = n_entity_types
@@ -70,12 +106,12 @@ class NeuroSymbolicLM(nn.Module):
         self.concept_dim = concept_dim
         self.node_dim = node_dim
         self.max_nodes = max_nodes
-        self.model_name = model_name
         self.use_kg = use_kg
         self.kg_embed_dim = kg_embed_dim
         self.use_kg_gnn = use_kg_gnn
         self.use_path_reasoning = use_path_reasoning
         self.max_path_length = max_path_length
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Freeze options
         if freeze_encoder:

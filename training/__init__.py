@@ -7,6 +7,11 @@ from .trainers import (
     Stage4_Joint_Trainer,
 )
 from .utils import (
+    # Training utilities
+    EarlyStopping,
+    CheckpointManager,
+    TrainingLogger,
+    # Extraction utilities
     extract_concept_to_entity_type_map,
     extract_relation_map_from_dataset,
     generate_soft_logic_rules_from_dataset,
@@ -29,7 +34,11 @@ __all__ = [
     "Stage2_Symbolic_Trainer",
     "Stage3_Decoder_Trainer",
     "Stage4_Joint_Trainer",
-    # Utils
+    # Training utilities
+    "EarlyStopping",
+    "CheckpointManager",
+    "TrainingLogger",
+    # Extraction utilities
     "extract_concept_to_entity_type_map",
     "extract_relation_map_from_dataset",
     "generate_soft_logic_rules_from_dataset",
