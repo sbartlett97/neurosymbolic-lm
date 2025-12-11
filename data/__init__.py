@@ -17,6 +17,16 @@ from .pipeline import (
     InstructionConverter,
     build_vocab_from_datasets,
 )
+from .staged_pipeline import (
+    StagedDataPipeline,
+    EntityRelationSample,
+    EntityRelationDataset,
+    InstructionSample,
+    InstructionDataset,
+    DocREDLoader,
+    DollyLoader,
+    AlpacaLoader,
+)
 
 __all__ = [
     # Dataset
@@ -25,7 +35,7 @@ __all__ = [
     "statement_to_question",
     "recalculate_entity_spans",
     "generate_response_text",
-    # Pipeline
+    # Pipeline (unified)
     "DataPipeline",
     "DatasetConfig",
     "ConvertedSample",
@@ -34,4 +44,13 @@ __all__ = [
     "MetaQAConverter",
     "InstructionConverter",
     "build_vocab_from_datasets",
+    # Staged Pipeline (recommended)
+    "StagedDataPipeline",
+    "EntityRelationSample",
+    "EntityRelationDataset",
+    "InstructionSample",
+    "InstructionDataset",
+    "DocREDLoader",
+    "DollyLoader",
+    "AlpacaLoader",
 ]
