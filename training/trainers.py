@@ -87,22 +87,30 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             if enc is None:
                 enc = self.model.encode(batch["input_ids"], batch["attention_mask"])
             
+            device = enc.device
+            
             # Entity classification
             ent_logits = out["token_ent_logits"]
             B, L, E = ent_logits.shape
             
+            # Check for NaN in logits
+            if torch.isnan(ent_logits).any() or torch.isinf(ent_logits).any():
+                return 0.0
+            
             entity_token_labels = self._create_entity_token_labels(
-                batch, B, L, E, enc.device
+                batch, B, L, E, device
             )
             
             # Only compute entity loss if there are valid labels
             valid_entity_mask = entity_token_labels != -100
             if valid_entity_mask.sum() > 0:
-                ent_loss = self.ce(ent_logits.view(-1, E), entity_token_labels.view(-1))
+                # Clamp logits for numerical stability
+                ent_logits_clamped = ent_logits.clamp(-100, 100)
+                ent_loss = self.ce(ent_logits_clamped.view(-1, E), entity_token_labels.view(-1))
             else:
-                ent_loss = torch.tensor(0.0, device=enc.device)
+                ent_loss = torch.tensor(0.0, device=device)
             
-            # Concept classification - use BCE directly on probabilities
+            # Concept classification
             concept_labels = batch["concept_labels"]
             n_concept_types = concept_labels.shape[2]
             
@@ -111,6 +119,11 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             aggregated_concept_labels = (concept_labels * entity_mask.unsqueeze(-1)).sum(dim=1) / num_valid_entities
             
             concept_probs = out["concept_probs"]
+            
+            # Check for NaN in concept probs
+            if torch.isnan(concept_probs).any() or torch.isinf(concept_probs).any():
+                return 0.0
+            
             n_concepts_bank = concept_probs.shape[1]
             
             if n_concept_types == n_concepts_bank:
@@ -126,7 +139,7 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            # Clamp probabilities to avoid log(0) issues if BCE needs it
+            # Clamp probabilities for numerical stability
             concept_probs_clamped = concept_probs.clamp(min=1e-7, max=1-1e-7)
             target_labels_clamped = target_labels.clamp(min=0.0, max=1.0)
             
@@ -134,10 +147,9 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             con_loss = F.mse_loss(concept_probs_clamped, target_labels_clamped)
             
             # Relation classification loss
-            rel_loss = torch.tensor(0.0, device=enc.device)
+            rel_loss = torch.tensor(0.0, device=device)
             pair_logits = out["pair_relation_logits"]
             relations = batch["relations"]
-            n_relations = self.model.n_relations
             
             rel_count = 0
             for i, (plogits, rels) in enumerate(zip(pair_logits, relations)):
@@ -146,12 +158,12 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                 for (head_idx, tail_idx, rel_type) in rels:
                     if head_idx < tail_idx:
                         pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
-                        # Ensure rel_type is in valid range
+                        # Ensure indices and rel_type are in valid range
                         if pair_idx < plogits.shape[0] and 0 <= rel_type < plogits.shape[-1]:
-                            rel_loss = rel_loss + F.cross_entropy(
-                                plogits[pair_idx].unsqueeze(0),
-                                torch.tensor([rel_type], device=plogits.device)
-                            )
+                            # Clamp logits for stability
+                            logits_clamped = plogits[pair_idx].clamp(-100, 100).unsqueeze(0)
+                            target = torch.tensor([rel_type], device=device)
+                            rel_loss = rel_loss + F.cross_entropy(logits_clamped, target)
                             rel_count += 1
             
             # Normalize relation loss
@@ -325,21 +337,36 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 y_ids=decoder_input_ids
             )
             
+            device = out["entity_logits"].device
+            
             # Entity loss
-            B, L, E = out["entity_logits"].shape
+            ent_logits = out["entity_logits"]
+            B, L, E = ent_logits.shape
+            
+            # Check for NaN in logits
+            if torch.isnan(ent_logits).any() or torch.isinf(ent_logits).any():
+                return 0.0
+            
             entity_token_labels = self._create_entity_token_labels(
-                batch, B, L, E, out["entity_logits"].device
+                batch, B, L, E, device
             )
             
             # Only compute entity loss if there are valid labels
             valid_entity_mask = entity_token_labels != -100
             if valid_entity_mask.sum() > 0:
-                ent_loss = self.ce(out["entity_logits"].view(-1, E), entity_token_labels.view(-1))
+                # Clamp logits for numerical stability
+                ent_logits_clamped = ent_logits.clamp(-100, 100)
+                ent_loss = self.ce(ent_logits_clamped.view(-1, E), entity_token_labels.view(-1))
             else:
-                ent_loss = torch.tensor(0.0, device=out["entity_logits"].device)
+                ent_loss = torch.tensor(0.0, device=device)
             
             # Concept loss - use MSE for stability
             concept_probs = out["concept_probs"]
+            
+            # Check for NaN in concept probs
+            if torch.isnan(concept_probs).any() or torch.isinf(concept_probs).any():
+                return 0.0
+            
             n_concepts_bank = concept_probs.shape[1]
             
             concept_labels = batch["concept_labels"]

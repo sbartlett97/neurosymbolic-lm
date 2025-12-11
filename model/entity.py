@@ -66,9 +66,13 @@ class ConceptBank(nn.Module):
             vec: (B, c_dim) soft-weighted concept vector
             probs: (B, n_concepts) assignment probabilities
         """
-        qn = F.normalize(query, dim=-1)
-        bankn = F.normalize(self.emb, dim=-1)
+        # Use eps to prevent NaN from zero-norm vectors
+        eps = 1e-8
+        qn = F.normalize(query + eps, dim=-1, eps=eps)
+        bankn = F.normalize(self.emb + eps, dim=-1, eps=eps)
         sim = torch.matmul(qn, bankn.t())  # (B, n_concepts)
+        # Clamp similarity to prevent extreme softmax values
+        sim = sim.clamp(-20, 20)
         p = F.softmax(sim, dim=-1)
         vec = torch.matmul(p, self.emb)  # (B, c_dim)
         return vec, p

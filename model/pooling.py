@@ -49,7 +49,17 @@ class MultiQueryPool(nn.Module):
             # Use -1e4 instead of -1e9 for float16 compatibility (max ~65504)
             scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e4)
         
+        # Clamp scores for numerical stability
+        scores = scores.clamp(-1e4, 1e4)
         attn = F.softmax(scores, dim=-1)
+        
+        # Handle case where softmax produces NaN (all tokens masked)
+        if torch.isnan(attn).any():
+            attn = torch.where(torch.isnan(attn), torch.zeros_like(attn), attn)
+            # If entire row is zero, use uniform distribution
+            row_sums = attn.sum(dim=-1, keepdim=True)
+            attn = torch.where(row_sums == 0, torch.ones_like(attn) / L, attn)
+        
         pooled = torch.matmul(attn, V)  # (B, k, H)
         flat = pooled.view(B, -1)
         
