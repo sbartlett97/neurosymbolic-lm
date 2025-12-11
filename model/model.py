@@ -55,7 +55,7 @@ class NSLM(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        enc_out = self.backbone.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        enc_out = self.backbone.encoder(input_ids=input_ids, attention_mask=attention_mask)
         h = enc_out.last_hidden_state
 
         ent_logits, rel_logits = self.relation(h, attention_mask)

@@ -2,7 +2,7 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AdamW
+from torch.optim import AdamW
 from model.model import NSLM
 
 
@@ -156,7 +156,7 @@ def train(dataset_path='dataset.jsonl', model_name='google/long-t5-tglobal-base'
     model = NSLM(model_name=model_name, num_ent_labels=num_ent, num_rel_labels=num_rel)
 
     # freeze encoder
-    for p in model.backbone.model.encoder.parameters():
+    for p in model.backbone.encoder.parameters():
         p.requires_grad = False
 
     model.to(device)
