@@ -165,8 +165,17 @@ def load_dataset(path: Path, max_samples: Optional[int] = None) -> ToyCognitiveD
     return dataset
 
 
-def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict, int, int, int]:
-    """Extract vocabulary mappings from dataset."""
+def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict, Dict, int, int, int]:
+    """Extract vocabulary mappings from dataset.
+    
+    Returns:
+        concept_map: Mapping from concept names to indices (1-indexed)
+        relation_map: Mapping from relation names to indices (1-indexed)
+        entity_type_map: Mapping from concept names to entity type indices (1-indexed)
+        n_entity_types: Number of entity type classes
+        n_relations: Number of relation classes
+        n_concepts: Number of concept classes
+    """
     concepts = set()
     relations = set()
     entity_types = set()
@@ -184,15 +193,17 @@ def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict
             if len(rel) >= 3:
                 relations.add(rel[2])
     
-    # Build maps (1-indexed, 0 is padding)
+    # Build maps (1-indexed, 0 is padding/unknown)
     concept_map = {c: i + 1 for i, c in enumerate(sorted(concepts))}
     relation_map = {r: i + 1 for i, r in enumerate(sorted(relations))}
+    # Entity type map: maps concept names to entity type indices
+    entity_type_map = {c: i + 1 for i, c in enumerate(sorted(entity_types))}
     
     n_entity_types = max(16, len(entity_types) + 4)
     n_relations = max(64, len(relations) + 10)
     n_concepts = max(256, len(concepts) + 50)
     
-    return concept_map, relation_map, n_entity_types, n_relations, n_concepts
+    return concept_map, relation_map, entity_type_map, n_entity_types, n_relations, n_concepts
 
 
 def create_dataloader(
@@ -200,6 +211,7 @@ def create_dataloader(
     tokenizer,
     concept_map: Dict,
     relation_map: Dict,
+    entity_type_map: Dict,
     model_config: ModelConfig,
     batch_size: int,
     num_workers: int,
@@ -211,6 +223,7 @@ def create_dataloader(
         concept_map=concept_map,
         relation_map=relation_map,
         include_responses=include_responses,
+        concept_to_entity_type_map=entity_type_map,
         max_length=model_config.max_input_length,
         max_output_length=model_config.max_output_length
     )
@@ -544,18 +557,19 @@ def main():
         print(f"\nNo eval dataset found at {eval_path} - will skip held-out evaluation")
     
     # Extract vocabulary
-    concept_map, relation_map, n_entity_types, n_relations, n_concepts = \
+    concept_map, relation_map, entity_type_map, n_entity_types, n_relations, n_concepts = \
         extract_vocab_from_dataset(train_dataset)
     
     if stage2_dataset:
-        c2, r2, ne2, nr2, nc2 = extract_vocab_from_dataset(stage2_dataset)
+        c2, r2, et2, ne2, nr2, nc2 = extract_vocab_from_dataset(stage2_dataset)
         concept_map.update(c2)
         relation_map.update(r2)
+        entity_type_map.update(et2)
         n_entity_types = max(n_entity_types, ne2)
         n_relations = max(n_relations, nr2)
         n_concepts = max(n_concepts, nc2)
     
-    print(f"  Entity types: {n_entity_types}")
+    print(f"  Entity types: {len(entity_type_map)} -> capacity {n_entity_types}")
     print(f"  Relations: {len(relation_map)} -> capacity {n_relations}")
     print(f"  Concepts: {len(concept_map)} -> capacity {n_concepts}")
     
@@ -609,7 +623,7 @@ def main():
             p.requires_grad = False
         
         train_loader = create_dataloader(
-            train_dataset, tokenizer, concept_map, relation_map,
+            train_dataset, tokenizer, concept_map, relation_map, entity_type_map,
             model_config, args.batch_size, args.num_workers,
             include_responses=False
         )
@@ -659,7 +673,7 @@ def main():
         decoder_dataset = stage2_dataset if stage2_dataset else train_dataset
         
         train_loader = create_dataloader(
-            decoder_dataset, tokenizer, concept_map, relation_map,
+            decoder_dataset, tokenizer, concept_map, relation_map, entity_type_map,
             model_config, args.batch_size, args.num_workers,
             include_responses=True
         )
@@ -698,7 +712,7 @@ def main():
         joint_dataset = stage2_dataset if stage2_dataset else train_dataset
         
         train_loader = create_dataloader(
-            joint_dataset, tokenizer, concept_map, relation_map,
+            joint_dataset, tokenizer, concept_map, relation_map, entity_type_map,
             model_config, args.batch_size, args.num_workers,
             include_responses=True
         )
