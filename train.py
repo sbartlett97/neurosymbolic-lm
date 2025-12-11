@@ -1,660 +1,742 @@
 #!/usr/bin/env python3
-"""
-Main training script for the Neurosymbolic Language Model.
+"""Unified training script for NeuroSymbolicLM.
 
-This script handles:
-- Model initialization with T5 backbone
-- Dataset loading and preprocessing  
-- Tiered training across multiple stages
-- Learning rate scheduling
-- Model checkpointing
-- Early stopping
-- TensorBoard logging
-- Generation evaluation with metrics
+This script consolidates training logic into a single, configurable pipeline that supports:
+1. Multi-stage training (entity/relation -> decoder -> joint)
+2. Custom datasets in JSONL format
+3. Memory-efficient training with gradient checkpointing and AMP
+4. Automatic dataset preparation from HuggingFace
+5. Proper evaluation on held-out eval dataset
 
 Usage:
-    python train.py
+    # Quick test with local data
+    python train.py --dataset comprehensive_dataset.jsonl --epochs 3
     
-Configure settings in the main() function.
+    # Training with separate eval dataset
+    python train.py --dataset comprehensive_dataset.jsonl --eval-dataset eval_dataset.jsonl
+    
+    # Prepare data from HuggingFace and train
+    python train.py --prepare-data --data-sources rebel dolly
+    
+    # Full training with all stages
+    python train.py --dataset data/staged/stage1_entity_relation.jsonl \
+                    --stage2-dataset data/staged/stage2_instruction.jsonl
+    
+    # Resume from checkpoint
+    python train.py --dataset mydata.jsonl --resume checkpoints/checkpoint.pt
 """
 
-import os
-import torch
-from torch.utils.data import DataLoader
-from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
-from transformers import AutoTokenizer
-from typing import Optional, Dict, List
+import argparse
+import json
+import sys
 from pathlib import Path
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 
-from data import ToyCognitiveDataset, CognitiveCollator
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+from config import ModelConfig, MODEL_PRESETS
 from model import NeuroSymbolicLM
+from data.collator import CognitiveCollator
+from data.dataset import ToyCognitiveDataset
 from training import (
     Stage2_Symbolic_Trainer,
     Stage3_Decoder_Trainer,
     Stage4_Joint_Trainer,
-    extract_concept_to_entity_type_map,
-    extract_relation_map_from_dataset,
-    generate_soft_logic_rules_from_dataset,
-    configure_soft_logic_rules,
+    CheckpointManager,
+    EarlyStopping,
+    TrainingLogger,
     evaluate_generation,
-    print_generation_results,
-    generate_response,
     compute_aggregate_metrics,
+    print_generation_results,
 )
 
-# Optional TensorBoard support
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_AVAILABLE = True
-except ImportError:
-    TENSORBOARD_AVAILABLE = False
-    SummaryWriter = None
 
-
-class EarlyStopping:
-    """Early stopping to prevent overfitting."""
-    
-    def __init__(self, patience: int = 5, min_delta: float = 0.0, mode: str = "min"):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-    
-    def __call__(self, score: float) -> bool:
-        if self.best_score is None:
-            self.best_score = score
-            return False
-        
-        if self.mode == "min":
-            improved = score < self.best_score - self.min_delta
-        else:
-            improved = score > self.best_score + self.min_delta
-        
-        if improved:
-            self.best_score = score
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        
-        return self.early_stop
-
-
-class CheckpointManager:
-    """Manage model checkpoints during training."""
-    
-    def __init__(
-        self,
-        checkpoint_dir: str = "checkpoints",
-        max_checkpoints: int = 3,
-        save_best_only: bool = True
-    ):
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.max_checkpoints = max_checkpoints
-        self.save_best_only = save_best_only
-        self.best_score = None
-        self.checkpoints: List[Path] = []
-    
-    def save(
-        self,
-        model,
-        optimizer,
-        epoch: int,
-        stage: str,
-        score: float,
-        config: Optional[Dict] = None
-    ) -> Optional[Path]:
-        if self.save_best_only:
-            if self.best_score is not None and score >= self.best_score:
-                return None
-            self.best_score = score
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"checkpoint_{stage}_epoch{epoch}_{timestamp}.pt"
-        filepath = self.checkpoint_dir / filename
-        
-        checkpoint = {
-            "epoch": epoch,
-            "stage": stage,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "score": score,
-            "config": config
-        }
-        
-        torch.save(checkpoint, filepath)
-        self.checkpoints.append(filepath)
-        
-        while len(self.checkpoints) > self.max_checkpoints:
-            old_checkpoint = self.checkpoints.pop(0)
-            if old_checkpoint.exists():
-                old_checkpoint.unlink()
-        
-        return filepath
-    
-    def load_latest(self, model, optimizer=None) -> Optional[Dict]:
-        if not self.checkpoints:
-            existing = sorted(self.checkpoint_dir.glob("checkpoint_*.pt"))
-            if existing:
-                self.checkpoints = existing
-        
-        if not self.checkpoints:
-            return None
-        
-        latest = self.checkpoints[-1]
-        return self.load(latest, model, optimizer)
-    
-    def load(self, filepath: Path, model, optimizer=None) -> Dict:
-        checkpoint = torch.load(filepath, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"])
-        
-        if optimizer is not None and "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        
-        return checkpoint
-
-
-class TensorBoardLogger:
-    """TensorBoard logging wrapper."""
-    
-    def __init__(self, log_dir: str = "runs", enabled: bool = True):
-        self.enabled = enabled and TENSORBOARD_AVAILABLE
-        self.writer = None
-        
-        if self.enabled:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.writer = SummaryWriter(log_dir=f"{log_dir}/{timestamp}")
-    
-    def log_scalar(self, tag: str, value: float, step: int):
-        if self.enabled and self.writer:
-            self.writer.add_scalar(tag, value, step)
-    
-    def log_scalars(self, main_tag: str, tag_scalar_dict: Dict[str, float], step: int):
-        if self.enabled and self.writer:
-            self.writer.add_scalars(main_tag, tag_scalar_dict, step)
-    
-    def close(self):
-        if self.writer:
-            self.writer.close()
-
-
-def create_scheduler(optimizer, num_epochs: int, warmup_epochs: int = 2):
-    """Create a learning rate scheduler with warmup."""
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=warmup_epochs
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Unified training for NeuroSymbolicLM",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    main_scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=num_epochs - warmup_epochs,
-        T_mult=1,
-        eta_min=1e-6
-    )
+    # Data
+    data_group = parser.add_argument_group("Data")
+    data_group.add_argument("--dataset", type=str, default="comprehensive_dataset.jsonl",
+                           help="Primary training dataset (JSONL format)")
+    data_group.add_argument("--eval-dataset", type=str, default="eval_dataset.jsonl",
+                           help="Evaluation dataset (JSONL format)")
+    data_group.add_argument("--stage2-dataset", type=str, default=None,
+                           help="Optional separate dataset for decoder training")
+    data_group.add_argument("--max-samples", type=int, default=None,
+                           help="Limit number of training samples")
+    data_group.add_argument("--prepare-data", action="store_true",
+                           help="Download and prepare datasets from HuggingFace")
+    data_group.add_argument("--data-sources", type=str, nargs="+", 
+                           default=["rebel", "dolly"],
+                           help="Data sources to prepare: rebel, dolly, alpaca")
     
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, main_scheduler],
-        milestones=[warmup_epochs]
-    )
+    # Model
+    model_group = parser.add_argument_group("Model")
+    model_group.add_argument("--preset", type=str, default="testing",
+                            choices=list(MODEL_PRESETS.keys()),
+                            help="Hardware preset configuration")
+    model_group.add_argument("--model-name", type=str, default=None,
+                            help="Override model backbone")
     
-    return scheduler
+    # Training stages
+    train_group = parser.add_argument_group("Training")
+    train_group.add_argument("--stages", type=str, nargs="+", 
+                            default=["symbolic", "decoder", "joint"],
+                            choices=["symbolic", "decoder", "joint"],
+                            help="Training stages to run")
+    train_group.add_argument("--epochs", type=int, default=5,
+                            help="Epochs per stage")
+    train_group.add_argument("--batch-size", type=int, default=4,
+                            help="Training batch size")
+    train_group.add_argument("--lr", type=float, default=1e-4,
+                            help="Learning rate")
+    train_group.add_argument("--warmup-ratio", type=float, default=0.1,
+                            help="Warmup ratio")
+    train_group.add_argument("--patience", type=int, default=3,
+                            help="Early stopping patience")
+    
+    # Hardware
+    hw_group = parser.add_argument_group("Hardware")
+    hw_group.add_argument("--device", type=str, default="cuda",
+                         help="Device (cuda/cpu)")
+    hw_group.add_argument("--no-amp", action="store_true",
+                         help="Disable mixed precision training")
+    hw_group.add_argument("--num-workers", type=int, default=2,
+                         help="DataLoader workers")
+    
+    # Checkpointing
+    ckpt_group = parser.add_argument_group("Checkpointing")
+    ckpt_group.add_argument("--output-dir", type=str, default="checkpoints",
+                           help="Output directory for checkpoints")
+    ckpt_group.add_argument("--resume", type=str, default=None,
+                           help="Resume from checkpoint")
+    ckpt_group.add_argument("--save-every", type=int, default=1,
+                           help="Save checkpoint every N epochs")
+    
+    # Logging
+    log_group = parser.add_argument_group("Logging")
+    log_group.add_argument("--log-dir", type=str, default="runs",
+                          help="TensorBoard log directory")
+    log_group.add_argument("--eval-every", type=int, default=2,
+                          help="Evaluate generation every N epochs")
+    log_group.add_argument("--debug", action="store_true",
+                          help="Enable debug output")
+    
+    return parser.parse_args()
 
 
-def run_training(
+def prepare_datasets(args) -> Dict[str, Path]:
+    """Prepare datasets from HuggingFace sources."""
+    from data.staged_pipeline import StagedDataPipeline
+    
+    pipeline = StagedDataPipeline()
+    paths = {}
+    
+    if "rebel" in args.data_sources:
+        print("\nPreparing Stage 1 data (REBEL - entity/relation)...")
+        pipeline.prepare_stage1_data(max_samples=args.max_samples)
+        paths["stage1"] = pipeline.get_stage1_path()
+    
+    if "dolly" in args.data_sources or "alpaca" in args.data_sources:
+        sources = [s for s in args.data_sources if s in ["dolly", "alpaca"]]
+        print(f"\nPreparing Stage 2 data ({sources})...")
+        pipeline.prepare_stage2_data(
+            sources=sources,
+            max_samples_per_source=args.max_samples
+        )
+        paths["stage2"] = pipeline.get_stage2_path()
+    
+    return paths
+
+
+def load_dataset(path: Path, max_samples: Optional[int] = None) -> ToyCognitiveDataset:
+    """Load dataset from JSONL file."""
+    dataset = ToyCognitiveDataset(str(path))
+    if max_samples and len(dataset) > max_samples:
+        dataset.data = dataset.data[:max_samples]
+    return dataset
+
+
+def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict, int, int, int]:
+    """Extract vocabulary mappings from dataset."""
+    concepts = set()
+    relations = set()
+    entity_types = set()
+    
+    for sample in dataset:
+        for concept_list in sample.get("concepts", []):
+            if isinstance(concept_list, list):
+                concepts.update(concept_list)
+                entity_types.update(concept_list)
+            else:
+                concepts.add(concept_list)
+                entity_types.add(concept_list)
+        
+        for rel in sample.get("relations", []):
+            if len(rel) >= 3:
+                relations.add(rel[2])
+    
+    # Build maps (1-indexed, 0 is padding)
+    concept_map = {c: i + 1 for i, c in enumerate(sorted(concepts))}
+    relation_map = {r: i + 1 for i, r in enumerate(sorted(relations))}
+    
+    n_entity_types = max(16, len(entity_types) + 4)
+    n_relations = max(64, len(relations) + 10)
+    n_concepts = max(256, len(concepts) + 50)
+    
+    return concept_map, relation_map, n_entity_types, n_relations, n_concepts
+
+
+def create_dataloader(
+    dataset: ToyCognitiveDataset,
     tokenizer,
-    model,
-    device: str = "cpu",
-    epochs_per_stage: int = 10,
-    soft_logic_weight: float = 0.1,
-    soft_logic_rules: Optional[Dict] = None,
-    dataset_file_path: Optional[str] = None,
-    batch_size: int = 8,
-    num_workers: int = 0,
-    concept_to_entity_type_map: Optional[Dict[str, int]] = None,
-    use_amp: bool = False,
-    grad_clip_norm: float = 1.0,
-    use_scheduler: bool = True,
-    checkpoint_dir: Optional[str] = "checkpoints",
-    enable_tensorboard: bool = True,
-    early_stopping_patience: int = 5,
-    eval_every_n_epochs: int = 5
-):
+    concept_map: Dict,
+    relation_map: Dict,
+    model_config: ModelConfig,
+    batch_size: int,
+    num_workers: int,
+    include_responses: bool
+) -> DataLoader:
+    """Create dataloader with collator."""
+    collator = CognitiveCollator(
+        tokenizer=tokenizer,
+        concept_map=concept_map,
+        relation_map=relation_map,
+        include_responses=include_responses,
+        max_length=model_config.max_input_length,
+        max_output_length=model_config.max_output_length
+    )
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collator,
+        pin_memory=True,
+        drop_last=len(dataset) > batch_size
+    )
+
+
+def run_evaluation(
+    model: NeuroSymbolicLM,
+    tokenizer,
+    eval_dataset: ToyCognitiveDataset,
+    device: str,
+    model_config: ModelConfig,
+    stage_name: str = "Eval",
+    num_samples: Optional[int] = None,
+    logger: Optional[TrainingLogger] = None,
+    global_step: int = 0
+) -> Dict[str, float]:
     """
-    Run tiered training.
+    Run comprehensive evaluation on the eval dataset.
     
-    With T5 backbone, we skip Stage 1 (MLM) since T5 is already pretrained.
-    Training stages:
-    - Stage 2: Entity/Concept/Relation training
-    - Stage 3: Decoder training (with EOS-based abstention learning)
-    - Stage 4: Joint end-to-end training
+    Args:
+        model: The model to evaluate
+        tokenizer: Tokenizer for encoding/decoding
+        eval_dataset: Dataset to evaluate on
+        device: Device to run on
+        model_config: Model configuration
+        stage_name: Name for logging
+        num_samples: Number of samples to evaluate (None = all)
+        logger: Optional logger for metrics
+        global_step: Current training step for logging
+    
+    Returns:
+        Dictionary of evaluation metrics
     """
-    model = model.to(device)
-    model.train()
+    model.eval()
     
-    # Initialize logging and checkpointing
-    logger = TensorBoardLogger(enabled=enable_tensorboard)
-    checkpoint_manager = CheckpointManager(checkpoint_dir) if checkpoint_dir else None
-    global_step = 0
+    # Count samples with responses for evaluation
+    samples_with_responses = [
+        s for s in eval_dataset 
+        if s.get("should_respond", 0) == 1 and s.get("response", "").strip()
+    ]
     
-    # Load dataset
-    if dataset_file_path:
-        print(f"\nLoading dataset from: {dataset_file_path}")
+    if num_samples is None:
+        num_samples = len(samples_with_responses)
     else:
-        print("\nUsing hardcoded toy dataset")
-    ds = ToyCognitiveDataset(jsonl_file_path=dataset_file_path)
+        num_samples = min(num_samples, len(samples_with_responses))
     
-    # Extract mappings
-    all_concepts = set()
-    for sample in ds:
-        concepts = sample.get("concepts", [])
-        for concept_list in concepts:
-            if isinstance(concept_list, str):
-                concept_list = [concept_list]
-            elif not isinstance(concept_list, list):
-                concept_list = [str(concept_list)]
-            for concept in concept_list:
-                all_concepts.add(concept)
+    if num_samples == 0:
+        print(f"  No samples with responses found in eval dataset")
+        return {}
     
-    concept_map = {concept: idx + 1 for idx, concept in enumerate(sorted(all_concepts))}
-    print(f"Extracted concept map: {len(concept_map)} concepts")
+    print(f"\n  Running evaluation on {num_samples} samples...")
     
-    relation_map = extract_relation_map_from_dataset(ds)
-    print(f"Extracted relation map: {len(relation_map)} relations")
-    
-    if concept_to_entity_type_map is None:
-        concept_to_entity_type_map = extract_concept_to_entity_type_map(
-            ds,
-            n_entity_types=model.n_entity_types,
-            base_concept_priority=["animal", "person", "location", "object", "attribute"]
-        )
-        print(f"Extracted concept-to-entity-type mapping: {concept_to_entity_type_map}")
-    
-    # Configure soft logic rules
-    if soft_logic_rules is not None:
-        configure_soft_logic_rules(
-            model,
-            soft_logic_rules.get("concept_to_entity_type_map", {}),
-            relation_map,
-            soft_logic_rules.get("rules", [])
-        )
-    
-    # Create collators (single tokenizer for everything)
-    collator_basic = CognitiveCollator(
-        tokenizer, concept_map, relation_map,
-        include_responses=False,
-        concept_to_entity_type_map=concept_to_entity_type_map or {}
-    )
-    collator_with_responses = CognitiveCollator(
-        tokenizer, concept_map, relation_map,
-        include_responses=True,
-        concept_to_entity_type_map=concept_to_entity_type_map or {}
+    results = evaluate_generation(
+        model, tokenizer, eval_dataset,
+        device=device,
+        num_samples=num_samples,
+        max_length=model_config.max_output_length,
+        compute_metrics=True
     )
     
-    # Create DataLoaders
-    use_pin_memory = device == "cuda"
-    dl = DataLoader(
-        ds, batch_size=batch_size, shuffle=True, collate_fn=collator_basic,
-        num_workers=num_workers, pin_memory=use_pin_memory
-    )
-    dl_with_responses = DataLoader(
-        ds, batch_size=batch_size, shuffle=True, collate_fn=collator_with_responses,
-        num_workers=num_workers, pin_memory=use_pin_memory
-    )
+    # Compute aggregate metrics
+    metrics = compute_aggregate_metrics(results)
     
-    print(f"DataLoader configured: batch_size={batch_size}, dataset_size={len(ds)}")
+    # Print results
+    print_generation_results(results, num_to_print=min(5, len(results)), show_metrics=True)
     
-    def to_device(batch):
-        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    # Log metrics
+    if logger and metrics:
+        for name, value in metrics.items():
+            logger.log_scalar(f"{stage_name}/{name}", value, global_step)
     
-    # ========================================================================
-    # Stage 2: Entity/Concept/Relation Training
-    # ========================================================================
+    model.train()
+    return metrics
+
+
+def run_final_evaluation(
+    model: NeuroSymbolicLM,
+    tokenizer,
+    train_dataset: ToyCognitiveDataset,
+    eval_dataset: Optional[ToyCognitiveDataset],
+    device: str,
+    model_config: ModelConfig,
+    logger: Optional[TrainingLogger] = None
+) -> Dict[str, Dict[str, float]]:
+    """
+    Run final comprehensive evaluation on both train and eval datasets.
+    
+    Returns metrics for both datasets.
+    """
     print("\n" + "=" * 60)
-    print("Stage 2: Entity/Concept/Relation Training")
+    print("Final Evaluation")
     print("=" * 60)
     
-    # Only train non-frozen parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer2 = Adam(trainable_params, lr=1e-4)
-    scheduler2 = create_scheduler(optimizer2, epochs_per_stage) if use_scheduler else None
-    early_stop2 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
+    all_metrics = {}
     
-    s2 = Stage2_Symbolic_Trainer(
-        model, optimizer2,
-        grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
+    # Evaluate on training set (subset)
+    print("\n--- Training Set Evaluation (sample) ---")
+    train_metrics = run_evaluation(
+        model, tokenizer, train_dataset, device, model_config,
+        stage_name="Final/Train", num_samples=10, logger=logger
     )
+    all_metrics["train"] = train_metrics
     
-    for epoch in range(epochs_per_stage):
-        epoch_losses = []
-        for batch in dl:
-            batch = to_device(batch)
-            loss = s2.train_step(batch)
-            epoch_losses.append(loss)
+    # Evaluate on eval set (full)
+    if eval_dataset:
+        print("\n--- Evaluation Set (held-out) ---")
+        eval_metrics = run_evaluation(
+            model, tokenizer, eval_dataset, device, model_config,
+            stage_name="Final/Eval", num_samples=None, logger=logger
+        )
+        all_metrics["eval"] = eval_metrics
+        
+        # Print comparison
+        if train_metrics and eval_metrics:
+            print("\n" + "-" * 40)
+            print("Train vs Eval Comparison:")
+            print("-" * 40)
+            for metric in ["avg_bleu", "avg_entity_f1"]:
+                train_val = train_metrics.get(metric, 0)
+                eval_val = eval_metrics.get(metric, 0)
+                diff = eval_val - train_val
+                print(f"  {metric}: Train={train_val:.4f}, Eval={eval_val:.4f} (diff={diff:+.4f})")
+    
+    return all_metrics
+
+
+def train_stage(
+    stage_name: str,
+    model: NeuroSymbolicLM,
+    trainer,
+    train_loader: DataLoader,
+    optimizer,
+    scheduler,
+    num_epochs: int,
+    device: str,
+    logger: TrainingLogger,
+    checkpoint_manager: CheckpointManager,
+    early_stopping: EarlyStopping,
+    tokenizer=None,
+    train_dataset=None,
+    eval_dataset=None,
+    model_config=None,
+    eval_every: int = 2,
+    save_every: int = 1,
+    debug: bool = False
+) -> Tuple[float, int]:
+    """Train a single stage with periodic evaluation."""
+    print(f"\n{'='*60}")
+    print(f"Training Stage: {stage_name}")
+    print(f"{'='*60}")
+    
+    model.train()
+    global_step = 0
+    best_loss = float('inf')
+    
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        num_batches = 0
+        
+        for step, batch in enumerate(train_loader):
+            # Move to device
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                     for k, v in batch.items()}
+            
+            loss = trainer.train_step(batch)
+            
+            # Skip invalid losses
+            if loss == 0.0 or loss != loss:
+                continue
+            
+            total_loss += loss
+            num_batches += 1
             global_step += 1
-            logger.log_scalar("Train/Stage2_Loss", loss, global_step)
+            
+            if scheduler:
+                scheduler.step()
+            
+            logger.log_scalar(f"{stage_name}/Loss", loss, global_step)
+            
+            if debug and step % 50 == 0:
+                print(f"  Step {step}: loss={loss:.4f}")
         
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
-        print(f"Stage 2 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
+        avg_loss = total_loss / max(num_batches, 1)
+        print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
         
-        if scheduler2:
-            scheduler2.step()
+        # Save checkpoint
+        if (epoch + 1) % save_every == 0:
+            checkpoint_manager.save(model, optimizer, epoch + 1, stage_name, avg_loss)
         
-        # Checkpoint
-        if checkpoint_manager and (epoch + 1) % eval_every_n_epochs == 0:
-            checkpoint_manager.save(model, optimizer2, epoch + 1, "stage2", avg_loss)
+        # Track best
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+        
+        # Evaluate on eval dataset (for decoder-related stages)
+        if tokenizer and model_config and stage_name.lower() in ["decoder", "joint"]:
+            if (epoch + 1) % eval_every == 0:
+                # Quick eval on training data
+                if train_dataset:
+                    print("  Quick train eval:")
+                    model.eval()
+                    results = evaluate_generation(
+                        model, tokenizer, train_dataset,
+                        device=device, num_samples=3,
+                        max_length=model_config.max_output_length
+                    )
+                    for r in results[:2]:
+                        print(f"    Q: {r['input'][:50]}...")
+                        print(f"    A: {r['generated'][:50]}...")
+                    model.train()
+                
+                # Eval on held-out eval dataset
+                if eval_dataset:
+                    print("  Eval dataset metrics:")
+                    run_evaluation(
+                        model, tokenizer, eval_dataset, device, model_config,
+                        stage_name=f"{stage_name}/Epoch{epoch+1}",
+                        num_samples=5,
+                        logger=logger,
+                        global_step=global_step
+                    )
         
         # Early stopping
-        if early_stop2 and early_stop2(avg_loss):
+        if early_stopping(avg_loss):
             print(f"Early stopping at epoch {epoch + 1}")
             break
     
-    # ========================================================================
-    # Stage 3: Decoder Response Generation
-    # ========================================================================
-    # Note: Controller training removed - abstention is learned through decoder
-    # generating EOS token for should_respond=0 samples
-    print("\n" + "=" * 60)
-    print("Stage 3: Decoder Response Generation (with EOS-based abstention)")
-    print("=" * 60)
-    
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer3 = Adam(trainable_params, lr=5e-5)
-    scheduler3 = create_scheduler(optimizer3, epochs_per_stage) if use_scheduler else None
-    early_stop3 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
-    
-    s3 = Stage3_Decoder_Trainer(
-        model, optimizer3,
-        grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
-    )
-    
-    for epoch in range(epochs_per_stage):
-        epoch_losses = []
-        for batch in dl_with_responses:
-            batch = to_device(batch)
-            loss = s3.train_step(batch)
-            if loss > 0:  # Skip batches with no valid labels
-                epoch_losses.append(loss)
-            global_step += 1
-            logger.log_scalar("Train/Stage3_Loss", loss, global_step)
-        
-        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
-        print(f"Stage 3 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        
-        if scheduler3:
-            scheduler3.step()
-        
-        # Evaluate generation periodically
-        if (epoch + 1) % eval_every_n_epochs == 0:
-            print(f"\nGeneration evaluation at epoch {epoch + 1}:")
-            try:
-                results = evaluate_generation(
-                    model, tokenizer, ds, device=device, num_samples=3
-                )
-                print_generation_results(results, num_to_print=2)
-            except Exception as e:
-                print(f"Generation evaluation failed: {e}")
-            
-            if checkpoint_manager:
-                checkpoint_manager.save(model, optimizer3, epoch + 1, "stage3", avg_loss)
-        
-        if early_stop3 and early_stop3(avg_loss):
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
-    
-    # ========================================================================
-    # Stage 4: Joint End-to-End Training
-    # ========================================================================
-    print("\n" + "=" * 60)
-    print("Stage 4: Joint End-to-End Training")
-    print("=" * 60)
-    
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer4 = Adam(trainable_params, lr=2e-5)
-    scheduler4 = create_scheduler(optimizer4, epochs_per_stage) if use_scheduler else None
-    early_stop4 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
-    
-    s4 = Stage4_Joint_Trainer(
-        model, optimizer4,
-        soft_logic_weight=soft_logic_weight,
-        grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
-    )
-    
-    for epoch in range(epochs_per_stage):
-        epoch_losses = []
-        for batch in dl_with_responses:
-            batch = to_device(batch)
-            loss = s4.train_step(batch)
-            epoch_losses.append(loss)
-            global_step += 1
-            logger.log_scalar("Train/Stage4_Loss", loss, global_step)
-        
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
-        print(f"Stage 4 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        
-        if scheduler4:
-            scheduler4.step()
-        
-        # Evaluate generation periodically
-        if (epoch + 1) % eval_every_n_epochs == 0:
-            print(f"\nGeneration evaluation at epoch {epoch + 1}:")
-            try:
-                results = evaluate_generation(
-                    model, tokenizer, ds, device=device, num_samples=3
-                )
-                print_generation_results(results, num_to_print=2)
-                
-                metrics = compute_aggregate_metrics(results)
-                for name, value in metrics.items():
-                    logger.log_scalar(f"Eval/{name}", value, global_step)
-            except Exception as e:
-                print(f"Generation evaluation failed: {e}")
-            
-            if checkpoint_manager:
-                checkpoint_manager.save(model, optimizer4, epoch + 1, "stage4", avg_loss)
-        
-        if early_stop4 and early_stop4(avg_loss):
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
-    
-    # Final evaluation
-    print("\n" + "=" * 60)
-    print("Final Generation Evaluation")
-    print("=" * 60)
-    try:
-        final_results = evaluate_generation(
-            model, tokenizer, ds, device=device, num_samples=10
-        )
-        print_generation_results(final_results, num_to_print=5)
-        
-        final_metrics = compute_aggregate_metrics(final_results)
-        for name, value in final_metrics.items():
-            logger.log_scalar(f"Final/{name}", value, 0)
-    except Exception as e:
-        print(f"Final evaluation failed: {e}")
-    
-    logger.close()
-    
-    return model
+    return best_loss, global_step
 
 
 def main():
-    """Main entry point for training."""
-    # ========================================================================
-    # Model Configuration - Using T5 as unified backbone
-    # ========================================================================
-    MODEL_NAME = "t5-small"  # Options: t5-small, t5-base, google/flan-t5-small, etc.
-    FREEZE_ENCODER = False  # Whether to freeze T5 encoder
-    FREEZE_DECODER = False  # Whether to freeze T5 decoder
+    args = parse_args()
     
-    print(f"\nInitializing NeuroSymbolicLM with {MODEL_NAME} backbone")
+    print("=" * 70)
+    print("NeuroSymbolicLM Unified Training")
+    print("=" * 70)
+    print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Preset: {args.preset}")
     
-    # Initialize tokenizer (T5 tokenizer for everything)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # Check device
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        args.device = "cpu"
+    
+    if args.device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
+    # Prepare data if requested
+    if args.prepare_data:
+        prepared_paths = prepare_datasets(args)
+        if not args.dataset or not Path(args.dataset).exists():
+            if "stage1" in prepared_paths:
+                args.dataset = str(prepared_paths["stage1"])
+            if "stage2" in prepared_paths and not args.stage2_dataset:
+                args.stage2_dataset = str(prepared_paths["stage2"])
+    
+    # Load model config
+    model_config = MODEL_PRESETS[args.preset]()
+    if args.model_name:
+        model_config.model_name = args.model_name
+    
+    print(f"\nModel: {model_config.model_name}")
+    print(f"Max input length: {model_config.max_input_length}")
+    print(f"Max output length: {model_config.max_output_length}")
+    
+    # Load tokenizer
+    print(f"\nLoading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    print(f"Tokenizer vocab size: {len(tokenizer)}")
+    # Load primary dataset
+    dataset_path = Path(args.dataset)
+    if not dataset_path.exists():
+        print(f"\nError: Dataset not found: {dataset_path}")
+        print("Run with --prepare-data to download datasets, or provide a valid --dataset path")
+        sys.exit(1)
     
-    # ========================================================================
-    # Dataset Configuration
-    # ========================================================================
-    dataset_file_path = "comprehensive_dataset.jsonl"
+    print(f"\nLoading dataset: {dataset_path}")
+    train_dataset = load_dataset(dataset_path, args.max_samples)
+    print(f"  Loaded {len(train_dataset)} samples")
     
-    # Load dataset to infer model parameters
-    print(f"\nLoading dataset to infer model parameters from: {dataset_file_path}")
-    ds_temp = ToyCognitiveDataset(jsonl_file_path=dataset_file_path)
+    # Load stage 2 dataset if provided
+    stage2_dataset = None
+    if args.stage2_dataset and Path(args.stage2_dataset).exists():
+        print(f"Loading stage 2 dataset: {args.stage2_dataset}")
+        stage2_dataset = load_dataset(Path(args.stage2_dataset), args.max_samples)
+        print(f"  Loaded {len(stage2_dataset)} samples")
     
-    # Extract all concepts for dynamic n_concepts
-    all_concepts = set()
-    for sample in ds_temp:
-        concepts = sample.get("concepts", [])
-        for concept_list in concepts:
-            if isinstance(concept_list, str):
-                concept_list = [concept_list]
-            elif not isinstance(concept_list, list):
-                concept_list = [str(concept_list)]
-            for concept in concept_list:
-                all_concepts.add(concept)
-    
-    n_concepts = max(len(all_concepts) * 2, 64)
-    print(f"Dynamic n_concepts: {n_concepts} (based on {len(all_concepts)} unique concepts)")
-    
-    # Extract mappings
-    concept_to_entity_type_map = extract_concept_to_entity_type_map(
-        ds_temp,
-        n_entity_types=None,
-        base_concept_priority=["animal", "person", "location", "object", "attribute"]
-    )
-    
-    n_entity_types = len(concept_to_entity_type_map)
-    if n_entity_types == 0:
-        print("Warning: No entity types found. Using default n_entity_types=8")
-        n_entity_types = 8
+    # Load evaluation dataset
+    eval_dataset = None
+    eval_path = Path(args.eval_dataset)
+    if eval_path.exists():
+        print(f"\nLoading eval dataset: {eval_path}")
+        eval_dataset = load_dataset(eval_path)
+        eval_samples_with_response = sum(1 for s in eval_dataset if s.get("should_respond", 0) == 1)
+        print(f"  Loaded {len(eval_dataset)} samples ({eval_samples_with_response} with responses)")
     else:
-        print(f"Inferred n_entity_types={n_entity_types} from dataset")
+        print(f"\nNo eval dataset found at {eval_path} - will skip held-out evaluation")
     
-    relation_map = extract_relation_map_from_dataset(ds_temp)
-    n_relations = len(relation_map)
-    if n_relations == 0:
-        print("Warning: No relations found. Using default n_relations=32")
-        n_relations = 32
-    else:
-        print(f"Inferred n_relations={n_relations} from dataset")
+    # Extract vocabulary
+    concept_map, relation_map, n_entity_types, n_relations, n_concepts = \
+        extract_vocab_from_dataset(train_dataset)
     
-    # ========================================================================
-    # Create Model
-    # ========================================================================
+    if stage2_dataset:
+        c2, r2, ne2, nr2, nc2 = extract_vocab_from_dataset(stage2_dataset)
+        concept_map.update(c2)
+        relation_map.update(r2)
+        n_entity_types = max(n_entity_types, ne2)
+        n_relations = max(n_relations, nr2)
+        n_concepts = max(n_concepts, nc2)
+    
+    print(f"  Entity types: {n_entity_types}")
+    print(f"  Relations: {len(relation_map)} -> capacity {n_relations}")
+    print(f"  Concepts: {len(concept_map)} -> capacity {n_concepts}")
+    
+    # Create model
+    print(f"\nCreating model...")
     model = NeuroSymbolicLM(
-        model_name=MODEL_NAME,
+        model_name=model_config.model_name,
         n_entity_types=n_entity_types,
         n_relations=n_relations,
         n_concepts=n_concepts,
-        concept_dim=256,
-        node_dim=256,
-        max_nodes=16,
-        freeze_encoder=FREEZE_ENCODER,
-        freeze_decoder=FREEZE_DECODER,
+        concept_dim=model_config.concept_dim,
+        node_dim=model_config.node_dim,
+        max_nodes=model_config.max_nodes,
+        gradient_checkpointing=model_config.gradient_checkpointing,
+        max_input_length=model_config.max_input_length,
+        max_output_length=model_config.max_output_length,
     )
     
-    print(f"\nModel initialized:")
-    print(f"  - Backbone: {MODEL_NAME}")
-    print(f"  - Hidden size: {model.d_model}")
-    print(f"  - Vocab size: {model.vocab_size}")
-    print(f"  - Entity types: {n_entity_types}")
-    print(f"  - Relations: {n_relations}")
-    print(f"  - Concepts: {n_concepts}")
+    # Resume from checkpoint
+    if args.resume:
+        print(f"Loading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
     
-    # ========================================================================
-    # Soft Logic Rules Configuration
-    # ========================================================================
-    print("\nGenerating soft logic rules dynamically from dataset patterns...")
-    generated_rules = generate_soft_logic_rules_from_dataset(
-        ds_temp,
-        concept_to_entity_type_map,
-        relation_map,
-        min_frequency=2,
-        min_confidence=0.2,
-        max_rules=50,
-        include_negative_rules=True
-    )
-    print(f"Generated {len(generated_rules)} soft logic rules from dataset")
+    model = model.to(args.device)
     
-    if len(generated_rules) > 0:
-        print("Sample generated rules:")
-        for rule in generated_rules[:5]:
-            polarity_str = "ENCOURAGE" if rule["polarity"] == 1 else "DISCOURAGE"
-            print(f"  {polarity_str}: {rule['concept_a']} + {rule['concept_b']} -> {rule['relation']} (weight={rule['weight']:.2f})")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Total parameters: {total_params:,}")
     
-    soft_logic_rules = {
-        "concept_to_entity_type_map": concept_to_entity_type_map,
-        "rules": generated_rules
-    }
+    # Setup logging and checkpointing
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger = TrainingLogger(log_dir=args.log_dir, experiment_name=f"unified_{timestamp}")
+    checkpoint_manager = CheckpointManager(save_dir=args.output_dir, max_checkpoints=5)
     
-    # ========================================================================
-    # Training Configuration
-    # ========================================================================
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\nUsing device: {device}")
+    use_amp = not args.no_amp and args.device == "cuda"
+    print(f"  Mixed precision (AMP): {use_amp}")
     
-    BATCH_SIZE = 8
-    NUM_WORKERS = 0
-    EPOCHS_PER_STAGE = 10
-    USE_AMP = device == "cuda"
+    # Training stages
+    print(f"\nStages to run: {args.stages}")
     
-    # Run training
-    trained_model = run_training(
-        tokenizer,
-        model,
-        device=device,
-        epochs_per_stage=EPOCHS_PER_STAGE,
-        soft_logic_weight=0.1,
-        soft_logic_rules=soft_logic_rules,
-        dataset_file_path=dataset_file_path,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        concept_to_entity_type_map=concept_to_entity_type_map,
-        use_amp=USE_AMP,
-        grad_clip_norm=1.0,
-        use_scheduler=True,
-        checkpoint_dir="checkpoints",
-        enable_tensorboard=True,
-        early_stopping_patience=5,
-        eval_every_n_epochs=5
-    )
-    
-    # ========================================================================
-    # Example Generation
-    # ========================================================================
-    print("\n" + "=" * 60)
-    print("Example Generation")
-    print("=" * 60)
-    
-    test_inputs = [
-        "Is Paris the capital of France?",
-        "Does the cat chase the mouse?",
-        "Did the teacher teach the students?"
-    ]
-    
-    for test_input in test_inputs:
-        generated = generate_response(
-            trained_model,
-            tokenizer,
-            test_input,
-            device=device,
-            max_length=128,
-            do_sample=False
+    # Stage 1: Symbolic (Entity/Relation)
+    if "symbolic" in args.stages:
+        print("\n" + "="*60)
+        print("Stage 1: Symbolic Training (Entity/Relation)")
+        print("="*60)
+        
+        # Freeze decoder
+        for p in model.t5.decoder.parameters():
+            p.requires_grad = False
+        for p in model.t5.lm_head.parameters():
+            p.requires_grad = False
+        
+        train_loader = create_dataloader(
+            train_dataset, tokenizer, concept_map, relation_map,
+            model_config, args.batch_size, args.num_workers,
+            include_responses=False
         )
-        print(f"\nInput:     {test_input}")
-        print(f"Generated: {generated}")
+        
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr)
+        total_steps = len(train_loader) * args.epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, int(total_steps * args.warmup_ratio), total_steps
+        )
+        
+        trainer = Stage2_Symbolic_Trainer(
+            model, optimizer, use_amp=use_amp, device=args.device
+        )
+        
+        train_stage(
+            "Symbolic", model, trainer, train_loader,
+            optimizer, scheduler, args.epochs, args.device,
+            logger, checkpoint_manager, EarlyStopping(patience=args.patience),
+            tokenizer=tokenizer, train_dataset=train_dataset, eval_dataset=eval_dataset,
+            model_config=model_config, debug=args.debug, save_every=args.save_every
+        )
+    
+    # Stage 2: Decoder
+    if "decoder" in args.stages:
+        print("\n" + "="*60)
+        print("Stage 2: Decoder Training")
+        print("="*60)
+        
+        # Unfreeze decoder, freeze symbolic heads
+        for p in model.t5.decoder.parameters():
+            p.requires_grad = True
+        for p in model.t5.lm_head.parameters():
+            p.requires_grad = True
+        
+        # Freeze symbolic components
+        for p in model.token_ent.parameters():
+            p.requires_grad = False
+        for p in model.concept_bank.parameters():
+            p.requires_grad = False
+        for p in model.rel_scorer.parameters():
+            p.requires_grad = False
+        for p in model.gnn.parameters():
+            p.requires_grad = False
+        
+        # Use stage2 dataset if available, otherwise use primary
+        decoder_dataset = stage2_dataset if stage2_dataset else train_dataset
+        
+        train_loader = create_dataloader(
+            decoder_dataset, tokenizer, concept_map, relation_map,
+            model_config, args.batch_size, args.num_workers,
+            include_responses=True
+        )
+        
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr * 0.5)
+        total_steps = len(train_loader) * args.epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, int(total_steps * args.warmup_ratio), total_steps
+        )
+        
+        trainer = Stage3_Decoder_Trainer(
+            model, optimizer, use_amp=use_amp, device=args.device
+        )
+        
+        train_stage(
+            "Decoder", model, trainer, train_loader,
+            optimizer, scheduler, args.epochs, args.device,
+            logger, checkpoint_manager, EarlyStopping(patience=args.patience),
+            tokenizer=tokenizer, train_dataset=decoder_dataset, eval_dataset=eval_dataset,
+            model_config=model_config, eval_every=args.eval_every, 
+            debug=args.debug, save_every=args.save_every
+        )
+    
+    # Stage 3: Joint
+    if "joint" in args.stages:
+        print("\n" + "="*60)
+        print("Stage 3: Joint Training")
+        print("="*60)
+        
+        # Unfreeze everything
+        for p in model.parameters():
+            p.requires_grad = True
+        
+        # Use the dataset with responses
+        joint_dataset = stage2_dataset if stage2_dataset else train_dataset
+        
+        train_loader = create_dataloader(
+            joint_dataset, tokenizer, concept_map, relation_map,
+            model_config, args.batch_size, args.num_workers,
+            include_responses=True
+        )
+        
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr * 0.1)
+        total_steps = len(train_loader) * args.epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, int(total_steps * args.warmup_ratio), total_steps
+        )
+        
+        trainer = Stage4_Joint_Trainer(
+            model, optimizer, use_amp=use_amp, device=args.device
+        )
+        
+        train_stage(
+            "Joint", model, trainer, train_loader,
+            optimizer, scheduler, args.epochs, args.device,
+            logger, checkpoint_manager, EarlyStopping(patience=args.patience + 2),
+            tokenizer=tokenizer, train_dataset=joint_dataset, eval_dataset=eval_dataset,
+            model_config=model_config, eval_every=args.eval_every, 
+            debug=args.debug, save_every=args.save_every
+        )
+    
+    # Run final comprehensive evaluation
+    final_metrics = run_final_evaluation(
+        model, tokenizer, train_dataset, eval_dataset,
+        args.device, model_config, logger
+    )
+    
+    # Save final model
+    print("\n" + "="*60)
+    print("Training Complete!")
+    print("="*60)
+    
+    final_path = Path(args.output_dir) / "final_model.pt"
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "config": {
+            "model_name": model_config.model_name,
+            "n_entity_types": n_entity_types,
+            "n_relations": n_relations,
+            "n_concepts": n_concepts,
+        },
+        "concept_map": concept_map,
+        "relation_map": relation_map,
+        "final_metrics": final_metrics,
+    }, final_path)
+    print(f"Saved final model to {final_path}")
+    
+    # Print final metrics summary
+    if final_metrics:
+        print("\nFinal Metrics Summary:")
+        for split, metrics in final_metrics.items():
+            if metrics:
+                print(f"  {split.upper()}:")
+                for name, value in metrics.items():
+                    print(f"    {name}: {value:.4f}")
+    
+    logger.close()
 
 
 if __name__ == "__main__":

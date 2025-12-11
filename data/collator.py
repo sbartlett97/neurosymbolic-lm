@@ -216,7 +216,12 @@ class CognitiveCollator:
                         entity_type_labels[batch_idx, j] = self.concept_to_entity_type_map[concept]
     
     def _process_relations(self, sample: dict) -> List[Tuple[int, int, int]]:
-        """Extract relation triplets from a sample."""
+        """Extract relation triplets from a sample.
+        
+        Supports two relation formats:
+        1. Index-based: (head_idx, tail_idx, relation_type) - e.g., [0, 1, "lives_in"]
+        2. Name-based: (head_name, relation_type, tail_name) - e.g., ["cat", "chases", "mouse"]
+        """
         triplets = []
         relations = sample.get("relations", [])
         entities = sample.get("entities", [])
@@ -224,12 +229,18 @@ class CognitiveCollator:
         for rel in relations:
             if len(rel) != 3:
                 continue
-            head, rel_type, tail = rel
             
-            head_idx = entities.index(head) if head in entities else -1
-            tail_idx = entities.index(tail) if tail in entities else -1
+            # Determine format based on first element type
+            if isinstance(rel[0], int):
+                # Index-based format: (head_idx, tail_idx, relation_type)
+                head_idx, tail_idx, rel_type = rel
+            else:
+                # Name-based format: (head_name, relation_type, tail_name)
+                head, rel_type, tail = rel
+                head_idx = entities.index(head) if head in entities else -1
+                tail_idx = entities.index(tail) if tail in entities else -1
             
-            if head_idx >= 0 and tail_idx >= 0:
+            if head_idx >= 0 and tail_idx >= 0 and head_idx < len(entities) and tail_idx < len(entities):
                 rel_type_idx = self.relation_map.get(rel_type, 0)
                 if rel_type_idx > 0:
                     triplets.append((head_idx, tail_idx, rel_type_idx))

@@ -1,524 +1,226 @@
-# Neuro-Symbolic Language Model (NS-LM)
+# NeuroSymbolic Language Model
 
-A research prototype implementing a unified neuro-symbolic architecture designed to move language models closer to human-aligned cognition. This system integrates:
+A neurosymbolic language model that combines transformer-based neural encoding with explicit symbolic reasoning through entity extraction, concept grounding, and relation inference.
 
-* Transformer-based neural text encoding (supports custom or pre-trained encoders like BERT)
-* Entity extraction and classification
-* Multi-label concept grounding
-* Relation inference via Graph Neural Networks
-* Differentiable soft-logic rule enforcement
-* Cognitive fusion for controlled response generation
-* Autoregressive sequence generation with transformer decoder
-* Tiered (curriculum) training across symbolic and neural modules
-
-This document describes the entire system, training pipeline, data structures, and implementation layout.
-
----
-
-## 1. Project Objectives
-
-### Cognitive Aims
-
-* Ground language in **entities**, **concepts**, and **relationships**.
-* Create a latent space aligned with structured semantics rather than pure pattern prediction.
-* Enable **neuro-symbolic reasoning** through differentiable rule constraints.
-* Introduce a gating controller so the model only produces output when cognitively appropriate.
-* Generate coherent text responses using autoregressive sequence generation.
-
-### Engineering Aims
-
-* Start with text-only experiments.
-* Modular design enabling later multimodal extensions.
-* Support for both custom and pre-trained transformer architectures (BERT, T5, BART).
-* Clean separation between neural encoding and symbolic reasoning layers.
-* Full sequence generation capabilities with configurable sampling strategies.
-
----
-
-## 2. Architecture Overview
-
-### 2.1 High-Level Flow
+## Architecture
 
 ```
 Input Text
-   ↓
-Neural Transformer Encoder (Custom or Pre-trained BERT)
-   ↓
-Entity Extractor (Token-level Classification) ────────┐
-   ↓                                                   │
-Concept Mapper (Multi-label Concept Bank) ────────────┤
-   ↓                                                   │
-Node Representation (Top-K Entity Tokens)             │
-   ↓                                                   │
-Graph Neural Network (Relation Reasoning) ────────────┤
-   ↓                                                   │
-Pairwise Relation Scorer ─────────────────────────────┤
-   ↓                                                   │
-Soft-Logic Constraints (Rule Loss) ───────────────────┘
-                ↓
-Cognitive Fusion Layer (merges encoder + node representations)
-                ↓
-Response Controller (semantic gating: answer/abstain/ask)
-                ↓
-Transformer Decoder (Custom or Pre-trained T5/BART)
-                ↓
-Autoregressive Sequence Generation
-                ↓
-Output Text (or abstain)
+    |
+    v
+T5/LongT5 Encoder
+    |
+    +---> Token Entity Classifier (entity type per token)
+    |
+    +---> Concept Bank (soft concept assignment)
+    |
+    +---> Node Extraction (top-K entity tokens)
+              |
+              v
+         Graph Neural Network (relation reasoning)
+              |
+              v
+         Pairwise Relation Scorer
+              |
+              v
+         Soft Logic Constraints (differentiable rules)
+              |
+    +---------+
+    |
+    v
+Combined Memory (encoder + node features)
+    |
+    v
+T5/LongT5 Decoder
+    |
+    v
+Generated Response
 ```
 
-### 2.2 Components
+### Key Components
 
-* **Transformer Encoder**: 
-  - Custom `SimpleTransformerEncoder` or pre-trained BERT via `PretrainedEncoderWrapper`
-  - Learns token-level semantics
-  - Supports frozen or fine-tunable pre-trained models
+- **T5/LongT5 Backbone**: Unified encoder-decoder for long context (up to 16k tokens with LongT5)
+- **Token Entity Classifier**: Per-token entity type classification
+- **Concept Bank**: Learnable concept embeddings with soft assignment
+- **Graph Neural Network**: Message passing for relational reasoning
+- **Relation Scorer**: Pairwise relation classification between entities
+- **Soft Logic Constraints**: Differentiable rule enforcement
 
-* **Entity Extractor** (`TokenEntityClassifier`): 
-  - Token-level entity type classification
-  - Outputs logits over entity types for each token position
+## Installation
 
-* **Concept Mapper** (`ConceptBank` + `concept_proj`): 
-  - Maps entities to concept embeddings via learnable concept bank
-  - Supports multi-label concept assignment (entities can have multiple concepts)
-  - Uses soft assignment for differentiable concept grounding
+```bash
+pip install -r requirements.txt
+```
 
-* **Node Representation**:
-  - Extracts top-K entity tokens as nodes
-  - Projects to node dimension for graph processing
+## Quick Start
 
-* **Graph Neural Network** (`SimpleGNN`): 
-  - Refines node representations through message passing
-  - Enables relation reasoning between entities
+### Training with Local Data
 
-* **Relation Inferencer** (`rel_scorer`): 
-  - Predicts relations between all entity pairs
-  - Outputs sparse pair logits converted to dense relation matrices
+```bash
+# Basic training with default dataset
+python train.py --dataset comprehensive_dataset.jsonl --epochs 5
 
-* **Soft-Logic Engine** (`SoftLogicConstraints`): 
-  - Enforces symbolic rule consistency as differentiable constraints
-  - Rules specify expected relations between entity type pairs
-  - Adds auxiliary loss to guide training
+# Quick test run
+python train.py --preset testing --epochs 2 --debug
+```
 
-* **Response Controller** (`Controller`): 
-  - Decides whether the model should answer, abstain, or ask for clarification
-  - Uses pooled token and node representations
+### Training with HuggingFace Datasets
 
-* **Transformer Decoder**: 
-  - Custom `SimpleTransformerDecoder` or pre-trained T5/BART via `PretrainedDecoderWrapper`
-  - Generates sequences autoregressively
-  - Uses encoder outputs and node representations as memory
-  - Supports causal masking for autoregressive generation
+```bash
+# Prepare data from HuggingFace and train
+python train.py --prepare-data --data-sources rebel dolly --epochs 5
 
-* **Generation Method** (`generate()`): 
-  - Autoregressive sequence generation with configurable sampling
-  - Supports greedy decoding, temperature sampling, top-k, and top-p (nucleus) sampling
-  - Early stopping on EOS tokens
+# Use specific stages
+python train.py --dataset mydata.jsonl --stages symbolic decoder joint
+```
 
----
+### Data Labelling
 
-## 3. Dataset Structure
+Create custom training data with the Streamlit labelling interface:
 
-### 3.1 Sample Format
+```bash
+streamlit run labelling_app.py
+```
 
-Each sample in the dataset consists of:
+## Training Stages
 
-```python
+Training follows a three-stage curriculum:
+
+### Stage 1: Symbolic Training
+- Trains entity classifier, concept bank, GNN, relation scorer
+- Decoder is frozen
+- Uses entity/relation extraction loss
+
+### Stage 2: Decoder Training  
+- Trains decoder for response generation
+- Symbolic heads are frozen
+- Uses language modeling loss
+
+### Stage 3: Joint Training
+- Fine-tunes all components together
+- Lower learning rate for stability
+- Combined loss from all components
+
+## Dataset Format
+
+Training data uses JSONL format. See `DATASET_FORMAT.md` for full specification.
+
+```json
 {
-    "text": "The cat chased the mouse.",
-    "entities": ["cat", "mouse"],
-    "entity_spans": [(4, 7), (20, 25)],  # Character-level spans
-    "concepts": [["animal", "predator"], ["animal", "prey"]],  # Multi-label concepts per entity
-    "relations": [(0, 1, "chases")],  # (entity_i, entity_j, relation_name)
-    "should_respond": 1,  # 1 if model should generate response, 0 otherwise
-    "response": "Yes, the cat chases the mouse."  # Target response text (optional)
+    "text": "Paris is the capital of France.",
+    "entities": ["Paris", "France"],
+    "concepts": [["city", "location"], ["country", "location"]],
+    "relations": [[0, 1, "capital_of"]],
+    "should_respond": 1,
+    "response": "Yes, Paris is the capital of France."
 }
 ```
 
-**Key Features:**
-- **Multiple concepts per entity**: Each entity can have multiple concept labels (e.g., `["person", "professional", "medical"]`)
-- **Multiple relationships**: Entities can participate in multiple relations with different entities
-- **Backward compatible**: Single concept strings are automatically converted to lists
-- **Question/Statement pairs**: The dataset automatically creates question versions of statements for training
-
-### 3.2 Modalities
-
-Current version: **text-only**.
-Future expansion: audio and image embeddings feeding into the same semantic backbone.
-
----
-
-## 4. Training Pipeline (Tiered / Curriculum)
-
-The training is organized into 4 main stages plus an intermediate stage:
-
-### Stage 1: MLM Pretraining (Optional)
-
-* **Purpose**: Pre-train the encoder on masked language modeling
-* **Loss**: Cross-entropy on masked token prediction
-* **Skip condition**: Automatically skipped if using a pre-trained encoder (e.g., BERT)
-* **Trainable components**: Encoder only (if not using pre-trained)
-
-### Stage 2: Entity & Concept Extraction
-
-* **Purpose**: Train entity classification and concept mapping
-* **Losses**: 
-  - Entity classification loss (token-level)
-  - Multi-label concept classification loss (BCE)
-  - Soft-logic constraint loss (optional, weighted)
-* **Trainable components**: 
-  - Entity classifier (`token_ent`)
-  - Concept head (`concept_head`)
-  - GNN (`gnn`)
-  - Relation scorer (`rel_scorer`)
-  - Node projection (`node_proj`)
-  - Encoder (if not frozen)
-
-### Stage 3: Response Controller
-
-* **Purpose**: Train the controller to decide when to respond
-* **Loss**: Binary cross-entropy on `should_respond` prediction
-* **Trainable components**: Controller only
-
-### Stage 3.5: Decoder Response Generation
-
-* **Purpose**: Train the decoder to generate response sequences
-* **Loss**: Cross-entropy on next-token prediction (teacher forcing)
-* **Trainable components**: Decoder only
-* **Evaluation**: Automatic generation evaluation after training
-
-### Stage 4: Joint End-to-End Training
-
-* **Purpose**: Fine-tune all components together
-* **Losses**: Combined loss from all previous stages:
-  - Entity classification loss
-  - Concept classification loss
-  - Response controller loss
-  - Decoder language modeling loss
-  - Soft-logic constraint loss (weighted)
-* **Trainable components**: All trainable parameters (encoder, decoder, heads, GNN, etc.)
-* **Evaluation**: Periodic generation evaluation (every 5 epochs)
-
----
-
-## 5. Implementation Details
-
-### 5.1 Source Files
+## Project Structure
 
 ```
 neurosymbolic_model/
-  config.py                     # Configuration dataclasses
-  train.py                      # Main training entry point
-  kg_utils.py                   # Knowledge graph utilities
-  comprehensive_dataset.jsonl   # Extended dataset examples
-  requirements.txt              # Python dependencies
-  README.md                     # This file
+    config.py                    # Model and training configurations
+    train.py                     # Main training script
+    labelling_app.py             # Streamlit data labelling UI
+    comprehensive_dataset.jsonl  # Example training data
+    DATASET_FORMAT.md            # Dataset format specification
+    
+    model/                       # Model architecture
+        neurosymbolic.py         # Main NeuroSymbolicLM class
+        entity.py                # Entity classifier, concept bank
+        gnn.py                   # Graph neural networks
+        logic.py                 # Soft logic constraints
+        pooling.py               # Pooling utilities
+        encoders.py              # Standalone encoders (optional)
+        decoders.py              # Standalone decoders (optional)
+    
+    data/                        # Data handling
+        dataset.py               # ToyCognitiveDataset
+        collator.py              # CognitiveCollator for batching
+        pipeline.py              # Data download/conversion pipeline
+        staged_pipeline.py       # Staged data preparation
+    
+    training/                    # Training utilities
+        trainers.py              # Stage trainers
+        evaluation.py            # Generation evaluation
+        utils.py                 # Checkpointing, logging, etc.
+    
+    continual_learning/          # Online learning components
+        learner.py               # ContinualLearner class
+        memory.py                # Episodic memory
+        regularization.py        # EWC, SI, LwF
+        safety.py                # Content filtering
+        uncertainty.py           # Uncertainty estimation
+```
+
+## Configuration
+
+### Model Presets
+
+```python
+# RTX 4090 with 8k context (recommended)
+python train.py --preset 4090-8k
+
+# RTX 4090 with 16k context
+python train.py --preset 4090-16k
+
+# Testing/development
+python train.py --preset testing
+```
+
+### Command Line Options
+
+```
+Data:
+  --dataset PATH          Training data file (JSONL)
+  --stage2-dataset PATH   Optional separate decoder training data
+  --max-samples N         Limit number of samples
+  --prepare-data          Download datasets from HuggingFace
+  --data-sources          Sources: rebel, dolly, alpaca
+
+Training:
+  --stages                Stages to run: symbolic, decoder, joint
+  --epochs N              Epochs per stage
+  --batch-size N          Training batch size
+  --lr FLOAT              Learning rate
+  --patience N            Early stopping patience
+
+Hardware:
+  --device                cuda or cpu
+  --no-amp                Disable mixed precision
   
-  data/                         # Data handling modules
-    __init__.py
-    dataset.py                  # ToyCognitiveDataset class
-    collator.py                 # CognitiveCollator for batching
-    
-  model/                        # Model architecture modules
-    __init__.py
-    encoders.py                 # Encoder implementations
-    decoders.py                 # Decoder implementations
-    pooling.py                  # Pooling strategies
-    entity.py                   # Entity/concept handling
-    gnn.py                      # Graph neural networks
-    logic.py                    # Soft logic constraints
-    neurosymbolic.py            # Main NeuroSymbolicLM class
-    
-  training/                     # Training utilities
-    __init__.py
-    trainers.py                 # Stage trainers with gradient clipping
-    utils.py                    # Helper functions
-    evaluation.py               # Generation evaluation & metrics
-    kg_loader.py                # KG data loading
+Output:
+  --output-dir PATH       Checkpoint directory
+  --resume PATH           Resume from checkpoint
 ```
 
-### 5.2 Key Classes and Functions
+## Continual Learning
 
-**Model (`model/`):**
-- `NeuroSymbolicLM`: Main model class (`neurosymbolic.py`)
-- `SimpleTransformerEncoder`, `PretrainedEncoderWrapper`: Encoder implementations (`encoders.py`)
-- `SimpleTransformerDecoder`, `PretrainedDecoderWrapper`: Decoder implementations (`decoders.py`)
-- `TokenEntityClassifier`, `ConceptBank`: Entity/concept handling (`entity.py`)
-- `SimpleGNN`, `KGAwareGNN`, `KGPathReasoner`: Graph neural networks (`gnn.py`)
-- `SoftLogicConstraints`, `Controller`: Logic and control (`logic.py`)
+The model supports online learning with:
+- Elastic Weight Consolidation (EWC)
+- Synaptic Intelligence (SI)
+- Learning without Forgetting (LwF)
+- Episodic memory replay
+- Uncertainty-based sample selection
 
-**Data (`data/`):**
-- `ToyCognitiveDataset`: In-memory dataset with question/statement pairs (`dataset.py`)
-- `CognitiveCollator`: Batch collation with multi-label concept encoding (`collator.py`)
+See `examples/continual_learning_example.py` for usage.
 
-**Training (`training/`):**
-- `Stage1_MLM_Trainer`: MLM pretraining with gradient clipping (`trainers.py`)
-- `Stage2_Symbolic_Trainer`: Entity and concept training (`trainers.py`)
-- `Stage3_Control_Trainer`: Controller training (`trainers.py`)
-- `Stage3_Decoder_Trainer`: Decoder training (`trainers.py`)
-- `Stage4_Joint_Trainer`: Joint end-to-end training (`trainers.py`)
-- `evaluate_generation()`, `compute_bleu_score()`, `compute_entity_f1()`: Evaluation functions (`evaluation.py`)
-- `generate_response()`: Inference utility (`evaluation.py`)
-- `run_training()`: Main training orchestration (`train.py`)
+## Evaluation
 
-### 5.3 Loss Components
+Training includes automatic evaluation:
+- Generation quality assessment
+- BLEU score computation
+- Entity F1 metrics
 
-```
-L_total =
-  L_entity * w_e +           # Entity classification
-  L_concept * w_c +          # Multi-label concept classification
-  L_controller * w_ctrl +    # Response controller
-  L_decoder * w_dec +        # Decoder language modeling
-  L_softlogic * w_s          # Soft-logic constraints (default w_s=0.1)
-```
+## Hardware Requirements
 
----
+| Preset | GPU | VRAM | Max Context |
+|--------|-----|------|-------------|
+| testing | Any | 4GB+ | 512 tokens |
+| 4090-8k | RTX 4090 | 24GB | 8k tokens |
+| 4090-16k | RTX 4090 | 24GB | 16k tokens |
 
-## 6. Soft Logic Integration
+## License
 
-The symbolic system integrates directly into the forward pass:
-
-1. Extract entity type probabilities from token-level predictions
-2. Produce sparse pair logits for all entity pairs
-3. Convert to dense matrix: `pair_logits_to_matrix`
-4. Apply rules through `SoftLogicConstraints`
-5. Add resulting penalty to total loss
-6. Rules specify expected relations between entity type pairs (e.g., "animals can chase other animals")
-
-**Example Rule Configuration:**
-```python
-soft_logic_rules = {
-    "concept_to_entity_type_map": {
-        "animal": 0, "person": 1, "location": 2, "object": 3, "attribute": 4
-    },
-    "rules": [
-        {"concept_a": "animal", "concept_b": "animal", "relation": "chases", 
-         "weight": 1.0, "polarity": 1},  # Encourage
-        {"concept_a": "attribute", "concept_b": "location", "relation": "capital_of", 
-         "weight": 0.5, "polarity": -1},  # Discourage
-    ]
-}
-```
-
----
-
-## 7. Generation Capabilities
-
-The model supports autoregressive sequence generation with the `generate()` method:
-
-**Features:**
-- Greedy decoding (argmax) or sampling
-- Temperature scaling
-- Top-k filtering
-- Top-p (nucleus) sampling
-- Early stopping on EOS tokens
-- Causal masking for autoregressive generation
-
-**Usage:**
-```python
-generated_ids = model.generate(
-    input_ids=input_ids,
-    attention_mask=attention_mask,
-    max_length=128,
-    bos_token_id=1,
-    eos_token_id=2,
-    temperature=1.0,
-    do_sample=False,  # Use greedy decoding
-    top_k=None,
-    top_p=None
-)
-```
-
-**Inference Utility:**
-```python
-from training import generate_response
-
-response = generate_response(
-    model, 
-    tokenizer, 
-    "Is Paris the capital of France?",
-    device="cuda",
-    max_length=128,
-    do_sample=False
-)
-```
-
----
-
-## 8. Example Usage
-
-### Basic Training
-
-```python
-from transformers import AutoTokenizer
-from model import NeuroSymbolicLM
-from train import run_training
-
-# Initialize tokenizer
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.unk_token
-
-# Initialize model with pre-trained encoder
-model = NeuroSymbolicLM(
-    vocab_size=len(tokenizer),
-    d_model=768,  # BERT-base hidden size
-    n_entity_types=8,
-    n_concepts=512,
-    concept_dim=256,
-    node_dim=256,
-    max_nodes=16,
-    use_pretrained_encoder=True,
-    pretrained_model_name="bert-base-uncased",
-    freeze_encoder=True,  # Or False to fine-tune
-    use_pretrained_decoder=True,
-    pretrained_decoder_name="t5-small",
-    freeze_decoder=False
-)
-
-# Configure soft logic rules (optional)
-soft_logic_rules = {
-    "concept_to_entity_type_map": {
-        "animal": 0, "person": 1, "location": 2, "object": 3, "attribute": 4
-    },
-    "rules": [
-        {"concept_a": "animal", "concept_b": "animal", "relation": "chases", 
-         "weight": 1.0, "polarity": 1},
-    ]
-}
-
-# Run training
-device = "cuda" if torch.cuda.is_available() else "cpu"
-trained_model = run_training(
-    tokenizer, 
-    model, 
-    device=device, 
-    epochs_per_stage=10,
-    skip_stage1_if_pretrained=True,
-    soft_logic_weight=0.1,
-    soft_logic_rules=soft_logic_rules
-)
-```
-
-### Generation and Evaluation
-
-```python
-from training import generate_response, evaluate_generation, print_generation_results
-
-# Generate a response
-response = generate_response(
-    trained_model,
-    tokenizer,
-    "Is Paris the capital of France?",
-    device=device,
-    max_length=128
-)
-print(f"Generated: {response}")
-
-# Evaluate on dataset
-results = evaluate_generation(
-    trained_model,
-    tokenizer,
-    dataset,
-    device=device,
-    num_samples=10
-)
-print_generation_results(results, num_to_print=5)
-```
-
-### Running the Training Script
-
-```bash
-python train.py
-```
-
-The script will:
-1. Initialize the model with pre-trained BERT encoder and T5 decoder
-2. Run all training stages automatically
-3. Evaluate generation after Stage 3.5 and periodically during Stage 4
-4. Perform final evaluation and show example generations
-
----
-
-## 9. Model Configuration Options
-
-### Encoder Options
-
-- **Custom encoder**: Set `use_pretrained_encoder=False` (default)
-- **Pre-trained BERT**: Set `use_pretrained_encoder=True`, `pretrained_model_name="bert-base-uncased"`
-- **Freeze encoder**: Set `freeze_encoder=True` to keep pre-trained weights frozen
-
-### Decoder Options
-
-- **Custom decoder**: Set `use_pretrained_decoder=False` (default)
-- **Pre-trained T5**: Set `use_pretrained_decoder=True`, `pretrained_decoder_name="t5-small"`
-- **Pre-trained BART**: Set `pretrained_decoder_name="facebook/bart-base"`
-- **Freeze decoder**: Set `freeze_decoder=True` to keep pre-trained weights frozen
-
-### Architecture Parameters
-
-- `d_model`: Model dimension (768 for BERT-base, 512 for custom)
-- `n_entity_types`: Number of entity type classes (default: 8)
-- `n_concepts`: Size of concept bank (default: 512)
-- `concept_dim`: Dimension of concept embeddings (default: 256)
-- `node_dim`: Dimension of node representations (default: 256)
-- `max_nodes`: Maximum number of entity nodes (default: 16)
-
----
-
-## 10. Evaluation and Monitoring
-
-The training pipeline includes automatic evaluation:
-
-- **After Stage 3.5**: Generation evaluation on 5 samples
-- **During Stage 4**: Periodic evaluation every 5 epochs
-- **After training**: Final evaluation on 10 samples
-
-Evaluation shows:
-- Input text
-- Target response
-- Generated response
-
-This helps monitor generation quality throughout training.
-
----
-
-## 11. Roadmap
-
-* [ ] **Integrate knowledge graph embeddings** - See `KG_EMBEDDINGS_GUIDE.md` for detailed implementation plan
-  - Initialize concept/entity embeddings from pre-trained KG embeddings (ConceptNet, Wikidata)
-  - Add KG regularization to maintain semantic consistency
-  - Enable entity linking to leverage external knowledge
-  - Expected benefits: Better generalization, handling of rare entities, improved relation understanding
-* [ ] Add multi-hop differentiable reasoning
-* [ ] Add audio/image encoders for multimodal support
-* [ ] Implement distributed training
-* [ ] Add beam search for generation
-* [ ] Implement more sophisticated evaluation metrics (BLEU, ROUGE)
-* [ ] Support for larger pre-trained models (BERT-large, T5-base/large)
-
----
-
-## 12. Additional Documentation
-
-- **`KG_EMBEDDINGS_GUIDE.md`**: Comprehensive guide on integrating knowledge graph embeddings
-- **`SOFT_LOGIC_GUIDE.md`**: Detailed explanation of soft-logic constraints
-- **`PRETRAINED_ENCODER_GUIDE.md`**: Guide for using pre-trained encoders
-- **`PRETRAINED_DECODER_RECOMMENDATIONS.md`**: Recommendations for pre-trained decoders
-- **`DECODER_TRAINING_GUIDE.md`**: Guide for training the decoder component
-
----
-
-## 13. Dependencies
-
-See `requirements.txt` for full list. Key dependencies:
-
-- `torch`: PyTorch deep learning framework
-- `transformers`: HuggingFace transformers library for pre-trained models
-- `numpy`: Numerical computations
-
----
-
-## 14. License
-
-Specify your license terms here.
+[Specify your license]

@@ -22,6 +22,9 @@ rouge-score
 tensorboard
 tqdm
 
+# Data labelling interface
+streamlit
+
 # Optional: For faster attention (requires CUDA)
 # flash-attn  # pip install flash-attn --no-build-isolation
 
