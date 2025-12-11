@@ -66,8 +66,9 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         device: str = "cpu"
     ):
         super().__init__(model, optimizer, grad_clip_norm, use_amp, device)
-        self.ce = nn.CrossEntropyLoss(ignore_index=0)
-        self.bce = nn.BCEWithLogitsLoss()
+        # Use ignore_index=-100 instead of 0, as 0 might be a valid entity type
+        self.ce = nn.CrossEntropyLoss(ignore_index=-100)
+        self.bce = nn.BCELoss()  # Use BCELoss since concept_probs are already probabilities
         self.soft_logic_weight = soft_logic_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
@@ -94,9 +95,14 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                 batch, B, L, E, enc.device
             )
             
-            ent_loss = self.ce(ent_logits.view(-1, E), entity_token_labels.view(-1))
+            # Only compute entity loss if there are valid labels
+            valid_entity_mask = entity_token_labels != -100
+            if valid_entity_mask.sum() > 0:
+                ent_loss = self.ce(ent_logits.view(-1, E), entity_token_labels.view(-1))
+            else:
+                ent_loss = torch.tensor(0.0, device=enc.device)
             
-            # Concept classification
+            # Concept classification - use BCE directly on probabilities
             concept_labels = batch["concept_labels"]
             n_concept_types = concept_labels.shape[2]
             
@@ -120,26 +126,37 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            eps = 1e-8
-            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
-            con_loss = self.bce(concept_logits, target_labels)
+            # Clamp probabilities to avoid log(0) issues if BCE needs it
+            concept_probs_clamped = concept_probs.clamp(min=1e-7, max=1-1e-7)
+            target_labels_clamped = target_labels.clamp(min=0.0, max=1.0)
+            
+            # Use MSE loss which is more stable for soft labels
+            con_loss = F.mse_loss(concept_probs_clamped, target_labels_clamped)
             
             # Relation classification loss
             rel_loss = torch.tensor(0.0, device=enc.device)
             pair_logits = out["pair_relation_logits"]
             relations = batch["relations"]
+            n_relations = self.model.n_relations
             
+            rel_count = 0
             for i, (plogits, rels) in enumerate(zip(pair_logits, relations)):
                 if len(rels) == 0 or len(plogits) == 0:
                     continue
                 for (head_idx, tail_idx, rel_type) in rels:
                     if head_idx < tail_idx:
                         pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
-                        if pair_idx < plogits.shape[0]:
+                        # Ensure rel_type is in valid range
+                        if pair_idx < plogits.shape[0] and 0 <= rel_type < plogits.shape[-1]:
                             rel_loss = rel_loss + F.cross_entropy(
                                 plogits[pair_idx].unsqueeze(0),
                                 torch.tensor([rel_type], device=plogits.device)
                             )
+                            rel_count += 1
+            
+            # Normalize relation loss
+            if rel_count > 0:
+                rel_loss = rel_loss / rel_count
             
             # Soft logic loss
             soft_logic_loss = torch.tensor(0.0, device=enc.device)
@@ -151,6 +168,10 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                     )
             
             loss = ent_loss + con_loss + rel_loss + self.soft_logic_weight * soft_logic_loss
+            
+            # Check for NaN/Inf and skip if found
+            if torch.isnan(loss) or torch.isinf(loss):
+                return 0.0
         
         self._backward_and_step(loss)
         return loss.item()
@@ -169,8 +190,12 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         E: int,
         device: torch.device
     ) -> torch.Tensor:
-        """Create entity token labels aligned to actual token positions."""
-        entity_token_labels = torch.zeros(B, L, dtype=torch.long, device=device)
+        """Create entity token labels aligned to actual token positions.
+        
+        Uses -100 as the ignore index for positions without entity labels.
+        """
+        # Initialize with -100 (ignore index)
+        entity_token_labels = torch.full((B, L), -100, dtype=torch.long, device=device)
         
         entity_token_spans = batch.get("entity_token_spans")
         
@@ -182,16 +207,20 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                     if j >= len(entity_types):
                         break
                     entity_type = entity_types[j].item()
-                    entity_type = min(entity_type, E - 1)
-                    for pos in range(start, min(end + 1, L)):
-                        entity_token_labels[i, pos] = entity_type
+                    # Ensure entity type is in valid range [0, E-1]
+                    if entity_type >= 0:
+                        entity_type = min(entity_type, E - 1)
+                        for pos in range(start, min(end + 1, L)):
+                            entity_token_labels[i, pos] = entity_type
         else:
+            # Fallback: assign entity types to first N token positions
             for i in range(B):
                 num_ents = (batch["entity_ids"][i] > 0).sum().item()
                 for j in range(min(num_ents, L)):
                     etype = batch["entity_type_labels"][i, j].item()
-                    etype = min(etype, E - 1)
-                    entity_token_labels[i, j] = etype
+                    if etype >= 0:
+                        etype = min(etype, E - 1)
+                        entity_token_labels[i, j] = etype
         
         return entity_token_labels
 
@@ -267,9 +296,8 @@ class Stage4_Joint_Trainer(BaseTrainer):
         device: str = "cpu"
     ):
         super().__init__(model, optimizer, grad_clip_norm, use_amp, device)
-        self.ce = nn.CrossEntropyLoss(ignore_index=0)
+        self.ce = nn.CrossEntropyLoss(ignore_index=-100)
         self.ce_ignore_neg100 = nn.CrossEntropyLoss(ignore_index=-100)
-        self.bce = nn.BCEWithLogitsLoss()
         self.soft_logic_weight = soft_logic_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
@@ -291,9 +319,15 @@ class Stage4_Joint_Trainer(BaseTrainer):
             entity_token_labels = self._create_entity_token_labels(
                 batch, B, L, E, out["entity_logits"].device
             )
-            ent_loss = self.ce(out["entity_logits"].view(-1, E), entity_token_labels.view(-1))
             
-            # Concept loss
+            # Only compute entity loss if there are valid labels
+            valid_entity_mask = entity_token_labels != -100
+            if valid_entity_mask.sum() > 0:
+                ent_loss = self.ce(out["entity_logits"].view(-1, E), entity_token_labels.view(-1))
+            else:
+                ent_loss = torch.tensor(0.0, device=out["entity_logits"].device)
+            
+            # Concept loss - use MSE for stability
             concept_probs = out["concept_probs"]
             n_concepts_bank = concept_probs.shape[1]
             
@@ -317,9 +351,10 @@ class Stage4_Joint_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            eps = 1e-8
-            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
-            con_loss = self.bce(concept_logits, target_labels)
+            # Clamp values and use MSE for stability
+            concept_probs_clamped = concept_probs.clamp(min=1e-7, max=1-1e-7)
+            target_labels_clamped = target_labels.clamp(min=0.0, max=1.0)
+            con_loss = F.mse_loss(concept_probs_clamped, target_labels_clamped)
             
             # Decoder loss (includes EOS-based abstention learning)
             decoder_loss = torch.tensor(0.0, device=out["entity_logits"].device)
@@ -327,10 +362,13 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 logits = out["logits"]
                 labels = batch["decoder_labels"]
                 
-                decoder_loss = self.ce_ignore_neg100(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1)
-                )
+                # Only compute if there are valid labels
+                valid_labels = (labels != -100).sum()
+                if valid_labels > 0:
+                    decoder_loss = self.ce_ignore_neg100(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1)
+                    )
             
             # Soft logic loss
             soft_logic_loss = torch.tensor(0.0, device=out["entity_logits"].device)
@@ -342,6 +380,10 @@ class Stage4_Joint_Trainer(BaseTrainer):
                     )
             
             loss = ent_loss + con_loss + decoder_loss + self.soft_logic_weight * soft_logic_loss
+            
+            # Check for NaN/Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                return 0.0
         
         self._backward_and_step(loss)
         return loss.item()
@@ -354,8 +396,12 @@ class Stage4_Joint_Trainer(BaseTrainer):
         E: int,
         device: torch.device
     ) -> torch.Tensor:
-        """Create entity token labels aligned to actual token positions."""
-        entity_token_labels = torch.zeros(B, L, dtype=torch.long, device=device)
+        """Create entity token labels aligned to actual token positions.
+        
+        Uses -100 as the ignore index for positions without entity labels.
+        """
+        # Initialize with -100 (ignore index)
+        entity_token_labels = torch.full((B, L), -100, dtype=torch.long, device=device)
         
         entity_token_spans = batch.get("entity_token_spans")
         
@@ -367,15 +413,19 @@ class Stage4_Joint_Trainer(BaseTrainer):
                     if j >= len(entity_types):
                         break
                     entity_type = entity_types[j].item()
-                    entity_type = min(entity_type, E - 1)
-                    for pos in range(start, min(end + 1, L)):
-                        entity_token_labels[i, pos] = entity_type
+                    # Ensure entity type is in valid range [0, E-1]
+                    if entity_type >= 0:
+                        entity_type = min(entity_type, E - 1)
+                        for pos in range(start, min(end + 1, L)):
+                            entity_token_labels[i, pos] = entity_type
         else:
+            # Fallback: assign entity types to first N token positions
             for i in range(B):
                 num_ents = (batch["entity_ids"][i] > 0).sum().item()
                 for j in range(min(num_ents, L)):
                     etype = batch["entity_type_labels"][i, j].item()
-                    etype = min(etype, E - 1)
-                    entity_token_labels[i, j] = etype
+                    if etype >= 0:
+                        etype = min(etype, E - 1)
+                        entity_token_labels[i, j] = etype
         
         return entity_token_labels

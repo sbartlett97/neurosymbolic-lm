@@ -252,6 +252,7 @@ def train_epoch(
     
     total_loss = 0.0
     num_batches = 0
+    skipped_batches = 0
     
     for step, batch in enumerate(dataloader):
         # Move batch to device
@@ -261,7 +262,14 @@ def train_epoch(
         # Forward + backward pass (trainer handles AMP internally)
         loss = trainer.train_step(batch)
         
+        # Skip batches with 0 loss (invalid data or NaN detected)
         if loss == 0.0:
+            skipped_batches += 1
+            continue
+        
+        # Skip NaN/Inf losses
+        if loss != loss or loss == float('inf'):  # NaN check
+            skipped_batches += 1
             continue
         
         total_loss += loss
@@ -278,6 +286,9 @@ def train_epoch(
         
         if debug and step % 50 == 0:
             print(f"  Step {step}: loss={loss:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}")
+    
+    if skipped_batches > 0 and debug:
+        print(f"  Skipped {skipped_batches} batches (NaN/Inf/invalid)")
     
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, global_step
