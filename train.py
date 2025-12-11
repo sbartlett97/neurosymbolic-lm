@@ -3,9 +3,9 @@
 Main training script for the Neurosymbolic Language Model.
 
 This script handles:
-- Model initialization with configurable components
+- Model initialization with T5 backbone
 - Dataset loading and preprocessing  
-- Tiered training across 4 stages
+- Tiered training across multiple stages
 - Learning rate scheduling
 - Model checkpointing
 - Early stopping
@@ -15,7 +15,7 @@ This script handles:
 Usage:
     python train.py
     
-Configure settings in the main() function or via command line arguments.
+Configure settings in the main() function.
 """
 
 import os
@@ -26,13 +26,11 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, Sequ
 from transformers import AutoTokenizer
 from typing import Optional, Dict, List
 from pathlib import Path
-import json
 from datetime import datetime
 
 from data import ToyCognitiveDataset, CognitiveCollator
 from model import NeuroSymbolicLM
 from training import (
-    Stage1_MLM_Trainer,
     Stage2_Symbolic_Trainer,
     Stage3_Control_Trainer,
     Stage3_Decoder_Trainer,
@@ -44,7 +42,6 @@ from training import (
     evaluate_generation,
     print_generation_results,
     generate_response,
-    load_kg_data_for_training,
     compute_aggregate_metrics,
 )
 
@@ -61,12 +58,6 @@ class EarlyStopping:
     """Early stopping to prevent overfitting."""
     
     def __init__(self, patience: int = 5, min_delta: float = 0.0, mode: str = "min"):
-        """
-        Args:
-            patience: Number of epochs to wait before stopping
-            min_delta: Minimum change to qualify as improvement
-            mode: 'min' for loss, 'max' for metrics like accuracy
-        """
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
@@ -75,15 +66,6 @@ class EarlyStopping:
         self.early_stop = False
     
     def __call__(self, score: float) -> bool:
-        """
-        Check if training should stop.
-        
-        Args:
-            score: Current metric value
-        
-        Returns:
-            True if training should stop
-        """
         if self.best_score is None:
             self.best_score = score
             return False
@@ -113,12 +95,6 @@ class CheckpointManager:
         max_checkpoints: int = 3,
         save_best_only: bool = True
     ):
-        """
-        Args:
-            checkpoint_dir: Directory to save checkpoints
-            max_checkpoints: Maximum number of checkpoints to keep
-            save_best_only: Only save when metric improves
-        """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.max_checkpoints = max_checkpoints
@@ -135,27 +111,11 @@ class CheckpointManager:
         score: float,
         config: Optional[Dict] = None
     ) -> Optional[Path]:
-        """
-        Save a checkpoint.
-        
-        Args:
-            model: Model to save
-            optimizer: Optimizer state to save
-            epoch: Current epoch
-            stage: Current training stage
-            score: Current metric score
-            config: Optional configuration to save
-        
-        Returns:
-            Path to saved checkpoint or None if not saved
-        """
-        # Check if we should save
         if self.save_best_only:
             if self.best_score is not None and score >= self.best_score:
                 return None
             self.best_score = score
         
-        # Create checkpoint
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"checkpoint_{stage}_epoch{epoch}_{timestamp}.pt"
         filepath = self.checkpoint_dir / filename
@@ -172,7 +132,6 @@ class CheckpointManager:
         torch.save(checkpoint, filepath)
         self.checkpoints.append(filepath)
         
-        # Remove old checkpoints
         while len(self.checkpoints) > self.max_checkpoints:
             old_checkpoint = self.checkpoints.pop(0)
             if old_checkpoint.exists():
@@ -181,9 +140,7 @@ class CheckpointManager:
         return filepath
     
     def load_latest(self, model, optimizer=None) -> Optional[Dict]:
-        """Load the latest checkpoint."""
         if not self.checkpoints:
-            # Try to find existing checkpoints
             existing = sorted(self.checkpoint_dir.glob("checkpoint_*.pt"))
             if existing:
                 self.checkpoints = existing
@@ -195,7 +152,6 @@ class CheckpointManager:
         return self.load(latest, model, optimizer)
     
     def load(self, filepath: Path, model, optimizer=None) -> Dict:
-        """Load a specific checkpoint."""
         checkpoint = torch.load(filepath, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"])
         
@@ -217,22 +173,14 @@ class TensorBoardLogger:
             self.writer = SummaryWriter(log_dir=f"{log_dir}/{timestamp}")
     
     def log_scalar(self, tag: str, value: float, step: int):
-        """Log a scalar value."""
         if self.enabled and self.writer:
             self.writer.add_scalar(tag, value, step)
     
     def log_scalars(self, main_tag: str, tag_scalar_dict: Dict[str, float], step: int):
-        """Log multiple scalars."""
         if self.enabled and self.writer:
             self.writer.add_scalars(main_tag, tag_scalar_dict, step)
     
-    def log_histogram(self, tag: str, values, step: int):
-        """Log a histogram."""
-        if self.enabled and self.writer:
-            self.writer.add_histogram(tag, values, step)
-    
     def close(self):
-        """Close the writer."""
         if self.writer:
             self.writer.close()
 
@@ -248,8 +196,9 @@ def create_scheduler(optimizer, num_epochs: int, warmup_epochs: int = 2):
     
     main_scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=max(1, num_epochs - warmup_epochs),
-        T_mult=1
+        T_0=num_epochs - warmup_epochs,
+        T_mult=1,
+        eta_min=1e-6
     )
     
     scheduler = SequentialLR(
@@ -266,18 +215,12 @@ def run_training(
     model,
     device: str = "cpu",
     epochs_per_stage: int = 10,
-    skip_stage1_if_pretrained: bool = True,
     soft_logic_weight: float = 0.1,
     soft_logic_rules: Optional[Dict] = None,
-    kg_embedding_path: Optional[str] = None,
-    kg_triples_path: Optional[str] = None,
-    kg_entity_mapping: Optional[Dict[str, str]] = None,
-    kg_type: str = "conceptnet",
     dataset_file_path: Optional[str] = None,
     batch_size: int = 8,
     num_workers: int = 0,
     concept_to_entity_type_map: Optional[Dict[str, int]] = None,
-    # New parameters
     use_amp: bool = False,
     grad_clip_norm: float = 1.0,
     use_scheduler: bool = True,
@@ -287,31 +230,14 @@ def run_training(
     eval_every_n_epochs: int = 5
 ):
     """
-    Run tiered training across 4 stages with advanced features.
+    Run tiered training.
     
-    Args:
-        tokenizer: HuggingFace tokenizer
-        model: NeuroSymbolicLM model
-        device: torch device
-        epochs_per_stage: number of epochs per stage
-        skip_stage1_if_pretrained: Skip Stage 1 when using pre-trained encoder
-        soft_logic_weight: Weight for soft logic constraint loss
-        soft_logic_rules: Dict with concept_to_entity_type_map and rules
-        kg_embedding_path: Path to KG embeddings file
-        kg_triples_path: Path to KG triples file
-        kg_entity_mapping: Mapping from text entities to KG entities
-        kg_type: Type of knowledge graph
-        dataset_file_path: Path to JSONL dataset file
-        batch_size: Training batch size
-        num_workers: DataLoader workers
-        concept_to_entity_type_map: Mapping from concepts to entity types
-        use_amp: Enable mixed precision training
-        grad_clip_norm: Gradient clipping norm
-        use_scheduler: Use learning rate scheduler
-        checkpoint_dir: Directory for checkpoints (None to disable)
-        enable_tensorboard: Enable TensorBoard logging
-        early_stopping_patience: Patience for early stopping (0 to disable)
-        eval_every_n_epochs: Evaluate every N epochs
+    With T5 backbone, we skip Stage 1 (MLM) since T5 is already pretrained.
+    Training stages:
+    - Stage 2: Entity/Concept/Relation training
+    - Stage 3: Response controller training  
+    - Stage 3.5: Decoder training
+    - Stage 4: Joint end-to-end training
     """
     model = model.to(device)
     model.train()
@@ -320,43 +246,6 @@ def run_training(
     logger = TensorBoardLogger(enabled=enable_tensorboard)
     checkpoint_manager = CheckpointManager(checkpoint_dir) if checkpoint_dir else None
     global_step = 0
-    
-    # Load KG data if enabled
-    if model.use_kg and kg_embedding_path is not None:
-        print("\n" + "=" * 60)
-        print("Loading Knowledge Graph Data")
-        print("=" * 60)
-        kg_loader, entity_linker, kg_graph = load_kg_data_for_training(
-            kg_embedding_path=kg_embedding_path,
-            kg_triples_path=kg_triples_path,
-            entity_mapping=kg_entity_mapping,
-            kg_type=kg_type
-        )
-        
-        if kg_loader is not None:
-            if kg_entity_mapping is None:
-                ds_temp = ToyCognitiveDataset(jsonl_file_path=dataset_file_path)
-                all_entities = []
-                for sample in ds_temp:
-                    all_entities.extend(sample.get("entities", []))
-                unique_entities = list(set(all_entities))
-                
-                try:
-                    from kg_utils import create_entity_mapping_from_dataset
-                    kg_entity_mapping = create_entity_mapping_from_dataset(unique_entities, kg_loader)
-                    print(f"Auto-generated entity mapping for {len(kg_entity_mapping)} entities")
-                except Exception:
-                    kg_entity_mapping = {}
-            
-            model.load_kg_data(
-                kg_loader=kg_loader,
-                entity_linker=entity_linker,
-                kg_graph=kg_graph,
-                entity_mapping=kg_entity_mapping
-            )
-            print("KG data loaded into model successfully")
-        else:
-            print("Warning: KG integration requested but data loading failed.")
     
     # Load dataset
     if dataset_file_path:
@@ -400,265 +289,236 @@ def run_training(
             soft_logic_rules.get("rules", [])
         )
     
-    # Setup decoder tokenizer if using pretrained decoder (e.g., T5)
-    # This is needed because T5 expects T5 tokenizer tokens, not BERT tokens
-    decoder_tokenizer = None
-    if model.use_pretrained_decoder:
-        from transformers import AutoTokenizer
-        # Get the decoder model name from the config
-        decoder_model_name = model.decoder.pretrained_model.config.name_or_path
-        print(f"Loading decoder tokenizer for {decoder_model_name}...")
-        decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_model_name)
-        if decoder_tokenizer.pad_token is None:
-            decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
-        print(f"Decoder vocab size: {len(decoder_tokenizer)}")
-    
-    # Create collators
+    # Create collators (single tokenizer for everything)
     collator_basic = CognitiveCollator(
         tokenizer, concept_map, relation_map,
         include_responses=False,
-        concept_to_entity_type_map=concept_to_entity_type_map or {},
-        decoder_tokenizer=decoder_tokenizer
+        concept_to_entity_type_map=concept_to_entity_type_map or {}
     )
     collator_with_responses = CognitiveCollator(
         tokenizer, concept_map, relation_map,
         include_responses=True,
-        concept_to_entity_type_map=concept_to_entity_type_map or {},
-        decoder_tokenizer=decoder_tokenizer
+        concept_to_entity_type_map=concept_to_entity_type_map or {}
     )
     
     # Create DataLoaders
-    use_pin_memory = device == "cuda" or (isinstance(device, torch.device) and device.type == 'cuda')
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collator_basic,
-                    num_workers=num_workers, pin_memory=use_pin_memory)
-    dl_with_responses = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collator_with_responses,
-                                   num_workers=num_workers, pin_memory=use_pin_memory)
+    use_pin_memory = device == "cuda"
+    dl = DataLoader(
+        ds, batch_size=batch_size, shuffle=True, collate_fn=collator_basic,
+        num_workers=num_workers, pin_memory=use_pin_memory
+    )
+    dl_with_responses = DataLoader(
+        ds, batch_size=batch_size, shuffle=True, collate_fn=collator_with_responses,
+        num_workers=num_workers, pin_memory=use_pin_memory
+    )
     
-    print(f"DataLoader configured: batch_size={batch_size}, num_workers={num_workers}, dataset_size={len(ds)}")
+    print(f"DataLoader configured: batch_size={batch_size}, dataset_size={len(ds)}")
     
     def to_device(batch):
         return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     
-    # Stage 1: MLM Pretraining
-    use_pretrained = model.use_pretrained_encoder
-    skip_stage1 = skip_stage1_if_pretrained and use_pretrained
-    
-    if not skip_stage1:
-        print("=" * 60)
-        print("Stage 1: MLM Pretraining")
-        print("=" * 60)
-        if use_pretrained:
-            print("  Skipping Stage 1: Using pre-trained encoder")
-        else:
-            optimizer1 = Adam(model.encoder.parameters(), lr=1e-4)
-            scheduler1 = create_scheduler(optimizer1, epochs_per_stage) if use_scheduler else None
-            s1 = Stage1_MLM_Trainer(
-                model, tokenizer, optimizer1,
-                grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
-            )
-            
-            for epoch in range(epochs_per_stage):
-                total_loss = 0.0
-                for batch in dl:
-                    batch = to_device(batch)
-                    loss = s1.train_step(batch)
-                    total_loss += loss
-                    global_step += 1
-                
-                avg_loss = total_loss / len(dl)
-                print(f"  Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-                logger.log_scalar("Stage1/loss", avg_loss, epoch)
-                
-                if scheduler1:
-                    scheduler1.step()
-                    logger.log_scalar("Stage1/lr", optimizer1.param_groups[0]["lr"], epoch)
-    else:
-        print("=" * 60)
-        print("Stage 1: MLM Pretraining (SKIPPED - Using pre-trained encoder)")
-        print("=" * 60)
-    
-    # Stage 2: Entity & Concept Extraction
+    # ========================================================================
+    # Stage 2: Entity/Concept/Relation Training
+    # ========================================================================
     print("\n" + "=" * 60)
-    print("Stage 2: Entity & Concept Extraction")
+    print("Stage 2: Entity/Concept/Relation Training")
     print("=" * 60)
     
-    if use_pretrained:
-        encoder_frozen = not any(p.requires_grad for p in model.encoder.parameters())
-        if encoder_frozen:
-            stage2_params = (list(model.token_ent.parameters()) +
-                            list(model.concept_head.parameters()) +
-                            list(model.gnn.parameters()) +
-                            list(model.rel_scorer.parameters()) +
-                            list(model.node_proj.parameters()))
-        else:
-            stage2_params = (list(model.encoder.parameters()) +
-                            list(model.token_ent.parameters()) +
-                            list(model.concept_head.parameters()) +
-                            list(model.gnn.parameters()) +
-                            list(model.rel_scorer.parameters()) +
-                            list(model.node_proj.parameters()))
-    else:
-        stage2_params = (list(model.encoder.parameters()) +
-                        list(model.token_ent.parameters()) +
-                        list(model.concept_head.parameters()) +
-                        list(model.gnn.parameters()) +
-                        list(model.rel_scorer.parameters()) +
-                        list(model.node_proj.parameters()))
-    
-    optimizer2 = Adam(stage2_params, lr=1e-4)
+    # Only train non-frozen parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer2 = Adam(trainable_params, lr=1e-4)
     scheduler2 = create_scheduler(optimizer2, epochs_per_stage) if use_scheduler else None
+    early_stop2 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
+    
     s2 = Stage2_Symbolic_Trainer(
-        model, optimizer2, soft_logic_weight=soft_logic_weight,
+        model, optimizer2,
         grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
     )
     
     for epoch in range(epochs_per_stage):
-        total_loss = 0.0
+        epoch_losses = []
         for batch in dl:
             batch = to_device(batch)
             loss = s2.train_step(batch)
-            total_loss += loss
+            epoch_losses.append(loss)
             global_step += 1
+            logger.log_scalar("Train/Stage2_Loss", loss, global_step)
         
-        avg_loss = total_loss / len(dl)
-        print(f"  Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        logger.log_scalar("Stage2/loss", avg_loss, epoch)
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        print(f"Stage 2 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
         
         if scheduler2:
             scheduler2.step()
-            logger.log_scalar("Stage2/lr", optimizer2.param_groups[0]["lr"], epoch)
+        
+        # Checkpoint
+        if checkpoint_manager and (epoch + 1) % eval_every_n_epochs == 0:
+            checkpoint_manager.save(model, optimizer2, epoch + 1, "stage2", avg_loss)
+        
+        # Early stopping
+        if early_stop2 and early_stop2(avg_loss):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
     
-    # Stage 3: Response Controller
+    # ========================================================================
+    # Stage 3: Response Controller Training
+    # ========================================================================
     print("\n" + "=" * 60)
-    print("Stage 3: Response Controller")
+    print("Stage 3: Response Controller Training")
     print("=" * 60)
     
-    optimizer3 = Adam(model.controller.parameters(), lr=1e-4)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer3 = Adam(trainable_params, lr=5e-5)
     scheduler3 = create_scheduler(optimizer3, epochs_per_stage) if use_scheduler else None
+    early_stop3 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
+    
     s3 = Stage3_Control_Trainer(
         model, optimizer3,
         grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
     )
     
     for epoch in range(epochs_per_stage):
-        total_loss = 0.0
-        for batch in dl:
+        epoch_losses = []
+        for batch in dl_with_responses:
             batch = to_device(batch)
             loss = s3.train_step(batch)
-            total_loss += loss
+            epoch_losses.append(loss)
             global_step += 1
+            logger.log_scalar("Train/Stage3_Loss", loss, global_step)
         
-        avg_loss = total_loss / len(dl)
-        print(f"  Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        logger.log_scalar("Stage3/loss", avg_loss, epoch)
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        print(f"Stage 3 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
         
         if scheduler3:
             scheduler3.step()
+        
+        if checkpoint_manager and (epoch + 1) % eval_every_n_epochs == 0:
+            checkpoint_manager.save(model, optimizer3, epoch + 1, "stage3", avg_loss)
+        
+        if early_stop3 and early_stop3(avg_loss):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
     
+    # ========================================================================
     # Stage 3.5: Decoder Response Generation
+    # ========================================================================
     print("\n" + "=" * 60)
     print("Stage 3.5: Decoder Response Generation")
     print("=" * 60)
     
-    optimizer3_5 = Adam(model.decoder.parameters(), lr=1e-4)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer3_5 = Adam(trainable_params, lr=5e-5)
     scheduler3_5 = create_scheduler(optimizer3_5, epochs_per_stage) if use_scheduler else None
+    early_stop3_5 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
+    
     s3_5 = Stage3_Decoder_Trainer(
         model, optimizer3_5,
         grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
     )
     
     for epoch in range(epochs_per_stage):
-        total_loss = 0.0
+        epoch_losses = []
         for batch in dl_with_responses:
             batch = to_device(batch)
             loss = s3_5.train_step(batch)
-            total_loss += loss
+            if loss > 0:  # Skip batches with no valid labels
+                epoch_losses.append(loss)
             global_step += 1
+            logger.log_scalar("Train/Stage3.5_Loss", loss, global_step)
         
-        avg_loss = total_loss / len(dl_with_responses)
-        print(f"  Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        logger.log_scalar("Stage3.5/loss", avg_loss, epoch)
+        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+        print(f"Stage 3.5 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
         
         if scheduler3_5:
             scheduler3_5.step()
-    
-    if epochs_per_stage > 0:
-        print("\n  Evaluating generation after Stage 3.5...")
-        gen_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=5, decoder_tokenizer=decoder_tokenizer)
-        print_generation_results(gen_results, num_to_print=3)
         
-        metrics = compute_aggregate_metrics(gen_results)
-        for name, value in metrics.items():
-            logger.log_scalar(f"Stage3.5/{name}", value, 0)
+        # Evaluate generation periodically
+        if (epoch + 1) % eval_every_n_epochs == 0:
+            print(f"\nGeneration evaluation at epoch {epoch + 1}:")
+            try:
+                results = evaluate_generation(
+                    model, tokenizer, ds, device=device, num_samples=3
+                )
+                print_generation_results(results, num_to_print=2)
+            except Exception as e:
+                print(f"Generation evaluation failed: {e}")
+            
+            if checkpoint_manager:
+                checkpoint_manager.save(model, optimizer3_5, epoch + 1, "stage3.5", avg_loss)
+        
+        if early_stop3_5 and early_stop3_5(avg_loss):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
     
+    # ========================================================================
     # Stage 4: Joint End-to-End Training
+    # ========================================================================
     print("\n" + "=" * 60)
     print("Stage 4: Joint End-to-End Training")
     print("=" * 60)
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer4 = Adam(trainable_params, lr=1e-5)
+    optimizer4 = Adam(trainable_params, lr=2e-5)
     scheduler4 = create_scheduler(optimizer4, epochs_per_stage) if use_scheduler else None
+    early_stop4 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
+    
     s4 = Stage4_Joint_Trainer(
-        model, optimizer4, soft_logic_weight=soft_logic_weight,
+        model, optimizer4,
+        soft_logic_weight=soft_logic_weight,
         grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
     )
     
-    early_stopper = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
-    best_loss = float("inf")
-    
     for epoch in range(epochs_per_stage):
-        total_loss = 0.0
+        epoch_losses = []
         for batch in dl_with_responses:
             batch = to_device(batch)
             loss = s4.train_step(batch)
-            total_loss += loss
+            epoch_losses.append(loss)
             global_step += 1
+            logger.log_scalar("Train/Stage4_Loss", loss, global_step)
         
-        avg_loss = total_loss / len(dl_with_responses)
-        print(f"  Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        logger.log_scalar("Stage4/loss", avg_loss, epoch)
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        print(f"Stage 4 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
         
         if scheduler4:
             scheduler4.step()
-            logger.log_scalar("Stage4/lr", optimizer4.param_groups[0]["lr"], epoch)
         
-        # Checkpointing
-        if checkpoint_manager and avg_loss < best_loss:
-            best_loss = avg_loss
-            checkpoint_manager.save(model, optimizer4, epoch, "stage4", avg_loss)
-            print(f"    Saved checkpoint (loss: {avg_loss:.4f})")
-        
-        # Early stopping check
-        if early_stopper and early_stopper(avg_loss):
-            print(f"  Early stopping triggered at epoch {epoch+1}")
-            break
-        
-        # Periodic evaluation
-        if (epoch + 1) % eval_every_n_epochs == 0 or (epoch + 1) == epochs_per_stage:
-            print(f"\n  Evaluating generation after epoch {epoch+1}...")
-            gen_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=5, decoder_tokenizer=decoder_tokenizer)
-            print_generation_results(gen_results, num_to_print=3)
+        # Evaluate generation periodically
+        if (epoch + 1) % eval_every_n_epochs == 0:
+            print(f"\nGeneration evaluation at epoch {epoch + 1}:")
+            try:
+                results = evaluate_generation(
+                    model, tokenizer, ds, device=device, num_samples=3
+                )
+                print_generation_results(results, num_to_print=2)
+                
+                metrics = compute_aggregate_metrics(results)
+                for name, value in metrics.items():
+                    logger.log_scalar(f"Eval/{name}", value, global_step)
+            except Exception as e:
+                print(f"Generation evaluation failed: {e}")
             
-            metrics = compute_aggregate_metrics(gen_results)
-            for name, value in metrics.items():
-                logger.log_scalar(f"Stage4/{name}", value, epoch)
-    
-    print("\n" + "=" * 60)
-    print("Training Complete!")
-    print("=" * 60)
+            if checkpoint_manager:
+                checkpoint_manager.save(model, optimizer4, epoch + 1, "stage4", avg_loss)
+        
+        if early_stop4 and early_stop4(avg_loss):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
     
     # Final evaluation
     print("\n" + "=" * 60)
     print("Final Generation Evaluation")
     print("=" * 60)
-    final_results = evaluate_generation(model, tokenizer, ds, device=device, num_samples=10, decoder_tokenizer=decoder_tokenizer)
-    print_generation_results(final_results, num_to_print=5)
-    
-    # Log final metrics
-    final_metrics = compute_aggregate_metrics(final_results)
-    for name, value in final_metrics.items():
-        logger.log_scalar(f"Final/{name}", value, 0)
+    try:
+        final_results = evaluate_generation(
+            model, tokenizer, ds, device=device, num_samples=10
+        )
+        print_generation_results(final_results, num_to_print=5)
+        
+        final_metrics = compute_aggregate_metrics(final_results)
+        for name, value in final_metrics.items():
+            logger.log_scalar(f"Final/{name}", value, 0)
+    except Exception as e:
+        print(f"Final evaluation failed: {e}")
     
     logger.close()
     
@@ -667,23 +527,21 @@ def run_training(
 
 def main():
     """Main entry point for training."""
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
+    # ========================================================================
+    # Model Configuration - Using T5 as unified backbone
+    # ========================================================================
+    MODEL_NAME = "t5-small"  # Options: t5-small, t5-base, google/flan-t5-small, etc.
+    FREEZE_ENCODER = False  # Whether to freeze T5 encoder
+    FREEZE_DECODER = False  # Whether to freeze T5 decoder
+    
+    print(f"\nInitializing NeuroSymbolicLM with {MODEL_NAME} backbone")
+    
+    # Initialize tokenizer (T5 tokenizer for everything)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.unk_token
+        tokenizer.pad_token = tokenizer.eos_token
     
-    vocab_size = len(tokenizer)
-    
-    # ========================================================================
-    # Knowledge Graph Configuration
-    # ========================================================================
-    USE_KG = False  # Disabled by default, enable with KG embeddings
-    KG_TYPE = "conceptnet"
-    KG_EMBEDDING_PATH = None  # Set to path for KG embeddings
-    KG_TRIPLES_PATH = None    # Set to path for KG triples
-    USE_KG_GNN = False
-    USE_PATH_REASONING = False
-    MAX_PATH_LENGTH = 3
+    print(f"Tokenizer vocab size: {len(tokenizer)}")
     
     # ========================================================================
     # Dataset Configuration
@@ -706,8 +564,7 @@ def main():
             for concept in concept_list:
                 all_concepts.add(concept)
     
-    # Dynamic n_concepts based on dataset (with buffer for generalization)
-    n_concepts = max(len(all_concepts) * 2, 64)  # At least 64, or 2x unique concepts
+    n_concepts = max(len(all_concepts) * 2, 64)
     print(f"Dynamic n_concepts: {n_concepts} (based on {len(all_concepts)} unique concepts)")
     
     # Extract mappings
@@ -733,95 +590,64 @@ def main():
         print(f"Inferred n_relations={n_relations} from dataset")
     
     # ========================================================================
-    # Model Configuration
+    # Create Model
     # ========================================================================
     model = NeuroSymbolicLM(
-        vocab_size=vocab_size,
-        d_model=768,
+        model_name=MODEL_NAME,
         n_entity_types=n_entity_types,
         n_relations=n_relations,
-        n_concepts=n_concepts,  # Now dynamic
+        n_concepts=n_concepts,
         concept_dim=256,
         node_dim=256,
         max_nodes=16,
-        use_pretrained_encoder=True,
-        pretrained_model_name="answerdotai/ModernBERT-base",
-        freeze_encoder=True,
-        use_pretrained_decoder=True,
-        pretrained_decoder_name="t5-small",
-        freeze_decoder=False,
-        use_kg=USE_KG,
-        kg_embed_dim=300,
-        use_kg_gnn=USE_KG_GNN,
-        use_path_reasoning=USE_PATH_REASONING,
-        max_path_length=MAX_PATH_LENGTH
+        freeze_encoder=FREEZE_ENCODER,
+        freeze_decoder=FREEZE_DECODER,
     )
     
-    print(f"Extracted concept-to-entity-type mapping: {concept_to_entity_type_map}")
+    print(f"\nModel initialized:")
+    print(f"  - Backbone: {MODEL_NAME}")
+    print(f"  - Hidden size: {model.d_model}")
+    print(f"  - Vocab size: {model.vocab_size}")
+    print(f"  - Entity types: {n_entity_types}")
+    print(f"  - Relations: {n_relations}")
+    print(f"  - Concepts: {n_concepts}")
     
     # ========================================================================
     # Soft Logic Rules Configuration
     # ========================================================================
-    USE_DYNAMIC_RULES = True
+    print("\nGenerating soft logic rules dynamically from dataset patterns...")
+    generated_rules = generate_soft_logic_rules_from_dataset(
+        ds_temp,
+        concept_to_entity_type_map,
+        relation_map,
+        min_frequency=2,
+        min_confidence=0.2,
+        max_rules=50,
+        include_negative_rules=True
+    )
+    print(f"Generated {len(generated_rules)} soft logic rules from dataset")
     
-    if USE_DYNAMIC_RULES:
-        print("\nGenerating soft logic rules dynamically from dataset patterns...")
-        generated_rules = generate_soft_logic_rules_from_dataset(
-            ds_temp,
-            concept_to_entity_type_map,
-            relation_map,
-            min_frequency=2,
-            min_confidence=0.2,
-            max_rules=50,
-            include_negative_rules=True
-        )
-        print(f"Generated {len(generated_rules)} soft logic rules from dataset")
-        
-        if len(generated_rules) > 0:
-            print("Sample generated rules:")
-            for rule in generated_rules[:5]:
-                polarity_str = "ENCOURAGE" if rule["polarity"] == 1 else "DISCOURAGE"
-                print(f"  {polarity_str}: {rule['concept_a']} + {rule['concept_b']} -> {rule['relation']} (weight={rule['weight']:.2f})")
-        
-        soft_logic_rules = {
-            "concept_to_entity_type_map": concept_to_entity_type_map,
-            "rules": generated_rules
-        }
-    else:
-        # Manual rules
-        soft_logic_rules = {
-            "concept_to_entity_type_map": concept_to_entity_type_map,
-            "rules": [
-                {"concept_a": "animal", "concept_b": "animal", "relation": "chases", "weight": 1.0, "polarity": 1},
-                {"concept_a": "location", "concept_b": "location", "relation": "capital_of", "weight": 1.0, "polarity": 1},
-                {"concept_a": "animal", "concept_b": "location", "relation": "lives_in", "weight": 1.0, "polarity": 1},
-            ]
-        }
+    if len(generated_rules) > 0:
+        print("Sample generated rules:")
+        for rule in generated_rules[:5]:
+            polarity_str = "ENCOURAGE" if rule["polarity"] == 1 else "DISCOURAGE"
+            print(f"  {polarity_str}: {rule['concept_a']} + {rule['concept_b']} -> {rule['relation']} (weight={rule['weight']:.2f})")
     
-    print(f"\nModel initialized with pre-trained encoder")
-    print(f"Encoder hidden size: {model.d_model}")
-    print(f"Encoder frozen: {not any(p.requires_grad for p in model.encoder.parameters())}")
-    if model.use_pretrained_decoder:
-        print(f"Using pre-trained decoder: {model.decoder.pretrained_model.config.name_or_path}")
-        print(f"Decoder frozen: {model.decoder.freeze_decoder}")
-    
-    if model.use_kg:
-        print(f"\nKG Integration: ENABLED")
-        print(f"  - KG-aware GNN: {model.use_kg_gnn}")
-        print(f"  - Path reasoning: {model.use_path_reasoning}")
-    else:
-        print(f"\nKG Integration: DISABLED")
+    soft_logic_rules = {
+        "concept_to_entity_type_map": concept_to_entity_type_map,
+        "rules": generated_rules
+    }
     
     # ========================================================================
     # Training Configuration
     # ========================================================================
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    print(f"\nUsing device: {device}")
     
     BATCH_SIZE = 8
     NUM_WORKERS = 0
     EPOCHS_PER_STAGE = 10
-    USE_AMP = device == "cuda"  # Enable AMP only on GPU
+    USE_AMP = device == "cuda"
     
     # Run training
     trained_model = run_training(
@@ -829,18 +655,12 @@ def main():
         model,
         device=device,
         epochs_per_stage=EPOCHS_PER_STAGE,
-        skip_stage1_if_pretrained=True,
         soft_logic_weight=0.1,
         soft_logic_rules=soft_logic_rules,
-        kg_embedding_path=KG_EMBEDDING_PATH,
-        kg_triples_path=KG_TRIPLES_PATH,
-        kg_entity_mapping=None,
-        kg_type=KG_TYPE,
         dataset_file_path=dataset_file_path,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
         concept_to_entity_type_map=concept_to_entity_type_map,
-        # New features
         use_amp=USE_AMP,
         grad_clip_norm=1.0,
         use_scheduler=True,
@@ -850,23 +670,18 @@ def main():
         eval_every_n_epochs=5
     )
     
-    # Example generation
+    # ========================================================================
+    # Example Generation
+    # ========================================================================
     print("\n" + "=" * 60)
     print("Example Generation")
     print("=" * 60)
+    
     test_inputs = [
         "Is Paris the capital of France?",
         "Does the cat chase the mouse?",
         "Did the teacher teach the students?"
     ]
-    
-    # Load decoder tokenizer for generation if using pretrained decoder
-    decoder_tokenizer = None
-    if trained_model.use_pretrained_decoder:
-        decoder_model_name = trained_model.decoder.pretrained_model.config.name_or_path
-        decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_model_name)
-        if decoder_tokenizer.pad_token is None:
-            decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
     
     for test_input in test_inputs:
         generated = generate_response(
@@ -875,8 +690,7 @@ def main():
             test_input,
             device=device,
             max_length=128,
-            do_sample=False,
-            decoder_tokenizer=decoder_tokenizer
+            do_sample=False
         )
         print(f"\nInput:     {test_input}")
         print(f"Generated: {generated}")

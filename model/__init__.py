@@ -7,7 +7,6 @@ from .encoders import (
 )
 from .decoders import (
     SimpleTransformerDecoder,
-    PretrainedDecoderWrapper,
 )
 from .pooling import (
     MultiQueryPool,
@@ -39,7 +38,6 @@ __all__ = [
     "PretrainedEncoderWrapper",
     # Decoders
     "SimpleTransformerDecoder",
-    "PretrainedDecoderWrapper",
     # Pooling
     "MultiQueryPool",
     "span_mean_pool",

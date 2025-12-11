@@ -2,7 +2,6 @@
 
 from .trainers import (
     BaseTrainer,
-    Stage1_MLM_Trainer,
     Stage2_Symbolic_Trainer,
     Stage3_Control_Trainer,
     Stage3_Decoder_Trainer,
@@ -28,7 +27,6 @@ from .kg_loader import load_kg_data_for_training
 __all__ = [
     # Trainers
     "BaseTrainer",
-    "Stage1_MLM_Trainer",
     "Stage2_Symbolic_Trainer",
     "Stage3_Control_Trainer",
     "Stage3_Decoder_Trainer",

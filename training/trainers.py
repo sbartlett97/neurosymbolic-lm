@@ -4,13 +4,12 @@ Includes:
 - Gradient clipping for training stability
 - Mixed precision training support
 - Proper entity span alignment
-- Learning rate scheduling
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from contextlib import nullcontext
 
 
@@ -31,7 +30,7 @@ class BaseTrainer:
         self.use_amp = use_amp and torch.cuda.is_available()
         self.device = device
         
-        # Mixed precision scaler (using updated API)
+        # Mixed precision scaler
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
     
     def _get_amp_context(self):
@@ -52,49 +51,6 @@ class BaseTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
             self.optimizer.step()
-
-
-class Stage1_MLM_Trainer(BaseTrainer):
-    """Stage 1: Masked Language Model pretraining for encoder."""
-    
-    def __init__(
-        self,
-        model,
-        tokenizer,
-        optimizer,
-        grad_clip_norm: float = 1.0,
-        use_amp: bool = False,
-        device: str = "cpu"
-    ):
-        super().__init__(model, optimizer, grad_clip_norm, use_amp, device)
-        self.tokenizer = tokenizer
-        self.loss_fct = nn.CrossEntropyLoss()
-    
-    def train_step(self, batch: Dict[str, Any]) -> float:
-        """Execute one training step."""
-        # Skip if using pre-trained encoder
-        if self.model.mlm_head is None:
-            return 0.0
-        
-        self.optimizer.zero_grad()
-        labels = batch["input_ids"].clone()
-        masked = batch["input_ids"].clone()
-        attention_mask = batch["attention_mask"]
-        
-        # Create random mask (15% masking)
-        rand = torch.rand(masked.shape, device=masked.device)
-        mask_positions = (rand < 0.15) & (attention_mask == 1)
-        labels[~mask_positions] = -100
-        
-        masked[mask_positions] = self.tokenizer.mask_token_id
-        
-        with self._get_amp_context():
-            enc = self.model.encode(masked, attention_mask)
-            logits = self.model.mlm_head(enc)
-            loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-        
-        self._backward_and_step(loss)
-        return loss.item()
 
 
 class Stage2_Symbolic_Trainer(BaseTrainer):
@@ -119,7 +75,6 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         self.optimizer.zero_grad()
         
         with self._get_amp_context():
-            # Single forward pass - get all outputs at once
             out = self.model(
                 batch["input_ids"],
                 batch["attention_mask"],
@@ -127,17 +82,14 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                 y_ids=None
             )
             
-            # Use encoder output from forward pass (no redundant encode call)
             enc = out.get("enc")
             if enc is None:
-                # Fallback if enc not in output (when y_ids is provided)
                 enc = self.model.encode(batch["input_ids"], batch["attention_mask"])
             
-            # Entity classification using token-level entity span alignment
+            # Entity classification
             ent_logits = out["token_ent_logits"]
             B, L, E = ent_logits.shape
             
-            # Create entity token labels aligned to actual positions
             entity_token_labels = self._create_entity_token_labels(
                 batch, B, L, E, enc.device
             )
@@ -148,17 +100,13 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             concept_labels = batch["concept_labels"]
             n_concept_types = concept_labels.shape[2]
             
-            # Use pooled encoder output
-            pooled_enc = enc.mean(dim=1)
-            concept_logits = self.model.concept_head(pooled_enc)
-            n_concepts_bank = concept_logits.shape[1]
-            
-            # Aggregate concept labels across entities
             entity_mask = (batch["entity_ids"] > 0).float()
             num_valid_entities = entity_mask.sum(dim=1, keepdim=True).clamp(min=1)
             aggregated_concept_labels = (concept_labels * entity_mask.unsqueeze(-1)).sum(dim=1) / num_valid_entities
             
-            # Handle dimension mismatch
+            concept_probs = out["concept_probs"]
+            n_concepts_bank = concept_probs.shape[1]
+            
             if n_concept_types == n_concepts_bank:
                 target_labels = aggregated_concept_labels
             elif n_concept_types < n_concepts_bank:
@@ -172,9 +120,28 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
+            eps = 1e-8
+            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
             con_loss = self.bce(concept_logits, target_labels)
             
-            # Soft logic constraint loss
+            # Relation classification loss
+            rel_loss = torch.tensor(0.0, device=enc.device)
+            pair_logits = out["pair_relation_logits"]
+            relations = batch["relations"]
+            
+            for i, (plogits, rels) in enumerate(zip(pair_logits, relations)):
+                if len(rels) == 0 or len(plogits) == 0:
+                    continue
+                for (head_idx, tail_idx, rel_type) in rels:
+                    if head_idx < tail_idx:
+                        pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
+                        if pair_idx < plogits.shape[0]:
+                            rel_loss = rel_loss + F.cross_entropy(
+                                plogits[pair_idx].unsqueeze(0),
+                                torch.tensor([rel_type], device=plogits.device)
+                            )
+            
+            # Soft logic loss
             soft_logic_loss = torch.tensor(0.0, device=enc.device)
             if len(self.model.softlogic.rules) > 0:
                 if "node_entity_type_probs" in out and "rel_logits_matrix" in out:
@@ -183,10 +150,16 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                         out["rel_logits_matrix"]
                     )
             
-            loss = ent_loss + con_loss + self.soft_logic_weight * soft_logic_loss
+            loss = ent_loss + con_loss + rel_loss + self.soft_logic_weight * soft_logic_loss
         
         self._backward_and_step(loss)
         return loss.item()
+    
+    def _get_pair_index(self, i: int, j: int, n: int) -> int:
+        """Convert node pair indices to flat index (upper triangular)."""
+        if i > j:
+            i, j = j, i
+        return i * n - i * (i + 1) // 2 + (j - i - 1)
     
     def _create_entity_token_labels(
         self,
@@ -196,18 +169,12 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         E: int,
         device: torch.device
     ) -> torch.Tensor:
-        """Create entity token labels aligned to actual token positions.
-        
-        Uses entity_token_spans if available, otherwise falls back to
-        distributing entity types across first N tokens.
-        """
+        """Create entity token labels aligned to actual token positions."""
         entity_token_labels = torch.zeros(B, L, dtype=torch.long, device=device)
         
-        # Check if we have token-level spans
         entity_token_spans = batch.get("entity_token_spans")
         
         if entity_token_spans is not None:
-            # Use actual token positions
             for i in range(B):
                 spans = entity_token_spans[i]
                 entity_types = batch["entity_type_labels"][i]
@@ -216,17 +183,15 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                         break
                     entity_type = entity_types[j].item()
                     entity_type = min(entity_type, E - 1)
-                    # Label all tokens in the span
                     for pos in range(start, min(end + 1, L)):
                         entity_token_labels[i, pos] = entity_type
         else:
-            # Fallback: distribute entity types to first N positions
             for i in range(B):
                 num_ents = (batch["entity_ids"][i] > 0).sum().item()
                 for j in range(min(num_ents, L)):
-                    entity_type = batch["entity_type_labels"][i, j].item()
-                    entity_type = min(entity_type, E - 1)
-                    entity_token_labels[i, j] = entity_type
+                    etype = batch["entity_type_labels"][i, j].item()
+                    etype = min(etype, E - 1)
+                    entity_token_labels[i, j] = etype
         
         return entity_token_labels
 
@@ -257,7 +222,7 @@ class Stage3_Control_Trainer(BaseTrainer):
                 y_ids=None
             )
             
-            answer_logit = out["controller_logits"][:, 0]
+            answer_logit = out["response_logit"].squeeze(-1)
             
             should_respond = batch["should_respond"]
             if not isinstance(should_respond, torch.Tensor):
@@ -267,6 +232,13 @@ class Stage3_Control_Trainer(BaseTrainer):
             else:
                 should_respond = should_respond.float()
             
+            B = answer_logit.shape[0]
+            if should_respond.dim() == 0:
+                should_respond = should_respond.unsqueeze(0).expand(B)
+            elif should_respond.shape[0] != B:
+                should_respond = should_respond.view(B)
+            
+            should_respond = should_respond.to(answer_logit.device)
             loss = self.bce(answer_logit, should_respond)
         
         self._backward_and_step(loss)
@@ -288,13 +260,7 @@ class Stage3_Decoder_Trainer(BaseTrainer):
         self.ce = nn.CrossEntropyLoss(ignore_index=-100)
     
     def train_step(self, batch: Dict[str, Any]) -> float:
-        """Execute one training step.
-        
-        Note: The collator already prepares decoder_input_ids and decoder_labels
-        such that they are aligned (no shift needed here):
-        - decoder_input_ids[t] is the input at timestep t
-        - decoder_labels[t] is the target prediction at timestep t
-        """
+        """Execute one training step."""
         self.optimizer.zero_grad()
         
         if "decoder_input_ids" not in batch:
@@ -303,19 +269,10 @@ class Stage3_Decoder_Trainer(BaseTrainer):
         labels = batch["decoder_labels"]
         decoder_input_ids = batch["decoder_input_ids"]
         
-        # Check if there are any valid labels (not all -100)
+        # Check if there are any valid labels
         valid_labels = (labels != -100).sum()
         if valid_labels == 0:
             return 0.0
-        
-        # Debug: Check for out-of-vocab tokens
-        vocab_size = self.model.decoder.vocab_size if hasattr(self.model.decoder, 'vocab_size') else None
-        if vocab_size is not None:
-            max_input_id = decoder_input_ids.max().item()
-            max_label_id = labels[labels != -100].max().item() if (labels != -100).any() else -1
-            if max_input_id >= vocab_size or max_label_id >= vocab_size:
-                print(f"WARNING: Token ID out of vocab! max_input={max_input_id}, max_label={max_label_id}, vocab_size={vocab_size}")
-                return 0.0
         
         with self._get_amp_context():
             out = self.model(
@@ -327,21 +284,14 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             
             logits = out["logits"]
             
-            # No shift needed - collator already aligned input_ids and labels:
-            # decoder_input_ids = [start, tok1, tok2, ...]
-            # decoder_labels    = [tok1,  tok2, tok3, ...]
-            # logits[t] predicts labels[t]
+            # Compute loss (no shift needed - collator aligns input_ids and labels)
             decoder_loss = self.ce(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1)
             )
             
-            # Check for NaN and skip if necessary
+            # Skip NaN losses
             if torch.isnan(decoder_loss) or torch.isinf(decoder_loss):
-                print(f"Warning: NaN/Inf loss detected")
-                print(f"  logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
-                print(f"  logits has nan: {torch.isnan(logits).any()}, has inf: {torch.isinf(logits).any()}")
-                print(f"  valid labels: {valid_labels}, labels range: [{labels[labels != -100].min().item()}, {labels[labels != -100].max().item()}]")
                 return 0.0
         
         self._backward_and_step(decoder_loss)
@@ -380,7 +330,7 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 y_ids=decoder_input_ids
             )
             
-            # Entity loss with proper span alignment
+            # Entity loss
             B, L, E = out["entity_logits"].shape
             entity_token_labels = self._create_entity_token_labels(
                 batch, B, L, E, out["entity_logits"].device
@@ -435,7 +385,7 @@ class Stage4_Joint_Trainer(BaseTrainer):
             should_respond = should_respond.to(response_logit_squeezed.device)
             resp_loss = self.bce(response_logit_squeezed, should_respond)
             
-            # Decoder loss (no shift - collator already aligned input_ids and labels)
+            # Decoder loss
             decoder_loss = torch.tensor(0.0, device=out["entity_logits"].device)
             if "logits" in out and decoder_input_ids is not None and "decoder_labels" in batch:
                 logits = out["logits"]
@@ -488,8 +438,8 @@ class Stage4_Joint_Trainer(BaseTrainer):
             for i in range(B):
                 num_ents = (batch["entity_ids"][i] > 0).sum().item()
                 for j in range(min(num_ents, L)):
-                    entity_type = batch["entity_type_labels"][i, j].item()
-                    entity_type = min(entity_type, E - 1)
-                    entity_token_labels[i, j] = entity_type
+                    etype = batch["entity_type_labels"][i, j].item()
+                    etype = min(etype, E - 1)
+                    entity_token_labels[i, j] = etype
         
         return entity_token_labels

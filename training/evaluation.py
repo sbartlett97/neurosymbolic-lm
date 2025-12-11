@@ -6,7 +6,7 @@ Includes:
 - Generation evaluation
 """
 
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Tuple
 from collections import Counter
 import math
 import torch
@@ -52,7 +52,6 @@ def compute_bleu_score(
             precisions.append(0.0)
             continue
         
-        # Clipped counts
         clipped_count = sum(
             min(count, ref_ngrams.get(ngram, 0))
             for ngram, count in hyp_ngrams.items()
@@ -62,7 +61,6 @@ def compute_bleu_score(
         precision = clipped_count / total_count if total_count > 0 else 0.0
         precisions.append(precision)
     
-    # Geometric mean of precisions
     if any(p == 0 for p in precisions):
         return 0.0
     
@@ -127,12 +125,10 @@ def extract_entities_from_text(text: str, entity_list: Optional[List[str]] = Non
         List of extracted entities
     """
     if entity_list is None:
-        # Simple extraction: capitalize words as potential entities
         words = text.split()
         entities = [w for w in words if w[0].isupper() and len(w) > 1] if words else []
         return entities
     
-    # Match against known entities
     text_lower = text.lower()
     found_entities = []
     for entity in entity_list:
@@ -149,31 +145,25 @@ def evaluate_generation(
     device: str = "cpu", 
     num_samples: int = 5, 
     max_length: int = 128,
-    compute_metrics: bool = True,
-    decoder_tokenizer=None
+    compute_metrics: bool = True
 ) -> List[Dict]:
     """
     Evaluate model's generation capabilities on a dataset subset.
     
     Args:
         model: Trained NeuroSymbolicLM model
-        tokenizer: Tokenizer for encoding input
+        tokenizer: Tokenizer (T5 tokenizer)
         dataset: Dataset to evaluate on
         device: Device to run evaluation on
         num_samples: Number of samples to evaluate
         max_length: Maximum generation length
         compute_metrics: Whether to compute BLEU and entity F1
-        decoder_tokenizer: Optional separate tokenizer for decoder (e.g., T5).
-                          If None, uses main tokenizer.
     
     Returns:
         List of dicts with input, generated, target texts and metrics
     """
     model.eval()
     results = []
-    
-    # Use decoder_tokenizer for generation if provided
-    gen_tokenizer = decoder_tokenizer if decoder_tokenizer is not None else tokenizer
     
     # Get samples with responses
     samples_with_responses = [
@@ -186,36 +176,23 @@ def evaluate_generation(
         print("  No samples with responses found for evaluation")
         return results
     
-    # Get special token IDs from the decoder tokenizer
-    # For T5: bos = pad_token_id (0), eos = eos_token_id (1)
-    bos_token_id = getattr(gen_tokenizer, 'decoder_start_token_id', None)
-    if bos_token_id is None:
-        bos_token_id = gen_tokenizer.pad_token_id or gen_tokenizer.bos_token_id or 0
-    eos_token_id = gen_tokenizer.eos_token_id or gen_tokenizer.sep_token_id or 1
-    pad_token_id = gen_tokenizer.pad_token_id or 0
-    
     with torch.no_grad():
         for sample in eval_samples:
             input_text = sample["text"]
-            # Use encoder tokenizer for input
             tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
             input_ids = tokenized["input_ids"].to(device)
             attention_mask = tokenized["attention_mask"].to(device)
             
             try:
+                # Use T5's built-in generation
                 generated_ids = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_length=max_length,
-                    bos_token_id=bos_token_id,
-                    eos_token_id=eos_token_id,
-                    pad_token_id=pad_token_id,
-                    temperature=1.0,
                     do_sample=False
                 )
                 
-                # Use decoder tokenizer to decode generated text
-                generated_text = gen_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+                generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
             except Exception as e:
                 print(f"  Generation error: {e}")
                 generated_text = ""
@@ -228,11 +205,9 @@ def evaluate_generation(
                 "target": target_text
             }
             
-            # Compute metrics if requested
             if compute_metrics and generated_text:
                 result["bleu"] = compute_bleu_score(target_text, generated_text)
                 
-                # Entity F1 if entities are available
                 ref_entities = sample.get("entities", [])
                 pred_entities = extract_entities_from_text(generated_text, ref_entities)
                 entity_metrics = compute_entity_f1(ref_entities, pred_entities)
@@ -251,31 +226,29 @@ def compute_aggregate_metrics(results: List[Dict]) -> Dict[str, float]:
     Compute aggregate metrics across all results.
     
     Args:
-        results: List of evaluation result dicts
+        results: List of evaluation results
     
     Returns:
         Dict with aggregate metrics
     """
-    if not results:
+    if len(results) == 0:
         return {}
     
     metrics = {}
     
-    # BLEU
-    bleu_scores = [r.get("bleu", 0.0) for r in results if "bleu" in r]
+    bleu_scores = [r["bleu"] for r in results if "bleu" in r]
     if bleu_scores:
         metrics["avg_bleu"] = sum(bleu_scores) / len(bleu_scores)
     
-    # Entity metrics
-    entity_f1_scores = [r.get("entity_f1", 0.0) for r in results if "entity_f1" in r]
-    if entity_f1_scores:
-        metrics["avg_entity_f1"] = sum(entity_f1_scores) / len(entity_f1_scores)
+    entity_f1 = [r["entity_f1"] for r in results if "entity_f1" in r]
+    if entity_f1:
+        metrics["avg_entity_f1"] = sum(entity_f1) / len(entity_f1)
     
-    entity_precision = [r.get("entity_precision", 0.0) for r in results if "entity_precision" in r]
+    entity_precision = [r["entity_precision"] for r in results if "entity_precision" in r]
     if entity_precision:
         metrics["avg_entity_precision"] = sum(entity_precision) / len(entity_precision)
     
-    entity_recall = [r.get("entity_recall", 0.0) for r in results if "entity_recall" in r]
+    entity_recall = [r["entity_recall"] for r in results if "entity_recall" in r]
     if entity_recall:
         metrics["avg_entity_recall"] = sum(entity_recall) / len(entity_recall)
     
@@ -300,7 +273,6 @@ def print_generation_results(results: List[Dict], num_to_print: int = 3, show_me
             print(f"    BLEU: {result['bleu']:.4f}, Entity F1: {result.get('entity_f1', 0.0):.4f}")
         print()
     
-    # Print aggregate metrics
     if show_metrics:
         agg_metrics = compute_aggregate_metrics(results)
         if agg_metrics:
@@ -319,15 +291,14 @@ def generate_response(
     temperature: float = 1.0, 
     do_sample: bool = False, 
     top_k: Optional[int] = None, 
-    top_p: Optional[float] = None,
-    decoder_tokenizer=None
+    top_p: Optional[float] = None
 ) -> str:
     """
     Generate a response for a given input text.
     
     Args:
         model: Trained NeuroSymbolicLM model
-        tokenizer: Tokenizer for encoding input
+        tokenizer: Tokenizer (T5 tokenizer)
         input_text: Input text to generate response for
         device: Device to run generation on
         max_length: Maximum generation length
@@ -335,25 +306,12 @@ def generate_response(
         do_sample: Whether to use sampling
         top_k: Top-k sampling parameter
         top_p: Nucleus sampling parameter
-        decoder_tokenizer: Optional separate tokenizer for decoder (e.g., T5).
-                          If None, uses main tokenizer.
     
     Returns:
         Generated response text
     """
     model.eval()
     
-    # Use decoder_tokenizer for generation token IDs and decoding
-    gen_tokenizer = decoder_tokenizer if decoder_tokenizer is not None else tokenizer
-    
-    # Get special token IDs from decoder tokenizer
-    bos_token_id = getattr(gen_tokenizer, 'decoder_start_token_id', None)
-    if bos_token_id is None:
-        bos_token_id = gen_tokenizer.pad_token_id or gen_tokenizer.bos_token_id or 0
-    eos_token_id = gen_tokenizer.eos_token_id or gen_tokenizer.sep_token_id or 1
-    pad_token_id = gen_tokenizer.pad_token_id or 0
-    
-    # Use encoder tokenizer for input
     tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
@@ -363,16 +321,12 @@ def generate_response(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=max_length,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            temperature=temperature,
             do_sample=do_sample,
+            temperature=temperature if do_sample else 1.0,
             top_k=top_k,
             top_p=top_p
         )
     
-    # Decode with decoder tokenizer
-    generated_text = gen_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     model.train()
     return generated_text
