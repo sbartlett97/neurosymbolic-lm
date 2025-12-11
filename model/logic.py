@@ -1,4 +1,4 @@
-"""Soft logic constraints and controller modules."""
+"""Soft logic constraints module."""
 
 from typing import List, Optional
 import torch
@@ -145,37 +145,3 @@ class SoftLogicConstraints(nn.Module):
             })
         
         return total_loss, details
-
-
-class Controller(nn.Module):
-    """
-    Response controller for deciding model behavior.
-    
-    Outputs logits for [answer, abstain, ask_clarify].
-    """
-    
-    def __init__(self, token_dim: int, node_dim: int):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(token_dim + node_dim, token_dim),
-            nn.ReLU(),
-            nn.Linear(token_dim, 3)
-        )
-    
-    def forward(
-        self, 
-        token_pool: torch.Tensor, 
-        node_pool: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute controller decision logits.
-        
-        Args:
-            token_pool: (B, token_dim) pooled token representation
-            node_pool: (B, node_dim) pooled node representation
-        
-        Returns:
-            Logits of shape (B, 3) for [answer, abstain, ask_clarify]
-        """
-        x = torch.cat([token_pool, node_pool], dim=-1)
-        return self.fc(x)

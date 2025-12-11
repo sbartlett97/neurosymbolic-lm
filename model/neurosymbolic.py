@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from .pooling import MultiQueryPool, span_mean_pool
 from .entity import TokenEntityClassifier, ConceptBank
 from .gnn import SimpleGNN, KGAwareGNN, KGPathReasoner
-from .logic import SoftLogicConstraints, Controller, pair_logits_to_matrix
+from .logic import SoftLogicConstraints, pair_logits_to_matrix
 
 
 class NeuroSymbolicLM(nn.Module):
@@ -28,6 +28,13 @@ class NeuroSymbolicLM(nn.Module):
     - Graph neural network for relational reasoning
     - Soft logic constraints for symbolic reasoning
     - T5 decoder for response generation
+    
+    Abstention Behavior:
+    The model learns when to abstain through the decoder generating EOS tokens.
+    For samples where should_respond=0, the decoder is trained to output EOS
+    immediately, effectively learning to "stay silent" without needing a
+    separate decision head. This is simpler and more effective than using
+    a separate Controller head for abstention decisions.
     """
     
     def __init__(
@@ -103,9 +110,6 @@ class NeuroSymbolicLM(nn.Module):
                 node_dim, kg_embed_dim, max_path_length=max_path_length
             )
             self.path_to_rel_proj = nn.Linear(node_dim, n_relations)
-        
-        # Controller (decides whether to respond)
-        self.controller = Controller(self.d_model, node_dim)
         
         # Relation scorer
         self.rel_scorer = nn.Sequential(
@@ -327,19 +331,13 @@ class NeuroSymbolicLM(nn.Module):
         # Node entity type probabilities
         node_entity_type_probs = self._compute_node_entity_probs(token_ent_logits, spans)
         
-        # Controller (should respond?)
-        node_pool = node_feats_refined.mean(dim=1)
-        controller_logits = self.controller(token_pool, node_pool)
-        
         # Base outputs
         outputs = {
             "entity_logits": token_ent_logits,
             "concept_logits": concept_probs,
             "concept_probs": concept_probs,
-            "response_logit": controller_logits[:, 0:1],
             "token_ent_logits": token_ent_logits,
             "pair_relation_logits": pair_logits,
-            "controller_logits": controller_logits,
             "node_entity_type_probs": node_entity_type_probs,
             "rel_logits_matrix": rel_logits_matrix,
             "enc": enc,
@@ -468,12 +466,6 @@ def compute_losses(model_outputs: Dict, targets: Dict, lambda_weights: Dict) -> 
         cid = targets["concept_id"]
         c_loss = F.cross_entropy(cp.log(), cid)
         losses["concept"] = c_loss * lambda_weights.get("concept", 1.0)
-    
-    # Controller loss
-    if targets.get("controller_label") is not None:
-        cl = model_outputs["controller_logits"]
-        lab = targets["controller_label"]
-        losses["controller"] = F.cross_entropy(cl, lab) * lambda_weights.get("controller", 1.0)
     
     total = sum(losses.values()) if len(losses) > 0 else torch.tensor(0.0)
     return total, losses

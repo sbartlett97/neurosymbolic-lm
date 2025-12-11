@@ -32,7 +32,6 @@ from data import ToyCognitiveDataset, CognitiveCollator
 from model import NeuroSymbolicLM
 from training import (
     Stage2_Symbolic_Trainer,
-    Stage3_Control_Trainer,
     Stage3_Decoder_Trainer,
     Stage4_Joint_Trainer,
     extract_concept_to_entity_type_map,
@@ -235,8 +234,7 @@ def run_training(
     With T5 backbone, we skip Stage 1 (MLM) since T5 is already pretrained.
     Training stages:
     - Stage 2: Entity/Concept/Relation training
-    - Stage 3: Response controller training  
-    - Stage 3.5: Decoder training
+    - Stage 3: Decoder training (with EOS-based abstention learning)
     - Stage 4: Joint end-to-end training
     """
     model = model.to(device)
@@ -360,10 +358,12 @@ def run_training(
             break
     
     # ========================================================================
-    # Stage 3: Response Controller Training
+    # Stage 3: Decoder Response Generation
     # ========================================================================
+    # Note: Controller training removed - abstention is learned through decoder
+    # generating EOS token for should_respond=0 samples
     print("\n" + "=" * 60)
-    print("Stage 3: Response Controller Training")
+    print("Stage 3: Decoder Response Generation (with EOS-based abstention)")
     print("=" * 60)
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -371,7 +371,7 @@ def run_training(
     scheduler3 = create_scheduler(optimizer3, epochs_per_stage) if use_scheduler else None
     early_stop3 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
     
-    s3 = Stage3_Control_Trainer(
+    s3 = Stage3_Decoder_Trainer(
         model, optimizer3,
         grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
     )
@@ -381,55 +381,16 @@ def run_training(
         for batch in dl_with_responses:
             batch = to_device(batch)
             loss = s3.train_step(batch)
-            epoch_losses.append(loss)
+            if loss > 0:  # Skip batches with no valid labels
+                epoch_losses.append(loss)
             global_step += 1
             logger.log_scalar("Train/Stage3_Loss", loss, global_step)
         
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
         print(f"Stage 3 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
         
         if scheduler3:
             scheduler3.step()
-        
-        if checkpoint_manager and (epoch + 1) % eval_every_n_epochs == 0:
-            checkpoint_manager.save(model, optimizer3, epoch + 1, "stage3", avg_loss)
-        
-        if early_stop3 and early_stop3(avg_loss):
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
-    
-    # ========================================================================
-    # Stage 3.5: Decoder Response Generation
-    # ========================================================================
-    print("\n" + "=" * 60)
-    print("Stage 3.5: Decoder Response Generation")
-    print("=" * 60)
-    
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer3_5 = Adam(trainable_params, lr=5e-5)
-    scheduler3_5 = create_scheduler(optimizer3_5, epochs_per_stage) if use_scheduler else None
-    early_stop3_5 = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
-    
-    s3_5 = Stage3_Decoder_Trainer(
-        model, optimizer3_5,
-        grad_clip_norm=grad_clip_norm, use_amp=use_amp, device=device
-    )
-    
-    for epoch in range(epochs_per_stage):
-        epoch_losses = []
-        for batch in dl_with_responses:
-            batch = to_device(batch)
-            loss = s3_5.train_step(batch)
-            if loss > 0:  # Skip batches with no valid labels
-                epoch_losses.append(loss)
-            global_step += 1
-            logger.log_scalar("Train/Stage3.5_Loss", loss, global_step)
-        
-        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
-        print(f"Stage 3.5 Epoch {epoch+1}/{epochs_per_stage}, Avg Loss: {avg_loss:.4f}")
-        
-        if scheduler3_5:
-            scheduler3_5.step()
         
         # Evaluate generation periodically
         if (epoch + 1) % eval_every_n_epochs == 0:
@@ -443,9 +404,9 @@ def run_training(
                 print(f"Generation evaluation failed: {e}")
             
             if checkpoint_manager:
-                checkpoint_manager.save(model, optimizer3_5, epoch + 1, "stage3.5", avg_loss)
+                checkpoint_manager.save(model, optimizer3, epoch + 1, "stage3", avg_loss)
         
-        if early_stop3_5 and early_stop3_5(avg_loss):
+        if early_stop3 and early_stop3(avg_loss):
             print(f"Early stopping at epoch {epoch + 1}")
             break
     

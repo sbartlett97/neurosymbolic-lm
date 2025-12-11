@@ -46,8 +46,6 @@ class ExtractionResult:
     concepts: List[List[int]]  # Concept IDs per entity
     concept_confidences: List[List[float]]
     relations: List[ExtractedRelation]
-    controller_decision: str  # 'answer', 'abstain', 'ask_clarify'
-    controller_confidence: float
     
     def to_sample_dict(self) -> Dict[str, Any]:
         """Convert to sample dictionary format for training."""
@@ -62,7 +60,7 @@ class ExtractionResult:
             "concept_confidences": self.concept_confidences,
             "relations": [(r.head_idx, r.tail_idx, r.relation_type) for r in self.relations],
             "relation_confidences": [r.confidence for r in self.relations],
-            "should_respond": 1 if self.controller_decision == "answer" else 0,
+            "should_respond": 1,  # Default to should respond; abstention is learned via EOS
         }
 
 
@@ -449,22 +447,12 @@ class ProductionInference:
         else:
             relations = []
         
-        # Get controller decision
-        controller_logits = outputs["controller_logits"]
-        controller_probs = F.softmax(controller_logits, dim=-1)
-        controller_decision_idx = controller_probs[0].argmax().item()
-        controller_decisions = ["answer", "abstain", "ask_clarify"]
-        controller_decision = controller_decisions[min(controller_decision_idx, 2)]
-        controller_confidence = controller_probs[0, controller_decision_idx].item()
-        
         return ExtractionResult(
             text=text,
             entities=entities,
             concepts=concepts,
             concept_confidences=concept_confs,
             relations=relations,
-            controller_decision=controller_decision,
-            controller_confidence=controller_confidence
         )
     
     @torch.no_grad()
@@ -610,7 +598,7 @@ class SelfLabelingPipeline:
                 (r.head_idx, r.tail_idx, r.relation_type)
                 for r in high_conf_relations
             ],
-            "should_respond": 1 if extraction.controller_decision == "answer" else 0,
+            "should_respond": 1,  # Default; abstention is learned via decoder EOS
             # Metadata for tracking
             "_pseudo_labeled": True,
             "_entity_confidences": entity_confs,

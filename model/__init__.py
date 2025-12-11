@@ -23,7 +23,6 @@ from .gnn import (
 )
 from .logic import (
     SoftLogicConstraints,
-    Controller,
     pair_logits_to_matrix,
 )
 from .neurosymbolic import (
@@ -48,9 +47,8 @@ __all__ = [
     "SimpleGNN",
     "KGAwareGNN",
     "KGPathReasoner",
-    # Logic/Control
+    # Logic
     "SoftLogicConstraints",
-    "Controller",
     "pair_logits_to_matrix",
     # Main model
     "NeuroSymbolicLM",

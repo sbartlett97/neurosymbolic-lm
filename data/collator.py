@@ -106,8 +106,14 @@ class CognitiveCollator:
         - decoder_input_ids starts with pad_token_id (decoder_start_token_id)
         - labels are the target tokens (response + eos)
         
-        For samples with should_respond=0:
-        - labels are just [eos_token] - teaches model to stay silent
+        Abstention Learning (EOS-based):
+        For samples with should_respond=0, the labels are set to [eos_token, -100, ...].
+        This teaches the decoder to output EOS immediately, effectively learning to
+        "abstain" or "stay silent" without needing a separate decision head.
+        
+        The decoder learns:
+        - should_respond=1: Generate full response ending with EOS
+        - should_respond=0: Generate EOS immediately (abstain)
         """
         responses = []
         should_respond_mask = []

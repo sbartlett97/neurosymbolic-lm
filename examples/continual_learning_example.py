@@ -305,8 +305,6 @@ def main():
             tail = extraction.entities[r.tail_idx].text
             print(f"  - {head} --[rel_{r.relation_type}]--> {tail} (conf={r.confidence:.3f})")
     
-    print(f"\nController Decision: {extraction.controller_decision} (conf={extraction.controller_confidence:.3f})")
-    
     # Simulate more learning iterations
     print("\n" + "=" * 70)
     print("Simulating Continued Learning")

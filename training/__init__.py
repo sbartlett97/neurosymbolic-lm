@@ -3,7 +3,6 @@
 from .trainers import (
     BaseTrainer,
     Stage2_Symbolic_Trainer,
-    Stage3_Control_Trainer,
     Stage3_Decoder_Trainer,
     Stage4_Joint_Trainer,
 )
@@ -28,7 +27,6 @@ __all__ = [
     # Trainers
     "BaseTrainer",
     "Stage2_Symbolic_Trainer",
-    "Stage3_Control_Trainer",
     "Stage3_Decoder_Trainer",
     "Stage4_Joint_Trainer",
     # Utils

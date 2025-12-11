@@ -196,55 +196,6 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         return entity_token_labels
 
 
-class Stage3_Control_Trainer(BaseTrainer):
-    """Stage 3: Response controller training."""
-    
-    def __init__(
-        self,
-        model,
-        optimizer,
-        grad_clip_norm: float = 1.0,
-        use_amp: bool = False,
-        device: str = "cpu"
-    ):
-        super().__init__(model, optimizer, grad_clip_norm, use_amp, device)
-        self.bce = nn.BCEWithLogitsLoss()
-    
-    def train_step(self, batch: Dict[str, Any]) -> float:
-        """Execute one training step."""
-        self.optimizer.zero_grad()
-        
-        with self._get_amp_context():
-            out = self.model(
-                batch["input_ids"],
-                batch["attention_mask"],
-                spans=None,
-                y_ids=None
-            )
-            
-            answer_logit = out["response_logit"].squeeze(-1)
-            
-            should_respond = batch["should_respond"]
-            if not isinstance(should_respond, torch.Tensor):
-                should_respond = torch.tensor(
-                    should_respond, dtype=torch.float, device=answer_logit.device
-                )
-            else:
-                should_respond = should_respond.float()
-            
-            B = answer_logit.shape[0]
-            if should_respond.dim() == 0:
-                should_respond = should_respond.unsqueeze(0).expand(B)
-            elif should_respond.shape[0] != B:
-                should_respond = should_respond.view(B)
-            
-            should_respond = should_respond.to(answer_logit.device)
-            loss = self.bce(answer_logit, should_respond)
-        
-        self._backward_and_step(loss)
-        return loss.item()
-
-
 class Stage3_Decoder_Trainer(BaseTrainer):
     """Stage 3.5: Decoder response generation training."""
     
@@ -299,7 +250,12 @@ class Stage3_Decoder_Trainer(BaseTrainer):
 
 
 class Stage4_Joint_Trainer(BaseTrainer):
-    """Stage 4: Joint end-to-end training of all components."""
+    """Stage 4: Joint end-to-end training of all components.
+    
+    Note: Controller/response decision training has been removed.
+    Abstention is now learned through the decoder generating EOS tokens
+    for should_respond=0 samples.
+    """
     
     def __init__(
         self,
@@ -365,27 +321,7 @@ class Stage4_Joint_Trainer(BaseTrainer):
             concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
             con_loss = self.bce(concept_logits, target_labels)
             
-            # Response controller loss
-            should_respond = batch["should_respond"]
-            if not isinstance(should_respond, torch.Tensor):
-                should_respond = torch.tensor(
-                    should_respond, dtype=torch.float, device=out["response_logit"].device
-                )
-            else:
-                should_respond = should_respond.float()
-            
-            response_logit_squeezed = out["response_logit"].squeeze(-1)
-            B_resp = response_logit_squeezed.shape[0]
-            
-            if should_respond.dim() == 0:
-                should_respond = should_respond.unsqueeze(0).expand(B_resp)
-            elif should_respond.shape[0] != B_resp:
-                should_respond = should_respond.view(B_resp)
-            
-            should_respond = should_respond.to(response_logit_squeezed.device)
-            resp_loss = self.bce(response_logit_squeezed, should_respond)
-            
-            # Decoder loss
+            # Decoder loss (includes EOS-based abstention learning)
             decoder_loss = torch.tensor(0.0, device=out["entity_logits"].device)
             if "logits" in out and decoder_input_ids is not None and "decoder_labels" in batch:
                 logits = out["logits"]
@@ -405,7 +341,7 @@ class Stage4_Joint_Trainer(BaseTrainer):
                         out["rel_logits_matrix"]
                     )
             
-            loss = ent_loss + con_loss + resp_loss + decoder_loss + self.soft_logic_weight * soft_logic_loss
+            loss = ent_loss + con_loss + decoder_loss + self.soft_logic_weight * soft_logic_loss
         
         self._backward_and_step(loss)
         return loss.item()

@@ -290,33 +290,56 @@ class ToyCognitiveDataset(Dataset):
                         normalized.append([str(concept)])
                 entry["concepts"] = normalized
     
+    def _is_question(self, text: str) -> bool:
+        """Check if text is already a question."""
+        text = text.strip()
+        question_starters = (
+            'Is ', 'Are ', 'Was ', 'Were ', 'Do ', 'Does ', 'Did ',
+            'Can ', 'Could ', 'Would ', 'Should ', 'Will ', 'Have ', 'Has ', 'Had ',
+            'Where ', 'What ', 'Who ', 'When ', 'Why ', 'How ', 'Which '
+        )
+        return text.startswith(question_starters) or text.endswith('?')
+    
     def _process_entries(self):
-        """Process entries: create question versions for should_respond=1 samples."""
+        """Process entries: handle questions and statements appropriately.
+        
+        - If text is already a question with should_respond=1: use as-is
+        - If text is a statement with should_respond=1: create both statement 
+          (should_respond=0) and question (should_respond=1) versions
+        - If should_respond=0: use as-is
+        """
         processed_data = []
         for entry in self.data:
             if entry.get("should_respond", 0) == 1:
-                # Create statement version with should_respond=0
-                statement_entry = entry.copy()
-                statement_entry["should_respond"] = 0
-                if "response" in statement_entry:
-                    del statement_entry["response"]
-                processed_data.append(statement_entry)
+                text = entry["text"]
                 
-                # Create question version with should_respond=1
-                question_text = statement_to_question(entry["text"])
-                question_entry = entry.copy()
-                question_entry["text"] = question_text
-                question_entry["entity_spans"] = recalculate_entity_spans(
-                    question_text, entry["entities"], entry.get("entity_spans")
-                )
-                
-                if "response" not in question_entry or not question_entry.get("response"):
-                    question_entry["response"] = generate_response_text(
-                        entry["text"], entry["entities"], entry["relations"]
+                if self._is_question(text):
+                    # Text is already a question - use as-is
+                    processed_data.append(entry)
+                else:
+                    # Text is a statement - create both versions
+                    # Create statement version with should_respond=0
+                    statement_entry = entry.copy()
+                    statement_entry["should_respond"] = 0
+                    if "response" in statement_entry:
+                        del statement_entry["response"]
+                    processed_data.append(statement_entry)
+                    
+                    # Create question version with should_respond=1
+                    question_text = statement_to_question(text)
+                    question_entry = entry.copy()
+                    question_entry["text"] = question_text
+                    question_entry["entity_spans"] = recalculate_entity_spans(
+                        question_text, entry["entities"], entry.get("entity_spans")
                     )
-                
-                question_entry["should_respond"] = 1
-                processed_data.append(question_entry)
+                    
+                    if "response" not in question_entry or not question_entry.get("response"):
+                        question_entry["response"] = generate_response_text(
+                            entry["text"], entry["entities"], entry["relations"]
+                        )
+                    
+                    question_entry["should_respond"] = 1
+                    processed_data.append(question_entry)
             else:
                 processed_data.append(entry)
         
