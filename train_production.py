@@ -238,69 +238,40 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler,
-    scaler: Optional[torch.amp.GradScaler],
-    gradient_accumulation_steps: int,
-    max_grad_norm: float,
     device: str,
     epoch: int,
     logger: TrainingLogger,
     global_step: int,
     debug: bool = False
 ) -> tuple:
-    """Train for one epoch with gradient accumulation."""
+    """Train for one epoch - matches train.py approach exactly."""
     model.train()
     
-    total_loss = 0.0
-    num_batches = 0
-    accumulated_loss = 0.0
+    epoch_losses = []
     
     for step, batch in enumerate(dataloader):
         # Move batch to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                  for k, v in batch.items()}
         
-        # Forward pass
+        # Call trainer.train_step - it handles everything internally (backward, clipping, step)
         loss = trainer.train_step(batch)
         
-        if loss == 0.0:
-            continue
+        if loss > 0:  # Skip batches with no valid labels
+            epoch_losses.append(loss)
         
-        # Scale loss for gradient accumulation
-        loss_scaled = loss / gradient_accumulation_steps
-        accumulated_loss += loss
+        global_step += 1
+        logger.log_scalar("Train/Loss", loss, global_step)
+        logger.log_scalar("Train/LR", optimizer.param_groups[0]["lr"], global_step)
         
-        # Backward pass (handled by trainer)
-        # Accumulate gradients
-        if (step + 1) % gradient_accumulation_steps == 0:
-            # Gradient clipping (if not handled by trainer)
-            if max_grad_norm > 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            
-            # Optimizer step
-            if scaler:
-                scaler.step(optimizer)
-                scaler.update()
-            
-            if scheduler:
-                scheduler.step()
-            
-            # Logging
-            avg_accumulated_loss = accumulated_loss / gradient_accumulation_steps
-            total_loss += avg_accumulated_loss
-            num_batches += 1
-            global_step += 1
-            
-            logger.log_scalar("Train/Loss", avg_accumulated_loss, global_step)
-            logger.log_scalar("Train/LR", optimizer.param_groups[0]["lr"], global_step)
-            
-            if debug and step % 100 == 0:
-                print(f"  Step {step}: loss={avg_accumulated_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}")
-            
-            accumulated_loss = 0.0
+        if debug and step % 100 == 0:
+            print(f"  Step {step}: loss={loss:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}")
     
-    avg_loss = total_loss / max(num_batches, 1)
+    # Step scheduler after epoch (matches train.py)
+    if scheduler:
+        scheduler.step()
+    
+    avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
     return avg_loss, global_step
 
 
@@ -343,9 +314,8 @@ def run_training(
     print(f"  Max input length: {model_config.max_input_length}")
     print(f"  Max output length: {model_config.max_output_length}")
     
-    # Setup mixed precision
+    # Setup mixed precision (handled internally by trainers)
     use_amp = not args.no_amp and device == "cuda"
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     global_step = 0
     
@@ -381,9 +351,8 @@ def run_training(
     
     for epoch in range(args.epochs):
         avg_loss, global_step = train_epoch(
-            model, trainer, train_loader, optimizer, scheduler, scaler,
-            args.gradient_accumulation, args.max_grad_norm, device,
-            epoch, logger, global_step, args.debug
+            model, trainer, train_loader, optimizer, scheduler,
+            device, epoch, logger, global_step, args.debug
         )
         
         print(f"Stage 1 Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_loss:.4f}")
@@ -432,9 +401,8 @@ def run_training(
     
     for epoch in range(args.epochs):
         avg_loss, global_step = train_epoch(
-            model, trainer, train_loader, optimizer, scheduler, scaler,
-            args.gradient_accumulation, args.max_grad_norm, device,
-            epoch, logger, global_step, args.debug
+            model, trainer, train_loader, optimizer, scheduler,
+            device, epoch, logger, global_step, args.debug
         )
         
         print(f"Stage 2 Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_loss:.4f}")
@@ -491,9 +459,8 @@ def run_training(
     
     for epoch in range(args.epochs):
         avg_loss, global_step = train_epoch(
-            model, trainer, train_loader, optimizer, scheduler, scaler,
-            args.gradient_accumulation, args.max_grad_norm, device,
-            epoch, logger, global_step, args.debug
+            model, trainer, train_loader, optimizer, scheduler,
+            device, epoch, logger, global_step, args.debug
         )
         
         print(f"Stage 3 Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_loss:.4f}")
