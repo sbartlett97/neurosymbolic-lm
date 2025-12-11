@@ -221,8 +221,14 @@ class NeuroSymbolicLM(nn.Module):
         node_j = node_feats.unsqueeze(1).expand(-1, N, -1, -1)
         pair_feats = torch.cat([node_i, node_j], dim=-1)
         
+        # Clamp pair features for numerical stability
+        pair_feats = pair_feats.clamp(-100, 100)
+        
         # Apply relation scorer: (B, N, N, n_rel)
         rel_logits_matrix = self.rel_scorer(pair_feats)
+        
+        # Clamp relation logits for numerical stability
+        rel_logits_matrix = rel_logits_matrix.clamp(-50, 50)
         
         # Extract upper triangular for compatibility
         pair_logits = []

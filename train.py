@@ -96,7 +96,7 @@ def parse_args():
                             help="Epochs per stage")
     train_group.add_argument("--batch-size", type=int, default=4,
                             help="Training batch size")
-    train_group.add_argument("--lr", type=float, default=1e-4,
+    train_group.add_argument("--lr", type=float, default=5e-5,
                             help="Learning rate")
     train_group.add_argument("--warmup-ratio", type=float, default=0.1,
                             help="Warmup ratio")

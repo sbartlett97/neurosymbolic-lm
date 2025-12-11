@@ -33,24 +33,74 @@ class BaseTrainer:
         # Mixed precision scaler
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
     
+    def _check_model_health(self) -> bool:
+        """Check if model weights contain NaN or Inf."""
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                return False
+        return True
+    
     def _get_amp_context(self):
         """Get appropriate autocast context for mixed precision."""
         if self.use_amp:
             return torch.amp.autocast('cuda')
         return nullcontext()
     
-    def _backward_and_step(self, loss: torch.Tensor):
-        """Perform backward pass with gradient clipping and optional AMP."""
-        if self.use_amp and self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-            self.optimizer.step()
+    def _backward_and_step(self, loss: torch.Tensor) -> bool:
+        """Perform backward pass with gradient clipping and optional AMP.
+        
+        Returns:
+            True if step was successful, False if NaN detected
+        """
+        try:
+            if self.use_amp and self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                
+                # Check for NaN/Inf gradients before clipping
+                has_bad_grad = False
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            has_bad_grad = True
+                            break
+                        # Also check for extremely large gradients
+                        if param.grad.abs().max() > 1e6:
+                            param.grad.clamp_(-1e6, 1e6)
+                
+                if has_bad_grad:
+                    self.optimizer.zero_grad()
+                    return False
+                
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                
+                # Check for NaN/Inf gradients before clipping
+                has_bad_grad = False
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            has_bad_grad = True
+                            break
+                        # Also check for extremely large gradients
+                        if param.grad.abs().max() > 1e6:
+                            param.grad.clamp_(-1e6, 1e6)
+                
+                if has_bad_grad:
+                    self.optimizer.zero_grad()
+                    return False
+                
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                self.optimizer.step()
+            
+            return True
+        except RuntimeError as e:
+            # Handle any runtime errors during backward pass
+            self.optimizer.zero_grad()
+            return False
 
 
 class Stage2_Symbolic_Trainer(BaseTrainer):
@@ -61,6 +111,9 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         model,
         optimizer,
         soft_logic_weight: float = 0.1,
+        entity_weight: float = 1.0,
+        concept_weight: float = 1.0,
+        relation_weight: float = 0.5,  # Lower weight for relations initially
         grad_clip_norm: float = 1.0,
         use_amp: bool = False,
         device: str = "cpu"
@@ -70,9 +123,16 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         self.ce = nn.CrossEntropyLoss(ignore_index=-100)
         self.bce = nn.BCELoss()  # Use BCELoss since concept_probs are already probabilities
         self.soft_logic_weight = soft_logic_weight
+        self.entity_weight = entity_weight
+        self.concept_weight = concept_weight
+        self.relation_weight = relation_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
+        # Check model health before forward pass
+        if not self._check_model_health():
+            return 0.0
+        
         self.optimizer.zero_grad()
         
         with self._get_amp_context():
@@ -179,19 +239,31 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                         out["rel_logits_matrix"]
                     )
             
-            loss = ent_loss + con_loss + rel_loss + self.soft_logic_weight * soft_logic_loss
+            # Apply loss weights
+            weighted_ent = self.entity_weight * ent_loss
+            weighted_con = self.concept_weight * con_loss
+            weighted_rel = self.relation_weight * rel_loss
+            weighted_logic = self.soft_logic_weight * soft_logic_loss
+            
+            loss = weighted_ent + weighted_con + weighted_rel + weighted_logic
             
             # Debug: print component losses on first step
             if not hasattr(self, '_debug_printed'):
                 self._debug_printed = True
-                print(f"    DEBUG Stage2 losses: ent={ent_loss.item():.4f}, con={con_loss.item():.4f}, "
-                      f"rel={rel_loss.item():.4f}, logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
+                print(f"    DEBUG Stage2 losses: ent={ent_loss.item():.4f}*{self.entity_weight}, "
+                      f"con={con_loss.item():.4f}*{self.concept_weight}, "
+                      f"rel={rel_loss.item():.4f}*{self.relation_weight}, "
+                      f"logic={soft_logic_loss.item():.4f}, total={loss.item():.4f}")
             
             # Check for NaN/Inf and skip if found
             if torch.isnan(loss) or torch.isinf(loss):
                 return 0.0
         
-        self._backward_and_step(loss)
+        # Backward pass with NaN gradient checking
+        success = self._backward_and_step(loss)
+        if not success:
+            return 0.0
+        
         return loss.item()
     
     def _get_pair_index(self, i: int, j: int, n: int) -> int:
@@ -259,6 +331,10 @@ class Stage3_Decoder_Trainer(BaseTrainer):
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
+        # Check model health before forward pass
+        if not self._check_model_health():
+            return 0.0
+        
         self.optimizer.zero_grad()
         
         if "decoder_input_ids" not in batch:
@@ -282,6 +358,13 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             
             logits = out["logits"]
             
+            # Check for NaN in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                return 0.0
+            
+            # Clamp logits for numerical stability
+            logits = logits.clamp(-100, 100)
+            
             # Compute loss (no shift needed - collator aligns input_ids and labels)
             decoder_loss = self.ce(
                 logits.view(-1, logits.size(-1)),
@@ -297,7 +380,11 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             if torch.isnan(decoder_loss) or torch.isinf(decoder_loss):
                 return 0.0
         
-        self._backward_and_step(decoder_loss)
+        # Backward pass with NaN gradient checking
+        success = self._backward_and_step(decoder_loss)
+        if not success:
+            return 0.0
+        
         return decoder_loss.item()
 
 
@@ -325,6 +412,10 @@ class Stage4_Joint_Trainer(BaseTrainer):
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
+        # Check model health before forward pass
+        if not self._check_model_health():
+            return 0.0
+        
         self.optimizer.zero_grad()
         
         decoder_input_ids = batch.get("decoder_input_ids", None)
@@ -429,7 +520,11 @@ class Stage4_Joint_Trainer(BaseTrainer):
             if torch.isnan(loss) or torch.isinf(loss):
                 return 0.0
         
-        self._backward_and_step(loss)
+        # Backward pass with NaN gradient checking
+        success = self._backward_and_step(loss)
+        if not success:
+            return 0.0
+        
         return loss.item()
     
     def _create_entity_token_labels(

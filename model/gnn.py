@@ -54,8 +54,12 @@ class SimpleGNN(nn.Module):
             if adj_mask is not None:
                 m = m * adj_mask.unsqueeze(-1)
             
-            msg = m.sum(dim=2)  # (B, N, D)
+            # Average instead of sum to prevent value explosion
+            msg = m.mean(dim=2)  # (B, N, D)
             h = self.layer_norm(h + self.dropout(msg))  # Residual + LayerNorm
+        
+        # Clamp output for numerical stability
+        h = h.clamp(-100, 100)
         
         return h
 
