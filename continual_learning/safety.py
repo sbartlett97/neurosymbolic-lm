@@ -108,33 +108,33 @@ class KeywordFilter:
     def check(self, text: str) -> Tuple[bool, ContentCategory, List[str]]:
         """
         Check text against keyword filters.
-        
+
         Returns:
             (is_safe, category, triggered_rules)
         """
         text_lower = text.lower()
         triggered = []
-        
-        # Check allowlist first
-        for term in self.allowlist:
-            if term in text_lower:
-                return True, ContentCategory.SAFE, []
-        
-        # Check blocklist
+
+        # SECURITY: Check blocklist FIRST - blocklist terms cannot be bypassed by allowlist
         for term in self.blocklist:
             if term in text_lower:
                 triggered.append(f"blocklist:{term}")
-        
+
         if triggered:
             return False, ContentCategory.UNKNOWN, triggered
-        
-        # Check category patterns
+
+        # Check category patterns before allowlist (security-critical patterns)
         for category, patterns in self.patterns.items():
             for pattern in patterns:
                 if pattern.search(text):
                     triggered.append(f"pattern:{category.value}:{pattern.pattern[:30]}")
                     return False, category, triggered
-        
+
+        # Only check allowlist after blocklist and patterns pass
+        for term in self.allowlist:
+            if term in text_lower:
+                return True, ContentCategory.SAFE, []
+
         return True, ContentCategory.SAFE, []
 
 

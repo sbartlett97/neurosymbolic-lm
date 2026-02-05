@@ -111,10 +111,14 @@ class EWCRegularizer:
                     fisher[n] += p.grad.data ** 2
             
             count += batch["input_ids"].size(0)
-        
-        # Normalize
+
+        # Normalize by sample count and apply mean normalization for stability
         for n in fisher:
-            fisher[n] /= count
+            fisher[n] /= max(count, 1)
+            # Apply additional mean normalization to prevent scale issues
+            fisher_mean = fisher[n].mean()
+            if fisher_mean > 0:
+                fisher[n] = fisher[n] / fisher_mean
         
         # Online EWC: running average
         if self.online and self._initialized:
@@ -138,14 +142,15 @@ class EWCRegularizer:
     def penalty(self) -> torch.Tensor:
         """
         Compute EWC penalty term.
-        
+
         Returns:
             Scalar tensor with penalty value
         """
+        device = next(self.model.parameters()).device
         if not self._initialized:
-            return torch.tensor(0.0)
-        
-        loss = torch.tensor(0.0, device=next(self.model.parameters()).device)
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        loss = torch.tensor(0.0, device=device)
         
         for n, p in self.model.named_parameters():
             if n in self.fisher_information and n in self.optimal_params:
@@ -317,12 +322,20 @@ class LearningWithoutForgetting:
             reduction='batchmean'
         ) * (self.temperature ** 2)
         
-        # Concept probabilities distillation
+        # Concept probabilities distillation - use KL divergence for consistency with entity distillation
         student_concept = student_outputs["concept_probs"]
         teacher_concept = teacher_outputs["concept_probs"]
-        
-        concept_distill = F.mse_loss(student_concept, teacher_concept)
-        
+
+        # Apply temperature scaling and use KL divergence
+        student_concept_soft = F.log_softmax(torch.logit(student_concept.clamp(1e-6, 1-1e-6)) / self.temperature, dim=-1)
+        teacher_concept_soft = F.softmax(torch.logit(teacher_concept.clamp(1e-6, 1-1e-6)) / self.temperature, dim=-1)
+
+        concept_distill = F.kl_div(
+            student_concept_soft,
+            teacher_concept_soft,
+            reduction='batchmean'
+        ) * (self.temperature ** 2)
+
         return self.alpha * (entity_distill + concept_distill)
 
 

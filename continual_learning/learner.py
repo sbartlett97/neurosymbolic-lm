@@ -502,41 +502,86 @@ class ContinuousLearner:
             truncation=True,
             max_length=4096
         )
-        
+
         input_ids = tokenized["input_ids"].to(self.device)
         attention_mask = tokenized["attention_mask"].to(self.device)
-        
+
         # Forward pass
         outputs = self.model(input_ids, attention_mask, spans=None, y_ids=None)
-        
-        # Compute losses
-        total_loss = torch.tensor(0.0, device=self.device)
-        
+
+        # Compute losses - start with zero tensor that has gradients
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        has_supervised_loss = False
+
         # Entity classification loss (if labels available)
         if any("entity_type_labels" in s for s in batch):
             entity_logits = outputs["entity_logits"]
-            # Simplified: use first token predictions
-            # In practice, would use proper span alignment
-            
+            B, L, E = entity_logits.shape
+
+            # Build entity labels tensor
+            entity_labels = torch.zeros(B, L, dtype=torch.long, device=self.device)
+            for i, s in enumerate(batch):
+                if "entity_type_labels" in s:
+                    labels = s["entity_type_labels"]
+                    # Handle different label formats
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.tolist()
+                    if isinstance(labels, list):
+                        for j, label in enumerate(labels[:L]):
+                            if isinstance(label, (int, float)):
+                                entity_labels[i, j] = int(label)
+
+            # Compute cross entropy loss (ignore_index=0 for padding)
+            entity_loss = F.cross_entropy(
+                entity_logits.view(-1, E),
+                entity_labels.view(-1),
+                ignore_index=0
+            )
+            total_loss = total_loss + entity_loss
+            has_supervised_loss = True
+
         # Concept loss (if labels available)
-        if any("concepts" in s for s in batch):
+        if any("concept_labels" in s for s in batch):
             concept_probs = outputs["concept_probs"]
-            # Simplified concept loss
-        
-        # Use a simple self-supervised objective
-        # Encourage consistent predictions
-        entity_probs = F.softmax(outputs["entity_logits"], dim=-1)
-        consistency_loss = -torch.mean(entity_probs * torch.log(entity_probs + 1e-10))
-        total_loss = total_loss + 0.1 * consistency_loss
-        
+            B, C = concept_probs.shape
+
+            # Build concept labels tensor
+            concept_labels = torch.zeros(B, C, device=self.device)
+            for i, s in enumerate(batch):
+                if "concept_labels" in s:
+                    labels = s["concept_labels"]
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.flatten()[:C]
+                        concept_labels[i, :len(labels)] = labels.float().to(self.device)
+                    elif isinstance(labels, list):
+                        for j, label in enumerate(labels[:C]):
+                            if isinstance(label, (int, float)):
+                                concept_labels[i, j] = float(label)
+
+            # BCE loss for multi-label concept classification
+            concept_probs_clamped = concept_probs.clamp(1e-6, 1 - 1e-6)
+            concept_loss = F.binary_cross_entropy(concept_probs_clamped, concept_labels)
+            total_loss = total_loss + concept_loss
+            has_supervised_loss = True
+
+        # Fall back to self-supervised objective only if no supervised labels
+        if not has_supervised_loss:
+            # Encourage consistent predictions (entropy minimization)
+            entity_probs = F.softmax(outputs["entity_logits"], dim=-1)
+            consistency_loss = -torch.mean(entity_probs * torch.log(entity_probs + 1e-10))
+            total_loss = total_loss + 0.1 * consistency_loss
+
         return total_loss, outputs
     
     def _should_consolidate(self) -> bool:
         """Check if knowledge should be consolidated."""
-        events_since = len(self.learning_events) % self.config.consolidate_every_n_events
+        # Trigger when event count reaches the threshold (not on zero events)
+        num_events = len(self.learning_events)
+        at_consolidation_interval = (num_events > 0 and
+                                      num_events % self.config.consolidate_every_n_events == 0)
         enough_samples = self.samples_since_consolidation >= self.config.min_samples_for_consolidation
-        
-        return events_since == 0 and enough_samples
+
+        return at_consolidation_interval and enough_samples
     
     def _consolidate(self):
         """Consolidate knowledge (update EWC Fisher, snapshot for LwF, etc.)."""

@@ -73,12 +73,15 @@ class BaseTrainer:
 
 class Stage2_Symbolic_Trainer(BaseTrainer):
     """Stage 2: Entity extraction, concept mapping, and relation head training."""
-    
+
     def __init__(
         self,
         model,
         optimizer,
         soft_logic_weight: float = 0.1,
+        entity_weight: float = 1.0,
+        concept_weight: float = 1.0,
+        relation_weight: float = 1.0,
         grad_clip_norm: float = 1.0,
         use_amp: bool = False,
         device: str = "cpu"
@@ -89,6 +92,9 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
         # Use BCEWithLogitsLoss for concept classification (applies sigmoid internally)
         self.bce = nn.BCEWithLogitsLoss()
         self.soft_logic_weight = soft_logic_weight
+        self.entity_weight = entity_weight
+        self.concept_weight = concept_weight
+        self.relation_weight = relation_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
@@ -140,36 +146,39 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            # Convert concept_probs to logits for BCEWithLogitsLoss
-            eps = 1e-8
-            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
+            # Convert concept_probs to logits for BCEWithLogitsLoss with numerical stability
+            concept_probs_clamped = concept_probs.clamp(1e-6, 1 - 1e-6)
+            concept_logits = torch.logit(concept_probs_clamped)
             con_loss = self.bce(concept_logits, target_labels)
             
-            # Relation classification loss
-            rel_loss = torch.tensor(0.0, device=enc.device)
+            # Relation classification loss - accumulate in list to preserve gradients
+            rel_losses = []
             pair_logits = out["pair_relation_logits"]
             relations = batch["relations"]
-            
+
             for i, (plogits, rels) in enumerate(zip(pair_logits, relations)):
                 if len(rels) == 0 or len(plogits) == 0:
                     continue
-                
+
                 # Fix NaN/Inf in pair logits before using them
                 if torch.isnan(plogits).any() or torch.isinf(plogits).any():
                     plogits = torch.where(torch.isnan(plogits), torch.zeros_like(plogits), plogits)
                     plogits = plogits.clamp(-100, 100)
-                
+
                 for (head_idx, tail_idx, rel_type) in rels:
                     if head_idx < tail_idx:
                         pair_idx = self._get_pair_index(head_idx, tail_idx, out["node_feats"].shape[1])
                         if pair_idx < plogits.shape[0]:
-                            rel_loss = rel_loss + F.cross_entropy(
+                            rel_losses.append(F.cross_entropy(
                                 plogits[pair_idx].unsqueeze(0),
                                 torch.tensor([rel_type], device=plogits.device)
-                            )
+                            ))
+
+            # Sum accumulated losses, or create zero tensor with gradients if empty
+            rel_loss = sum(rel_losses) if rel_losses else torch.tensor(0.0, device=enc.device, requires_grad=True)
             
-            # Soft logic loss
-            soft_logic_loss = torch.tensor(0.0, device=enc.device)
+            # Soft logic loss - use requires_grad=True to preserve gradient flow
+            soft_logic_loss = torch.tensor(0.0, device=enc.device, requires_grad=True)
             if len(self.model.softlogic.rules) > 0:
                 if "node_entity_type_probs" in out and "rel_logits_matrix" in out:
                     soft_logic_loss, _ = self.model.softlogic(
@@ -177,8 +186,11 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                         out["rel_logits_matrix"]
                     )
             
-            loss = ent_loss + con_loss + rel_loss + self.soft_logic_weight * soft_logic_loss
-            
+            loss = (self.entity_weight * ent_loss +
+                    self.concept_weight * con_loss +
+                    self.relation_weight * rel_loss +
+                    self.soft_logic_weight * soft_logic_loss)
+
             # Debug: print component losses on first step
             if not hasattr(self, '_debug_printed'):
                 self._debug_printed = True
@@ -250,12 +262,13 @@ class Stage3_Decoder_Trainer(BaseTrainer):
         """Execute one training step."""
         # Check and fix model health
         self._check_model_health()
-        
-        self.optimizer.zero_grad()
-        
+
+        # Early return before zero_grad to avoid polluting optimizer state
         if "decoder_input_ids" not in batch:
             return 0.0
-        
+
+        self.optimizer.zero_grad()
+
         labels = batch["decoder_labels"]
         decoder_input_ids = batch["decoder_input_ids"]
         
@@ -302,17 +315,20 @@ class Stage3_Decoder_Trainer(BaseTrainer):
 
 class Stage4_Joint_Trainer(BaseTrainer):
     """Stage 4: Joint end-to-end training of all components.
-    
+
     Note: Controller/response decision training has been removed.
     Abstention is now learned through the decoder generating EOS tokens
     for should_respond=0 samples.
     """
-    
+
     def __init__(
         self,
         model,
         optimizer,
         soft_logic_weight: float = 0.1,
+        entity_weight: float = 1.0,
+        concept_weight: float = 1.0,
+        decoder_weight: float = 1.0,
         grad_clip_norm: float = 1.0,
         use_amp: bool = False,
         device: str = "cpu"
@@ -325,6 +341,9 @@ class Stage4_Joint_Trainer(BaseTrainer):
         # Use BCEWithLogitsLoss for concept classification
         self.bce = nn.BCEWithLogitsLoss()
         self.soft_logic_weight = soft_logic_weight
+        self.entity_weight = entity_weight
+        self.concept_weight = concept_weight
+        self.decoder_weight = decoder_weight
     
     def train_step(self, batch: Dict[str, Any]) -> float:
         """Execute one training step."""
@@ -371,9 +390,9 @@ class Stage4_Joint_Trainer(BaseTrainer):
             else:
                 target_labels = aggregated_concept_labels[:, :n_concepts_bank]
             
-            # Convert concept_probs to logits for BCEWithLogitsLoss
-            eps = 1e-8
-            concept_logits = torch.log(concept_probs + eps) - torch.log(1 - concept_probs + eps)
+            # Convert concept_probs to logits for BCEWithLogitsLoss with numerical stability
+            concept_probs_clamped = concept_probs.clamp(1e-6, 1 - 1e-6)
+            concept_logits = torch.logit(concept_probs_clamped)
             con_loss = self.bce(concept_logits, target_labels)
             
             # Decoder loss (includes EOS-based abstention learning)
@@ -387,17 +406,20 @@ class Stage4_Joint_Trainer(BaseTrainer):
                     labels.view(-1)
                 )
             
-            # Soft logic loss
-            soft_logic_loss = torch.tensor(0.0, device=out["entity_logits"].device)
+            # Soft logic loss - use requires_grad=True to preserve gradient flow
+            soft_logic_loss = torch.tensor(0.0, device=out["entity_logits"].device, requires_grad=True)
             if len(self.model.softlogic.rules) > 0:
                 if "node_entity_type_probs" in out and "rel_logits_matrix" in out:
                     soft_logic_loss, _ = self.model.softlogic(
                         out["node_entity_type_probs"],
                         out["rel_logits_matrix"]
                     )
-            
-            loss = ent_loss + con_loss + decoder_loss + self.soft_logic_weight * soft_logic_loss
-            
+
+            loss = (self.entity_weight * ent_loss +
+                    self.concept_weight * con_loss +
+                    self.decoder_weight * decoder_loss +
+                    self.soft_logic_weight * soft_logic_loss)
+
             # Debug: print component losses on first step
             if not hasattr(self, '_debug_printed'):
                 self._debug_printed = True

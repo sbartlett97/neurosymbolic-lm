@@ -257,11 +257,21 @@ class NeuroSymbolicLM(nn.Module):
     ) -> torch.Tensor:
         """Extract node features from encoder outputs."""
         B, L, _ = enc.shape
-        
+
         if spans is not None:
-            # Use provided spans
-            node_repr = span_mean_pool(enc, spans)
-            node_feats = self.node_proj(node_repr).unsqueeze(1)
+            # Use provided spans - extract each span's mean representation per batch item
+            nodes = []
+            for i in range(B):
+                batch_spans = spans[i] if i < len(spans) else []
+                batch_nodes = []
+                for (s, e) in batch_spans[:self.max_nodes]:
+                    span_repr = enc[i, s:e+1].mean(dim=0)
+                    batch_nodes.append(self.node_proj(span_repr))
+                # Pad to max_nodes
+                while len(batch_nodes) < self.max_nodes:
+                    batch_nodes.append(torch.zeros(self.node_dim, device=enc.device))
+                nodes.append(torch.stack(batch_nodes[:self.max_nodes], dim=0))
+            node_feats = torch.stack(nodes, dim=0)  # (B, max_nodes, node_dim)
         else:
             # Use top-k entity scores
             ent_scores = token_ent_logits.max(dim=-1).values
@@ -392,8 +402,8 @@ class NeuroSymbolicLM(nn.Module):
             memory_nodes = self.node_to_encoder_proj(node_feats_refined)
             combined_memory = torch.cat([enc, memory_nodes], dim=1)
             
-            # Create extended attention mask
-            node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device)
+            # Create extended attention mask with matching dtype
+            node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
             combined_mask = torch.cat([attention_mask, node_mask], dim=1)
             
             # Get decoder outputs
@@ -447,7 +457,7 @@ class NeuroSymbolicLM(nn.Module):
             # Combine encoder outputs with node features
             B = enc.shape[0]
             combined_memory = torch.cat([enc, memory_nodes], dim=1)
-            node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device)
+            node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
             combined_mask = torch.cat([attention_mask, node_mask], dim=1)
             
             # Wrap in BaseModelOutput for T5's generate method
@@ -502,12 +512,17 @@ def compute_losses(model_outputs: Dict, targets: Dict, lambda_weights: Dict) -> 
         )
         losses["entity"] = ent_loss * lambda_weights.get("entity", 1.0)
     
-    # Concept loss
+    # Concept loss - use nll_loss since cp is already probabilities (avoids double log)
     if targets.get("concept_id") is not None:
         cp = model_outputs["concept_probs"]
         cid = targets["concept_id"]
-        c_loss = F.cross_entropy(cp.log(), cid)
+        c_loss = F.nll_loss(torch.log(cp + 1e-8), cid)
         losses["concept"] = c_loss * lambda_weights.get("concept", 1.0)
     
-    total = sum(losses.values()) if len(losses) > 0 else torch.tensor(0.0)
+    if len(losses) > 0:
+        total = sum(losses.values())
+    else:
+        # Get device from model outputs to avoid device mismatch
+        device = model_outputs.get("entity_logits", model_outputs.get("concept_probs")).device
+        total = torch.tensor(0.0, device=device, requires_grad=True)
     return total, losses

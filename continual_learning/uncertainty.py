@@ -166,14 +166,15 @@ class MonteCarloDropout:
         
         # Predictive entropy (total uncertainty)
         predictive_entropy = entity_entropy.mean().item()
-        
+
         # Expected entropy (aleatoric - irreducible)
         individual_entropies = torch.stack([self._entropy(p) for p in entity_probs])
         expected_entropy = individual_entropies.mean(dim=0)
         aleatoric = expected_entropy.mean().item()
-        
+
         # Epistemic uncertainty (mutual information - reducible)
-        epistemic = predictive_entropy - aleatoric
+        # Clamp to non-negative since numerical precision can cause slight negatives
+        epistemic = max(0.0, predictive_entropy - aleatoric)
         
         # Combined score (weighted average)
         overall = 0.4 * epistemic + 0.3 * entity_uncertainty + 0.2 * concept_uncertainty + 0.1 * relation_uncertainty

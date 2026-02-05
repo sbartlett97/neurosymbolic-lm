@@ -113,8 +113,9 @@ class EpisodicMemory:
         """
         self.seen_count += 1
         concepts = concepts or sample.get("concepts", [])
-        if isinstance(concepts[0], list) if concepts else False:
-            concepts = [c for clist in concepts for c in clist]
+        # Safely flatten nested concept lists, avoiding IndexError on empty lists
+        if concepts and len(concepts) > 0 and isinstance(concepts[0], list):
+            concepts = [c for clist in concepts for c in clist if c]
         
         entry = MemoryEntry(
             sample=sample,

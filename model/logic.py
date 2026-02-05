@@ -114,7 +114,8 @@ class SoftLogicConstraints(nn.Module):
         for (etype_a, etype_b, rel_idx, weight, polarity) in self.rules:
             p_a = entity_type_probs[:, :, etype_a].unsqueeze(-1)  # (B, N, 1)
             p_b = entity_type_probs[:, :, etype_b].unsqueeze(1)   # (B, 1, N)
-            type_pair_prob = (p_a * p_b).squeeze(-1)  # (B, N, N)
+            # Broadcast produces (B, N, N) directly - no squeeze needed
+            type_pair_prob = p_a * p_b  # (B, N, N)
             
             # Work with logits directly for numerical stability
             rel_logits = rel_logits_matrix[:, :, :, rel_idx]  # (B, N, N)

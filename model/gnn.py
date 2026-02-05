@@ -136,11 +136,12 @@ class KGAwareGNN(nn.Module):
             
             if kg_adjacency is not None:
                 m = m * kg_adjacency.unsqueeze(-1)
-            
+
             if adj_mask is not None:
                 m = m * adj_mask.unsqueeze(-1)
-            
-            msg = m.sum(dim=2)
+
+            # Use mean instead of sum for numerical stability
+            msg = m.mean(dim=2)
             h = self.layer_norm(h + self.dropout(msg))
         
         return h
@@ -225,7 +226,9 @@ class KGPathReasoner(nn.Module):
         
         path_tensor = torch.cat(path_steps, dim=0).unsqueeze(0)
         path_encoded, (hidden, _) = self.path_encoder(path_tensor)
-        path_embedding = hidden.squeeze(0)
+        # hidden shape: (num_layers * num_directions, batch, hidden_size)
+        # Get the last layer's hidden state for the single batch item
+        path_embedding = hidden[-1, 0]  # (hidden_size,)
         
         return path_embedding
     
