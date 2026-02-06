@@ -16,8 +16,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .pooling import MultiQueryPool, span_mean_pool
-from .entity import TokenEntityClassifier, ConceptBank
-from .gnn import SimpleGNN, KGAwareGNN, KGPathReasoner
+from .entity import (
+    TokenEntityClassifier,
+    ContextAwareEntityClassifier,
+    ConceptBank,
+    HierarchicalConceptBank,
+)
+from .gnn import SimpleGNN, AttentionGNN, KGAwareGNN, KGPathReasoner
 from .logic import SoftLogicConstraints, pair_logits_to_matrix
 
 
@@ -71,15 +76,21 @@ class NeuroSymbolicLM(nn.Module):
         gradient_checkpointing: bool = False,
         max_input_length: int = 4096,
         max_output_length: int = 1024,
+        # New options for enhanced components
+        use_context_aware_entity: bool = False,
+        use_hierarchical_concepts: bool = False,
+        concept_hierarchy_levels: Optional[List[int]] = None,
+        use_attention_gnn: bool = False,
+        gnn_n_heads: int = 4,
     ):
         super().__init__()
-        
+
         # Determine model type and load appropriately
         self.model_name = model_name
         self.is_long_t5 = "long-t5" in model_name.lower()
         self.max_input_length = max_input_length
         self.max_output_length = max_output_length
-        
+
         # Load the appropriate model
         if self.is_long_t5:
             from transformers import LongT5ForConditionalGeneration
@@ -89,16 +100,16 @@ class NeuroSymbolicLM(nn.Module):
             from transformers import T5ForConditionalGeneration
             print(f"Loading T5 model: {model_name}")
             self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
-        
+
         self.config = self.t5.config
         self.d_model = self.config.d_model
         self.vocab_size = self.config.vocab_size
-        
+
         # Enable gradient checkpointing for memory efficiency
         if gradient_checkpointing:
             self.t5.gradient_checkpointing_enable()
             print("Gradient checkpointing enabled")
-        
+
         # Store configuration
         self.n_entity_types = n_entity_types
         self.n_relations = n_relations
@@ -112,41 +123,82 @@ class NeuroSymbolicLM(nn.Module):
         self.use_path_reasoning = use_path_reasoning
         self.max_path_length = max_path_length
         self.gradient_checkpointing = gradient_checkpointing
-        
+        self.use_context_aware_entity = use_context_aware_entity
+        self.use_hierarchical_concepts = use_hierarchical_concepts
+        self.use_attention_gnn = use_attention_gnn
+
         # Freeze options
         if freeze_encoder:
             for param in self.t5.encoder.parameters():
                 param.requires_grad = False
-        
+
         if freeze_decoder:
             for param in self.t5.decoder.parameters():
                 param.requires_grad = False
             for param in self.t5.lm_head.parameters():
                 param.requires_grad = False
-        
+
         # Token processing
         self.token_pool = MultiQueryPool(self.d_model, n_queries=6)
-        self.token_ent = TokenEntityClassifier(self.d_model, n_entity_types)
-        
-        # Concept bank
-        self.concept_bank = ConceptBank(n_concepts, concept_dim)
+
+        # Entity classifier - standard or context-aware
+        if use_context_aware_entity:
+            self.token_ent = ContextAwareEntityClassifier(
+                self.d_model,
+                n_entity_types,
+                n_heads=4,
+                context_layers=1,
+            )
+            print("Using context-aware entity classifier")
+        else:
+            self.token_ent = TokenEntityClassifier(self.d_model, n_entity_types)
+
+        # Concept bank - flat or hierarchical
+        if use_hierarchical_concepts:
+            if concept_hierarchy_levels is None:
+                concept_hierarchy_levels = [n_concepts, n_concepts // 4, n_concepts // 16]
+            self.concept_bank = HierarchicalConceptBank(
+                n_concepts_per_level=concept_hierarchy_levels,
+                c_dim=concept_dim,
+            )
+            print(f"Using hierarchical concept bank: {concept_hierarchy_levels}")
+        else:
+            self.concept_bank = ConceptBank(n_concepts, concept_dim)
+
         self.concept_proj = nn.Linear(self.d_model, concept_dim)
         self.node_proj = nn.Linear(self.d_model, node_dim)
-        
-        # GNN
-        if use_kg_gnn:
+
+        # GNN - select variant
+        if use_attention_gnn:
+            self.gnn = AttentionGNN(
+                node_dim,
+                n_heads=gnn_n_heads,
+                n_layers=2,
+            )
+            print(f"Using attention-based GNN with {gnn_n_heads} heads")
+        elif use_kg_gnn:
             self.gnn = KGAwareGNN(node_dim, kg_embed_dim, n_layers=2, use_kg=True)
         else:
             self.gnn = SimpleGNN(node_dim, n_layers=2)
-        
-        # Path reasoner (placeholder for KG integration)
+
+        # Path reasoner for multi-hop KG reasoning
         self.path_reasoner = None
+        self.kg_entity_embeddings: Optional[Dict[str, torch.Tensor]] = None
+        self.kg_relation_embeddings: Optional[Dict[str, torch.Tensor]] = None
         if use_path_reasoning:
             self.path_reasoner = KGPathReasoner(
                 node_dim, kg_embed_dim, max_path_length=max_path_length
             )
             self.path_to_rel_proj = nn.Linear(node_dim, n_relations)
-        
+            # Fusion layer for combining GNN and path reasoning outputs
+            self.path_fusion = nn.Sequential(
+                nn.Linear(node_dim * 2, node_dim),
+                nn.LayerNorm(node_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+            )
+            print("Using KG path reasoning")
+
         # Relation scorer
         self.rel_scorer = nn.Sequential(
             nn.Linear(node_dim * 2, node_dim),
@@ -154,18 +206,33 @@ class NeuroSymbolicLM(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(node_dim, n_relations)
         )
-        
+
         # Soft logic constraints
         self.softlogic = SoftLogicConstraints(n_entity_types, n_relations)
-        
+
         # Concept classification head
         self.concept_head = nn.Linear(self.d_model, n_concepts)
-        
+
         # Projection for node features to feed into decoder
         if node_dim != self.d_model:
             self.node_to_encoder_proj = nn.Linear(node_dim, self.d_model)
         else:
             self.node_to_encoder_proj = nn.Identity()
+
+    def set_kg_embeddings(
+        self,
+        entity_embeddings: Dict[str, torch.Tensor],
+        relation_embeddings: Dict[str, torch.Tensor],
+    ):
+        """
+        Set external knowledge graph embeddings for path reasoning.
+
+        Args:
+            entity_embeddings: Dict mapping entity names to embedding tensors
+            relation_embeddings: Dict mapping relation names to embedding tensors
+        """
+        self.kg_entity_embeddings = entity_embeddings
+        self.kg_relation_embeddings = relation_embeddings
     
     @property
     def entity_head(self):
@@ -338,51 +405,86 @@ class NeuroSymbolicLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         spans: Optional[List[List[Tuple[int, int]]]] = None,
-        y_ids: Optional[torch.Tensor] = None
+        y_ids: Optional[torch.Tensor] = None,
+        entity_names: Optional[List[List[str]]] = None,
+        kg_paths: Optional[List[List[List[List[Tuple[str, str]]]]]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the model.
-        
+
         Args:
             input_ids: (B, L) input token IDs
             attention_mask: (B, L) attention mask
             spans: Optional gold entity spans
             y_ids: Decoder input IDs for teacher forcing
-        
+            entity_names: Optional entity name strings for KG lookup (B, num_entities)
+            kg_paths: Optional pre-computed KG paths for path reasoning
+                      Shape: [batch][pair_idx][path_idx][(relation, entity), ...]
+
         Returns:
             Dictionary with model outputs
         """
         B, L = input_ids.shape
-        
+
         # Encode input
         enc = self.encode(input_ids, attention_mask)
-        
+
         # Token-level entity classification
-        token_ent_logits = self.token_ent(enc)
-        
+        # Context-aware classifier can use attention mask
+        if self.use_context_aware_entity:
+            token_ent_logits = self.token_ent(enc, attention_mask)
+        else:
+            token_ent_logits = self.token_ent(enc)
+
         # Pool tokens
         token_pool, _ = self.token_pool(enc, attention_mask)
-        
+
         # Extract node features
         node_feats = self._extract_node_features(enc, token_ent_logits, spans)
-        
+
         # GNN processing
         node_feats_refined = self.gnn(node_feats)
-        
+
+        # Path reasoning integration (if enabled and KG available)
+        path_enhanced_feats = None
+        if (
+            self.path_reasoner is not None
+            and self.kg_entity_embeddings is not None
+            and self.kg_relation_embeddings is not None
+            and kg_paths is not None
+        ):
+            path_enhanced_feats = self._apply_path_reasoning(
+                node_feats_refined,
+                entity_names,
+                kg_paths,
+            )
+            # Fuse GNN and path reasoning features
+            node_feats_refined = self.path_fusion(
+                torch.cat([node_feats_refined, path_enhanced_feats], dim=-1)
+            )
+
         # Concept mapping
         concept_query = self.concept_proj(token_pool)
-        concept_vec, concept_probs = self.concept_bank.soft_assign(concept_query)
-        
+
+        # Handle hierarchical vs flat concept bank
+        if self.use_hierarchical_concepts:
+            concept_vec, concept_probs, hierarchy_probs = self.concept_bank.soft_assign(
+                concept_query, aggregate_hierarchy=True
+            )
+        else:
+            concept_vec, concept_probs = self.concept_bank.soft_assign(concept_query)
+            hierarchy_probs = None
+
         # Compute pairwise relations
         N = node_feats_refined.shape[1]
         n_rel = self.rel_scorer[-1].out_features
         pair_logits, pairs_index_map, rel_logits_matrix = self._compute_pairwise_relations_vectorized(
             node_feats_refined, N, n_rel
         )
-        
+
         # Node entity type probabilities
         node_entity_type_probs = self._compute_node_entity_probs(token_ent_logits, spans)
-        
+
         # Base outputs
         outputs = {
             "entity_logits": token_ent_logits,
@@ -395,22 +497,96 @@ class NeuroSymbolicLM(nn.Module):
             "enc": enc,
             "node_feats": node_feats_refined,
         }
-        
+
+        # Add hierarchical concept outputs if available
+        if hierarchy_probs is not None:
+            outputs["hierarchy_concept_probs"] = hierarchy_probs
+
+        # Add path-enhanced features if available
+        if path_enhanced_feats is not None:
+            outputs["path_enhanced_feats"] = path_enhanced_feats
+
         # Decoder forward if y_ids provided
         if y_ids is not None:
             # Combine encoder outputs with node features for richer context
             memory_nodes = self.node_to_encoder_proj(node_feats_refined)
             combined_memory = torch.cat([enc, memory_nodes], dim=1)
-            
+
             # Create extended attention mask with matching dtype
             node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
             combined_mask = torch.cat([attention_mask, node_mask], dim=1)
-            
+
             # Get decoder outputs
             logits = self.decode(y_ids, combined_memory, combined_mask)
             outputs["logits"] = logits
-        
+
         return outputs
+
+    def _apply_path_reasoning(
+        self,
+        node_feats: torch.Tensor,
+        entity_names: Optional[List[List[str]]],
+        kg_paths: List[List[List[List[Tuple[str, str]]]]],
+    ) -> torch.Tensor:
+        """
+        Apply KG path reasoning to enhance node features.
+
+        Args:
+            node_feats: (B, N, D) node features from GNN
+            entity_names: Entity names for KG lookup
+            kg_paths: Pre-computed paths between entity pairs
+
+        Returns:
+            Path-enhanced node features (B, N, D)
+        """
+        B, N, D = node_feats.shape
+        device = node_feats.device
+
+        # Initialize path-enhanced features with zeros
+        path_feats = torch.zeros_like(node_feats)
+
+        for b in range(B):
+            batch_paths = kg_paths[b] if b < len(kg_paths) else []
+
+            # Generate entity pairs for this batch
+            entity_pairs = []
+            pair_to_nodes = []
+            for i in range(N):
+                for j in range(i + 1, N):
+                    pair_idx = len(entity_pairs)
+                    if pair_idx < len(batch_paths):
+                        entity_pairs.append((i, j))
+                        pair_to_nodes.append((i, j))
+
+            if not entity_pairs or not batch_paths:
+                continue
+
+            # Get path embeddings using the path reasoner
+            path_embeddings = self.path_reasoner(
+                entity_pairs=entity_pairs,
+                paths=batch_paths[:len(entity_pairs)],
+                kg_entity_embeddings=self.kg_entity_embeddings,
+                kg_relation_embeddings=self.kg_relation_embeddings,
+                device=str(device),
+            )
+
+            # Distribute path embeddings back to nodes
+            for pair_idx, (i, j) in enumerate(pair_to_nodes):
+                if pair_idx < path_embeddings.shape[0]:
+                    path_emb = path_embeddings[pair_idx]
+                    # Add path info to both nodes in the pair
+                    path_feats[b, i] = path_feats[b, i] + path_emb
+                    path_feats[b, j] = path_feats[b, j] + path_emb
+
+            # Normalize by number of paths per node
+            node_path_counts = torch.zeros(N, device=device)
+            for i, j in pair_to_nodes:
+                node_path_counts[i] += 1
+                node_path_counts[j] += 1
+            node_path_counts = node_path_counts.clamp(min=1)
+            path_feats[b] = path_feats[b] / node_path_counts.unsqueeze(-1)
+
+        return path_feats
     
     def generate(
         self,
