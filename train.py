@@ -41,7 +41,9 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from config import ModelConfig, MODEL_PRESETS
 from model import NeuroSymbolicLM
+from model.kg_relation_encoder import KGRelationEncoder
 from data.collator import CognitiveCollator
+from data.chat_template import ChatTemplate
 from data.dataset import ToyCognitiveDataset
 from training import (
     Stage2_Symbolic_Trainer,
@@ -88,10 +90,10 @@ def parse_args():
     
     # Training stages
     train_group = parser.add_argument_group("Training")
-    train_group.add_argument("--stages", type=str, nargs="+", 
+    train_group.add_argument("--stages", type=str, nargs="+",
                             default=["symbolic", "decoder", "joint"],
                             choices=["symbolic", "decoder", "joint"],
-                            help="Training stages to run")
+                            help="Training stages to run (for pretrain phase)")
     train_group.add_argument("--epochs", type=int, default=5,
                             help="Epochs per stage")
     train_group.add_argument("--batch-size", type=int, default=4,
@@ -102,6 +104,30 @@ def parse_args():
                             help="Warmup ratio")
     train_group.add_argument("--patience", type=int, default=3,
                             help="Early stopping patience")
+
+    # Two-phase training
+    phase_group = parser.add_argument_group("Two-Phase Training")
+    phase_group.add_argument("--phase", type=str, default="pretrain",
+                            choices=["pretrain", "chat", "both"],
+                            help="Training phase: pretrain, chat, or both")
+    phase_group.add_argument("--chat-dataset", type=str, default=None,
+                            help="Chat JSONL dataset with 'messages' field")
+    phase_group.add_argument("--chat-epochs", type=int, default=3,
+                            help="Epochs for chat fine-tuning phase")
+    phase_group.add_argument("--chat-lr", type=float, default=1e-5,
+                            help="Learning rate for chat phase")
+    phase_group.add_argument("--system-prompt", type=str,
+                            default="You are a helpful assistant.",
+                            help="Default system prompt for chat mode")
+
+    # Knowledge graph
+    kg_group = parser.add_argument_group("Knowledge Graph")
+    kg_group.add_argument("--use-kg", action="store_true",
+                         help="Enable KG integration with ConceptNet")
+    kg_group.add_argument("--kg-embeddings", type=str, default=None,
+                         help="Path to ConceptNet Numberbatch embeddings")
+    kg_group.add_argument("--kg-triples", type=str, default=None,
+                         help="Path to ConceptNet triples JSONL")
     
     # Hardware
     hw_group = parser.add_argument_group("Hardware")
@@ -215,7 +241,10 @@ def create_dataloader(
     model_config: ModelConfig,
     batch_size: int,
     num_workers: int,
-    include_responses: bool
+    include_responses: bool,
+    chat_mode: bool = False,
+    chat_template: Optional[ChatTemplate] = None,
+    kg_relation_encoder: Optional[KGRelationEncoder] = None,
 ) -> DataLoader:
     """Create dataloader with collator."""
     collator = CognitiveCollator(
@@ -225,9 +254,13 @@ def create_dataloader(
         include_responses=include_responses,
         concept_to_entity_type_map=entity_type_map,
         max_length=model_config.max_input_length,
-        max_output_length=model_config.max_output_length
+        max_output_length=model_config.max_output_length,
+        chat_mode=chat_mode,
+        chat_template=chat_template,
+        kg_relation_encoder=kg_relation_encoder,
+        max_nodes=model_config.max_nodes,
     )
-    
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -573,6 +606,9 @@ def main():
     print(f"  Relations: {len(relation_map)} -> capacity {n_relations}")
     print(f"  Concepts: {len(concept_map)} -> capacity {n_concepts}")
     
+    # Determine if KG-aware GNN should be used
+    use_kg_gnn = args.use_kg
+
     # Create model
     print(f"\nCreating model...")
     model = NeuroSymbolicLM(
@@ -586,168 +622,265 @@ def main():
         gradient_checkpointing=model_config.gradient_checkpointing,
         max_input_length=model_config.max_input_length,
         max_output_length=model_config.max_output_length,
+        use_kg_gnn=use_kg_gnn,
+        kg_embed_dim=model_config.kg_embed_dim,
+        use_path_reasoning=model_config.use_path_reasoning,
     )
-    
+
+    # Add chat special tokens to tokenizer and resize embeddings
+    chat_template = ChatTemplate(default_system_prompt=args.system_prompt)
+    tokens_added = ChatTemplate.add_special_tokens(tokenizer)
+    if tokens_added > 0:
+        model.t5.resize_token_embeddings(len(tokenizer))
+        print(f"  Added {tokens_added} chat special tokens, resized embeddings to {len(tokenizer)}")
+
     # Resume from checkpoint
     if args.resume:
         print(f"Loading checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"])
-    
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+    # Load KG embeddings if requested
+    kg_relation_encoder = model.kg_relation_encoder  # May be None
+    if args.use_kg:
+        print("\nInitializing KG integration...")
+        if args.kg_embeddings and Path(args.kg_embeddings).exists():
+            from kg_utils import KGEmbeddingLoader
+            kg_loader = KGEmbeddingLoader(kg_type="conceptnet")
+            kg_dim = kg_loader.load_conceptnet_embeddings(args.kg_embeddings)
+            # Convert to torch tensors for the model
+            entity_embeddings = {
+                k: torch.tensor(v, dtype=torch.float32)
+                for k, v in kg_loader.entity_embeddings.items()
+            }
+            # Relation embeddings from Numberbatch don't exist separately —
+            # the KGRelationEncoder learns them. But path reasoner needs
+            # entity embeddings.
+            model.set_kg_embeddings(entity_embeddings, {})
+            print(f"  Loaded {len(entity_embeddings)} entity embeddings (dim={kg_dim})")
+        else:
+            print("  Warning: --use-kg specified but no --kg-embeddings path (or file missing)")
+
     model = model.to(args.device)
-    
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Total parameters: {total_params:,}")
-    
+
     # Setup logging and checkpointing
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TrainingLogger(log_dir=args.log_dir, experiment_name=f"unified_{timestamp}")
     checkpoint_manager = CheckpointManager(save_dir=args.output_dir, max_checkpoints=5)
-    
+
     use_amp = not args.no_amp and args.device == "cuda"
     print(f"  Mixed precision (AMP): {use_amp}")
-    
-    # Training stages
-    print(f"\nStages to run: {args.stages}")
-    
-    # Stage 1: Symbolic (Entity/Relation)
-    if "symbolic" in args.stages:
+
+    # =========================================================================
+    # Phase 1: Pre-training (existing symbolic → decoder → joint sub-stages)
+    # =========================================================================
+    if args.phase in ("pretrain", "both"):
+        print(f"\nPhase: Pre-training")
+        print(f"Stages to run: {args.stages}")
+
+        # Stage 1: Symbolic (Entity/Relation)
+        if "symbolic" in args.stages:
+            print("\n" + "="*60)
+            print("Stage 1: Symbolic Training (Entity/Relation)")
+            print("="*60)
+
+            # Freeze decoder
+            for p in model.t5.decoder.parameters():
+                p.requires_grad = False
+            for p in model.t5.lm_head.parameters():
+                p.requires_grad = False
+
+            train_loader = create_dataloader(
+                train_dataset, tokenizer, concept_map, relation_map, entity_type_map,
+                model_config, args.batch_size, args.num_workers,
+                include_responses=False,
+                kg_relation_encoder=kg_relation_encoder,
+            )
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = AdamW(trainable_params, lr=args.lr)
+            total_steps = len(train_loader) * args.epochs
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, int(total_steps * args.warmup_ratio), total_steps
+            )
+
+            trainer = Stage2_Symbolic_Trainer(
+                model, optimizer, use_amp=use_amp, device=args.device
+            )
+
+            train_stage(
+                "Symbolic", model, trainer, train_loader,
+                optimizer, scheduler, args.epochs, args.device,
+                logger, checkpoint_manager, EarlyStopping(patience=args.patience),
+                tokenizer=tokenizer, train_dataset=train_dataset, eval_dataset=eval_dataset,
+                model_config=model_config, debug=args.debug, save_every=args.save_every
+            )
+
+        # Stage 2: Decoder
+        if "decoder" in args.stages:
+            print("\n" + "="*60)
+            print("Stage 2: Decoder Training")
+            print("="*60)
+
+            # Unfreeze decoder, freeze symbolic heads
+            for p in model.t5.decoder.parameters():
+                p.requires_grad = True
+            for p in model.t5.lm_head.parameters():
+                p.requires_grad = True
+
+            # Freeze symbolic components
+            for p in model.token_ent.parameters():
+                p.requires_grad = False
+            for p in model.concept_bank.parameters():
+                p.requires_grad = False
+            for p in model.rel_scorer.parameters():
+                p.requires_grad = False
+            for p in model.gnn.parameters():
+                p.requires_grad = False
+
+            # Use stage2 dataset if available, otherwise use primary
+            decoder_dataset = stage2_dataset if stage2_dataset else train_dataset
+
+            train_loader = create_dataloader(
+                decoder_dataset, tokenizer, concept_map, relation_map, entity_type_map,
+                model_config, args.batch_size, args.num_workers,
+                include_responses=True,
+                kg_relation_encoder=kg_relation_encoder,
+            )
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = AdamW(trainable_params, lr=args.lr * 0.5)
+            total_steps = len(train_loader) * args.epochs
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, int(total_steps * args.warmup_ratio), total_steps
+            )
+
+            trainer = Stage3_Decoder_Trainer(
+                model, optimizer, use_amp=use_amp, device=args.device
+            )
+
+            train_stage(
+                "Decoder", model, trainer, train_loader,
+                optimizer, scheduler, args.epochs, args.device,
+                logger, checkpoint_manager, EarlyStopping(patience=args.patience),
+                tokenizer=tokenizer, train_dataset=decoder_dataset, eval_dataset=eval_dataset,
+                model_config=model_config, eval_every=args.eval_every,
+                debug=args.debug, save_every=args.save_every
+            )
+
+        # Stage 3: Joint
+        if "joint" in args.stages:
+            print("\n" + "="*60)
+            print("Stage 3: Joint Training")
+            print("="*60)
+
+            # Unfreeze everything
+            for p in model.parameters():
+                p.requires_grad = True
+
+            # Use the dataset with responses
+            joint_dataset = stage2_dataset if stage2_dataset else train_dataset
+
+            train_loader = create_dataloader(
+                joint_dataset, tokenizer, concept_map, relation_map, entity_type_map,
+                model_config, args.batch_size, args.num_workers,
+                include_responses=True,
+                kg_relation_encoder=kg_relation_encoder,
+            )
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = AdamW(trainable_params, lr=args.lr * 0.1)
+            total_steps = len(train_loader) * args.epochs
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, int(total_steps * args.warmup_ratio), total_steps
+            )
+
+            trainer = Stage4_Joint_Trainer(
+                model, optimizer, use_amp=use_amp, device=args.device
+            )
+
+            train_stage(
+                "Joint", model, trainer, train_loader,
+                optimizer, scheduler, args.epochs, args.device,
+                logger, checkpoint_manager, EarlyStopping(patience=args.patience + 2),
+                tokenizer=tokenizer, train_dataset=joint_dataset, eval_dataset=eval_dataset,
+                model_config=model_config, eval_every=args.eval_every,
+                debug=args.debug, save_every=args.save_every
+            )
+
+    # =========================================================================
+    # Phase 2: Chat Fine-tuning
+    # =========================================================================
+    if args.phase in ("chat", "both"):
         print("\n" + "="*60)
-        print("Stage 1: Symbolic Training (Entity/Relation)")
+        print("Phase 2: Chat Fine-tuning")
         print("="*60)
-        
-        # Freeze decoder
-        for p in model.t5.decoder.parameters():
-            p.requires_grad = False
-        for p in model.t5.lm_head.parameters():
-            p.requires_grad = False
-        
-        train_loader = create_dataloader(
-            train_dataset, tokenizer, concept_map, relation_map, entity_type_map,
-            model_config, args.batch_size, args.num_workers,
-            include_responses=False
-        )
-        
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = AdamW(trainable_params, lr=args.lr)
-        total_steps = len(train_loader) * args.epochs
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, int(total_steps * args.warmup_ratio), total_steps
-        )
-        
-        trainer = Stage2_Symbolic_Trainer(
-            model, optimizer, use_amp=use_amp, device=args.device
-        )
-        
-        train_stage(
-            "Symbolic", model, trainer, train_loader,
-            optimizer, scheduler, args.epochs, args.device,
-            logger, checkpoint_manager, EarlyStopping(patience=args.patience),
-            tokenizer=tokenizer, train_dataset=train_dataset, eval_dataset=eval_dataset,
-            model_config=model_config, debug=args.debug, save_every=args.save_every
-        )
-    
-    # Stage 2: Decoder
-    if "decoder" in args.stages:
-        print("\n" + "="*60)
-        print("Stage 2: Decoder Training")
-        print("="*60)
-        
-        # Unfreeze decoder, freeze symbolic heads
-        for p in model.t5.decoder.parameters():
-            p.requires_grad = True
-        for p in model.t5.lm_head.parameters():
-            p.requires_grad = True
-        
-        # Freeze symbolic components
-        for p in model.token_ent.parameters():
-            p.requires_grad = False
-        for p in model.concept_bank.parameters():
-            p.requires_grad = False
-        for p in model.rel_scorer.parameters():
-            p.requires_grad = False
-        for p in model.gnn.parameters():
-            p.requires_grad = False
-        
-        # Use stage2 dataset if available, otherwise use primary
-        decoder_dataset = stage2_dataset if stage2_dataset else train_dataset
-        
-        train_loader = create_dataloader(
-            decoder_dataset, tokenizer, concept_map, relation_map, entity_type_map,
-            model_config, args.batch_size, args.num_workers,
-            include_responses=True
-        )
-        
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = AdamW(trainable_params, lr=args.lr * 0.5)
-        total_steps = len(train_loader) * args.epochs
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, int(total_steps * args.warmup_ratio), total_steps
-        )
-        
-        trainer = Stage3_Decoder_Trainer(
-            model, optimizer, use_amp=use_amp, device=args.device
-        )
-        
-        train_stage(
-            "Decoder", model, trainer, train_loader,
-            optimizer, scheduler, args.epochs, args.device,
-            logger, checkpoint_manager, EarlyStopping(patience=args.patience),
-            tokenizer=tokenizer, train_dataset=decoder_dataset, eval_dataset=eval_dataset,
-            model_config=model_config, eval_every=args.eval_every, 
-            debug=args.debug, save_every=args.save_every
-        )
-    
-    # Stage 3: Joint
-    if "joint" in args.stages:
-        print("\n" + "="*60)
-        print("Stage 3: Joint Training")
-        print("="*60)
-        
-        # Unfreeze everything
+
+        # Load chat dataset
+        chat_dataset_path = args.chat_dataset
+        if chat_dataset_path and Path(chat_dataset_path).exists():
+            chat_dataset = load_dataset(Path(chat_dataset_path), args.max_samples)
+            print(f"  Loaded {len(chat_dataset)} chat samples from {chat_dataset_path}")
+        else:
+            # Fall back to primary dataset with chat formatting
+            chat_dataset = train_dataset
+            print(f"  No chat dataset specified, using primary dataset ({len(chat_dataset)} samples)")
+            print("  Tip: Use --chat-dataset for dedicated chat data")
+
+        # Merge vocab from chat dataset
+        c_chat, r_chat, et_chat, _, _, _ = extract_vocab_from_dataset(chat_dataset)
+        concept_map.update(c_chat)
+        relation_map.update(r_chat)
+        entity_type_map.update(et_chat)
+
+        # Unfreeze all parameters for chat fine-tuning
         for p in model.parameters():
             p.requires_grad = True
-        
-        # Use the dataset with responses
-        joint_dataset = stage2_dataset if stage2_dataset else train_dataset
-        
+
         train_loader = create_dataloader(
-            joint_dataset, tokenizer, concept_map, relation_map, entity_type_map,
+            chat_dataset, tokenizer, concept_map, relation_map, entity_type_map,
             model_config, args.batch_size, args.num_workers,
-            include_responses=True
+            include_responses=True,
+            chat_mode=True,
+            chat_template=chat_template,
+            kg_relation_encoder=kg_relation_encoder,
         )
-        
+
         trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = AdamW(trainable_params, lr=args.lr * 0.1)
-        total_steps = len(train_loader) * args.epochs
+        optimizer = AdamW(trainable_params, lr=args.chat_lr)
+        total_steps = len(train_loader) * args.chat_epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer, int(total_steps * args.warmup_ratio), total_steps
         )
-        
+
+        # Use joint trainer for chat — it handles all losses
         trainer = Stage4_Joint_Trainer(
             model, optimizer, use_amp=use_amp, device=args.device
         )
-        
+
         train_stage(
-            "Joint", model, trainer, train_loader,
-            optimizer, scheduler, args.epochs, args.device,
+            "Chat", model, trainer, train_loader,
+            optimizer, scheduler, args.chat_epochs, args.device,
             logger, checkpoint_manager, EarlyStopping(patience=args.patience + 2),
-            tokenizer=tokenizer, train_dataset=joint_dataset, eval_dataset=eval_dataset,
-            model_config=model_config, eval_every=args.eval_every, 
+            tokenizer=tokenizer, train_dataset=chat_dataset, eval_dataset=eval_dataset,
+            model_config=model_config, eval_every=args.eval_every,
             debug=args.debug, save_every=args.save_every
         )
-    
+
     # Run final comprehensive evaluation
     final_metrics = run_final_evaluation(
         model, tokenizer, train_dataset, eval_dataset,
         args.device, model_config, logger
     )
-    
+
     # Save final model
     print("\n" + "="*60)
     print("Training Complete!")
     print("="*60)
-    
+
     final_path = Path(args.output_dir) / "final_model.pt"
     torch.save({
         "model_state_dict": model.state_dict(),
@@ -756,13 +889,15 @@ def main():
             "n_entity_types": n_entity_types,
             "n_relations": n_relations,
             "n_concepts": n_concepts,
+            "use_kg_gnn": use_kg_gnn,
+            "phase": args.phase,
         },
         "concept_map": concept_map,
         "relation_map": relation_map,
         "final_metrics": final_metrics,
     }, final_path)
     print(f"Saved final model to {final_path}")
-    
+
     # Print final metrics summary
     if final_metrics:
         print("\nFinal Metrics Summary:")
@@ -771,7 +906,7 @@ def main():
                 print(f"  {split.upper()}:")
                 for name, value in metrics.items():
                     print(f"    {name}: {value:.4f}")
-    
+
     logger.close()
 
 

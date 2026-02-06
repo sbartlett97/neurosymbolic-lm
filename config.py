@@ -44,6 +44,10 @@ class ModelConfig:
     use_path_reasoning: bool = False
     max_path_length: int = 3
     
+    # Chat mode
+    use_chat_mode: bool = False
+    default_system_prompt: str = "You are a helpful assistant."
+
     # Memory efficiency
     gradient_checkpointing: bool = True
     use_flash_attention: bool = True  # If available
@@ -79,6 +83,26 @@ class ModelConfig:
         )
     
     @classmethod
+    def for_4090_chat(cls) -> "ModelConfig":
+        """Optimized config for chat fine-tuning on RTX 4090.
+
+        Uses 4K input to accommodate multi-turn conversations
+        with gradient checkpointing for memory efficiency.
+        """
+        return cls(
+            model_name="google/long-t5-tglobal-base",
+            max_input_length=4096,
+            max_output_length=1024,
+            n_entity_types=16,
+            n_relations=128,
+            n_concepts=1024,
+            max_nodes=32,
+            gradient_checkpointing=True,
+            use_flash_attention=True,
+            use_chat_mode=True,
+        )
+
+    @classmethod
     def for_testing(cls) -> "ModelConfig":
         """Small config for testing and development."""
         return cls(
@@ -97,6 +121,7 @@ class ModelConfig:
 MODEL_PRESETS = {
     "4090-16k": ModelConfig.for_4090_16k,
     "4090-8k": ModelConfig.for_4090_8k,
+    "4090-chat": ModelConfig.for_4090_chat,
     "testing": ModelConfig.for_testing,
 }
 
@@ -115,7 +140,7 @@ class KGConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
-    
+
     device: str = "cpu"
     epochs_per_stage: int = 10
     batch_size: int = 8
@@ -124,6 +149,11 @@ class TrainingConfig:
     joint_learning_rate: float = 1e-5
     soft_logic_weight: float = 0.1
     skip_stage1_if_pretrained: bool = True
+
+    # Two-phase training
+    training_phase: str = "pretrain"  # "pretrain", "chat", or "both"
+    chat_lr: float = 1e-5
+    chat_epochs: int = 3
     
     # Gradient clipping
     grad_clip_norm: float = 1.0

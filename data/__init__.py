@@ -7,6 +7,8 @@ from .dataset import (
     generate_response_text,
 )
 from .collator import CognitiveCollator
+from .chat_template import ChatTemplate, CHAT_SPECIAL_TOKENS
+from .chat_converter import ChatConverter
 from .pipeline import (
     DataPipeline,
     DatasetConfig,
@@ -32,6 +34,10 @@ __all__ = [
     # Dataset
     "ToyCognitiveDataset",
     "CognitiveCollator",
+    # Chat
+    "ChatTemplate",
+    "CHAT_SPECIAL_TOKENS",
+    "ChatConverter",
     "statement_to_question",
     "recalculate_entity_spans",
     "generate_response_text",

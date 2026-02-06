@@ -1,7 +1,15 @@
-"""Data collator for batching cognitive dataset samples."""
+"""Data collator for batching cognitive dataset samples.
 
-from typing import List, Dict, Optional, Tuple
+Supports optional chat mode (with ChatTemplate) and KG tensor construction
+for ConceptNet-enriched samples.
+"""
+
+from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
 import torch
+
+if TYPE_CHECKING:
+    from .chat_template import ChatTemplate
+    from model.kg_relation_encoder import KGRelationEncoder
 
 
 class CognitiveCollator:
@@ -13,18 +21,22 @@ class CognitiveCollator:
     """
     
     def __init__(
-        self, 
-        tokenizer, 
-        concept_map: Dict[str, int], 
-        relation_map: Dict[str, int], 
-        include_responses: bool = False, 
+        self,
+        tokenizer,
+        concept_map: Dict[str, int],
+        relation_map: Dict[str, int],
+        include_responses: bool = False,
         concept_to_entity_type_map: Optional[Dict[str, int]] = None,
         max_length: int = 512,
-        max_output_length: int = 256
+        max_output_length: int = 256,
+        chat_mode: bool = False,
+        chat_template: Optional["ChatTemplate"] = None,
+        kg_relation_encoder: Optional["KGRelationEncoder"] = None,
+        max_nodes: int = 32,
     ):
         """
         Initialize the collator.
-        
+
         Args:
             tokenizer: HuggingFace tokenizer (e.g., T5 tokenizer)
             concept_map: Mapping from concept names to indices (1-indexed)
@@ -33,6 +45,10 @@ class CognitiveCollator:
             concept_to_entity_type_map: Mapping from concepts to entity type indices
             max_length: Maximum input sequence length
             max_output_length: Maximum output/response sequence length
+            chat_mode: Whether to use chat message formatting
+            chat_template: ChatTemplate instance (required if chat_mode=True)
+            kg_relation_encoder: KGRelationEncoder for building KG tensors
+            max_nodes: Maximum number of entity nodes (for KG tensor sizing)
         """
         self.tokenizer = tokenizer
         self.concept_map = concept_map
@@ -42,57 +58,87 @@ class CognitiveCollator:
         self.n_concepts = max(concept_map.values()) if concept_map else 0
         self.max_length = max_length
         self.max_output_length = max_output_length
+        self.chat_mode = chat_mode
+        self.chat_template = chat_template
+        self.kg_relation_encoder = kg_relation_encoder
+        self.max_nodes = max_nodes
     
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
         """
         Collate a batch of samples.
-        
+
         Args:
             batch: List of sample dictionaries
-        
+
         Returns:
             Dictionary with batched tensors
         """
-        texts = [x["text"] for x in batch]
+        # --- Determine input/target texts ---
+        texts = []
+        chat_targets = []  # Non-empty when chat_mode overrides response
+        for sample in batch:
+            if self.chat_mode and self.chat_template and "messages" in sample:
+                input_text, target_text = self.chat_template.format_messages(
+                    sample["messages"]
+                )
+                texts.append(input_text)
+                chat_targets.append(target_text)
+            elif self.chat_mode and self.chat_template:
+                # No messages field — wrap text/response as single-turn
+                input_text, target_text = self.chat_template.format_single_turn(
+                    sample["text"],
+                    response=sample.get("response", ""),
+                )
+                texts.append(input_text)
+                chat_targets.append(target_text)
+            else:
+                texts.append(sample["text"])
+                chat_targets.append("")
+
         tok = self.tokenizer(
-            texts, 
-            padding=True, 
-            truncation=True, 
+            texts,
+            padding=True,
+            truncation=True,
             max_length=self.max_length,
-            return_tensors="pt"
+            return_tensors="pt",
         )
-        
+
         max_entities = max(len(x["entities"]) for x in batch) if batch else 1
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
         entity_type_labels = torch.zeros(len(batch), max_entities, dtype=torch.long)
         concept_labels = torch.zeros(len(batch), max_entities, self.n_concepts, dtype=torch.float)
-        
+
         relation_triplets = []
         should_respond_values = [int(x.get("should_respond", 0)) for x in batch]
         should_respond = torch.tensor(should_respond_values, dtype=torch.long)
-        
+
         # Entity token spans for proper alignment
         entity_token_spans = []
-        
+
         # Process decoder inputs if needed
         decoder_input_ids = None
         decoder_labels = None
         if self.include_responses:
-            decoder_input_ids, decoder_labels = self._process_responses(batch)
-        
+            if self.chat_mode and any(ct != "" for ct in chat_targets):
+                decoder_input_ids, decoder_labels = self._process_chat_responses(
+                    batch, chat_targets
+                )
+            else:
+                decoder_input_ids, decoder_labels = self._process_responses(batch)
+
         # Process each sample
         for i, sample in enumerate(batch):
             self._process_entities(
                 sample, i, entity_ids, entity_type_labels, concept_labels, max_entities
             )
             relation_triplets.append(self._process_relations(sample))
-            
+
             # Compute token-level spans for entity alignment
             token_spans = self._compute_entity_token_spans(
                 sample, texts[i], tok["input_ids"][i]
             )
             entity_token_spans.append(token_spans)
-        
+
         result = {
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
@@ -103,11 +149,24 @@ class CognitiveCollator:
             "should_respond": should_respond,
             "entity_token_spans": entity_token_spans,
         }
-        
+
         if decoder_input_ids is not None:
             result["decoder_input_ids"] = decoder_input_ids
             result["decoder_labels"] = decoder_labels
-        
+
+        # KG tensor construction (optional, when samples have kg_relations)
+        kg_result = self._process_kg_data(batch)
+        result.update(kg_result)
+
+        # Entity names for path reasoning
+        entity_names = [sample.get("entities", []) for sample in batch]
+        result["entity_names"] = entity_names
+
+        # KG paths (pre-computed, optional)
+        kg_paths = [sample.get("kg_paths", []) for sample in batch]
+        if any(len(p) > 0 for p in kg_paths):
+            result["kg_paths"] = kg_paths
+
         return result
     
     def _process_responses(self, batch: List[dict]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -179,6 +238,90 @@ class CognitiveCollator:
         
         return decoder_input_ids, decoder_labels
     
+    def _process_chat_responses(
+        self, batch: List[dict], chat_targets: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Process chat-formatted response targets for decoder training.
+
+        Works like _process_responses but uses chat_targets from ChatTemplate
+        instead of sample["response"]. Abstention (should_respond=0) still
+        produces EOS-only labels.
+        """
+        responses = []
+        should_respond_mask = []
+
+        for sample, target in zip(batch, chat_targets):
+            if sample.get("should_respond", 0) == 1 and target.strip():
+                responses.append(target)
+                should_respond_mask.append(True)
+            else:
+                responses.append("")
+                should_respond_mask.append(False)
+
+        pad_token_id = self.tokenizer.pad_token_id or 0
+        eos_token_id = self.tokenizer.eos_token_id or 1
+        decoder_start_token_id = getattr(
+            self.tokenizer, "decoder_start_token_id", pad_token_id
+        )
+
+        resp_tok = self.tokenizer(
+            responses,
+            padding=True,
+            truncation=True,
+            max_length=self.max_output_length,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+
+        decoder_labels = resp_tok["input_ids"].clone()
+        batch_size, seq_len = decoder_labels.shape
+        decoder_input_ids = torch.full_like(decoder_labels, pad_token_id)
+        decoder_input_ids[:, 0] = decoder_start_token_id
+        decoder_input_ids[:, 1:] = decoder_labels[:, :-1]
+
+        decoder_labels[decoder_labels == pad_token_id] = -100
+
+        for i, should_respond in enumerate(should_respond_mask):
+            if not should_respond:
+                decoder_input_ids[i] = pad_token_id
+                decoder_input_ids[i, 0] = decoder_start_token_id
+                decoder_labels[i] = -100
+                decoder_labels[i, 0] = eos_token_id
+
+        return decoder_input_ids, decoder_labels
+
+    def _process_kg_data(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
+        """Build KG relation and adjacency tensors from sample kg_relations fields.
+
+        Returns a dict with optional keys:
+            kg_relation_ids: (B, N, N) long tensor of relation type indices
+            kg_adjacency: (B, N, N) float tensor binary mask for KG edges
+        """
+        has_kg = any("kg_relations" in sample for sample in batch)
+        if not has_kg or self.kg_relation_encoder is None:
+            return {}
+
+        B = len(batch)
+        N = self.max_nodes
+        kg_relation_ids = torch.zeros(B, N, N, dtype=torch.long)
+        kg_adjacency = torch.zeros(B, N, N, dtype=torch.float)
+
+        for i, sample in enumerate(batch):
+            for rel_triplet in sample.get("kg_relations", []):
+                if len(rel_triplet) != 3:
+                    continue
+                head_idx, tail_idx, rel_str = rel_triplet
+                if isinstance(head_idx, int) and isinstance(tail_idx, int):
+                    if head_idx < N and tail_idx < N:
+                        rel_id = self.kg_relation_encoder.encode_relation(rel_str)
+                        kg_relation_ids[i, head_idx, tail_idx] = rel_id
+                        kg_adjacency[i, head_idx, tail_idx] = 1.0
+
+        return {
+            "kg_relation_ids": kg_relation_ids,
+            "kg_adjacency": kg_adjacency,
+        }
+
     def _process_entities(
         self, 
         sample: dict, 

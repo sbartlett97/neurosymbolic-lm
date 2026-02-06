@@ -21,6 +21,10 @@ from .gnn import (
     KGAwareGNN,
     KGPathReasoner,
 )
+from .kg_relation_encoder import (
+    KGRelationEncoder,
+    CONCEPTNET_RELATIONS,
+)
 from .logic import (
     SoftLogicConstraints,
     pair_logits_to_matrix,
@@ -47,6 +51,9 @@ __all__ = [
     "SimpleGNN",
     "KGAwareGNN",
     "KGPathReasoner",
+    # KG Relation Encoder
+    "KGRelationEncoder",
+    "CONCEPTNET_RELATIONS",
     # Logic
     "SoftLogicConstraints",
     "pair_logits_to_matrix",

@@ -23,6 +23,7 @@ from .entity import (
     HierarchicalConceptBank,
 )
 from .gnn import SimpleGNN, AttentionGNN, KGAwareGNN, KGPathReasoner
+from .kg_relation_encoder import KGRelationEncoder
 from .logic import SoftLogicConstraints, pair_logits_to_matrix
 
 
@@ -180,6 +181,12 @@ class NeuroSymbolicLM(nn.Module):
             self.gnn = KGAwareGNN(node_dim, kg_embed_dim, n_layers=2, use_kg=True)
         else:
             self.gnn = SimpleGNN(node_dim, n_layers=2)
+
+        # KG relation encoder for producing dense relation embeddings
+        self.kg_relation_encoder = None
+        if use_kg_gnn:
+            self.kg_relation_encoder = KGRelationEncoder(kg_embed_dim)
+            print("Using KG relation encoder")
 
         # Path reasoner for multi-hop KG reasoning
         self.path_reasoner = None
@@ -408,6 +415,8 @@ class NeuroSymbolicLM(nn.Module):
         y_ids: Optional[torch.Tensor] = None,
         entity_names: Optional[List[List[str]]] = None,
         kg_paths: Optional[List[List[List[List[Tuple[str, str]]]]]] = None,
+        kg_relation_ids: Optional[torch.Tensor] = None,
+        kg_adjacency: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the model.
@@ -420,6 +429,9 @@ class NeuroSymbolicLM(nn.Module):
             entity_names: Optional entity name strings for KG lookup (B, num_entities)
             kg_paths: Optional pre-computed KG paths for path reasoning
                       Shape: [batch][pair_idx][path_idx][(relation, entity), ...]
+            kg_relation_ids: Optional (B, N, N) long tensor of ConceptNet relation
+                             type indices from KG preprocessing
+            kg_adjacency: Optional (B, N, N) float tensor binary mask for KG edges
 
         Returns:
             Dictionary with model outputs
@@ -442,8 +454,25 @@ class NeuroSymbolicLM(nn.Module):
         # Extract node features
         node_feats = self._extract_node_features(enc, token_ent_logits, spans)
 
-        # GNN processing
-        node_feats_refined = self.gnn(node_feats)
+        # GNN processing — pass KG relation embeddings if available
+        if self.use_kg_gnn and self.kg_relation_encoder is not None:
+            if kg_relation_ids is not None:
+                kg_rel_emb = self.kg_relation_encoder(kg_relation_ids)
+            else:
+                # Create zero-filled relation embeddings so KGAwareGNN
+                # gets the expected 3-way input dimension
+                N = node_feats.shape[1]
+                kg_rel_emb = torch.zeros(
+                    B, N, N, self.kg_embed_dim,
+                    device=node_feats.device, dtype=node_feats.dtype,
+                )
+            node_feats_refined = self.gnn(
+                node_feats,
+                kg_relation_embeddings=kg_rel_emb,
+                kg_adjacency=kg_adjacency,
+            )
+        else:
+            node_feats_refined = self.gnn(node_feats)
 
         # Path reasoning integration (if enabled and KG available)
         path_enhanced_feats = None
