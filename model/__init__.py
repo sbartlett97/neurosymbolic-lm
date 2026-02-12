@@ -21,6 +21,9 @@ from .gnn import (
     KGAwareGNN,
     KGPathReasoner,
 )
+from .entity_selector import SoftEntitySelector
+from .linear_graph_transformer import LinearGraphTransformer, LinearGraphTransformerLayer
+from .global_workspace import GlobalWorkspace
 from .kg_relation_encoder import (
     KGRelationEncoder,
     CONCEPTNET_RELATIONS,
@@ -57,6 +60,13 @@ __all__ = [
     # Logic
     "SoftLogicConstraints",
     "pair_logits_to_matrix",
+    # Entity selector
+    "SoftEntitySelector",
+    # Linear graph transformer
+    "LinearGraphTransformer",
+    "LinearGraphTransformerLayer",
+    # Global workspace
+    "GlobalWorkspace",
     # Main model
     "NeuroSymbolicLM",
     "compute_losses",

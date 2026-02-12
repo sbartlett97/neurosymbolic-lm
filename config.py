@@ -51,6 +51,24 @@ class ModelConfig:
     # Memory efficiency
     gradient_checkpointing: bool = True
     use_flash_attention: bool = True  # If available
+
+    # T5Gemma 2
+    use_vision: bool = False
+    vision_max_tokens: int = 256
+
+    # Soft entity selection
+    use_soft_entity_selection: bool = False
+    entity_selection_initial_temp: float = 2.0
+    entity_selection_min_temp: float = 0.1
+
+    # Linear graph transformer
+    use_linear_graph_transformer: bool = False
+    linear_attn_n_random_features: int = 64
+
+    # Global workspace
+    use_global_workspace: bool = False
+    workspace_n_slots: int = 16
+    workspace_n_cycles: int = 1
     
     @classmethod
     def for_4090_16k(cls) -> "ModelConfig":
@@ -116,6 +134,36 @@ class ModelConfig:
             gradient_checkpointing=False,
         )
 
+    @classmethod
+    def for_t5gemma_1b(cls) -> "ModelConfig":
+        """T5Gemma 2 1B-1B multimodal config."""
+        return cls(
+            model_name="google/t5gemma-2-1b-1b",
+            max_input_length=8192,
+            max_output_length=2048,
+            n_entity_types=16,
+            n_relations=128,
+            n_concepts=1024,
+            max_nodes=64,
+            gradient_checkpointing=True,
+            use_vision=True,
+        )
+
+    @classmethod
+    def for_t5gemma_270m(cls) -> "ModelConfig":
+        """T5Gemma 2 270M lightweight multimodal config."""
+        return cls(
+            model_name="google/t5gemma-2-270m-270m",
+            max_input_length=4096,
+            max_output_length=1024,
+            n_entity_types=16,
+            n_relations=128,
+            n_concepts=512,
+            max_nodes=32,
+            gradient_checkpointing=False,
+            use_vision=True,
+        )
+
 
 # Preset configurations for common hardware
 MODEL_PRESETS = {
@@ -123,6 +171,8 @@ MODEL_PRESETS = {
     "4090-8k": ModelConfig.for_4090_8k,
     "4090-chat": ModelConfig.for_4090_chat,
     "testing": ModelConfig.for_testing,
+    "t5gemma-1b": ModelConfig.for_t5gemma_1b,
+    "t5gemma-270m": ModelConfig.for_t5gemma_270m,
 }
 
 

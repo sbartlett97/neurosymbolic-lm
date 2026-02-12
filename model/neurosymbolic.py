@@ -83,17 +83,42 @@ class NeuroSymbolicLM(nn.Module):
         concept_hierarchy_levels: Optional[List[int]] = None,
         use_attention_gnn: bool = False,
         gnn_n_heads: int = 4,
+        # Soft entity selection
+        use_soft_entity_selection: bool = False,
+        entity_selection_initial_temp: float = 2.0,
+        entity_selection_min_temp: float = 0.1,
+        # Linear graph transformer
+        use_linear_graph_transformer: bool = False,
+        linear_attn_n_random_features: int = 64,
+        # Global workspace
+        use_global_workspace: bool = False,
+        workspace_n_slots: int = 16,
+        workspace_n_cycles: int = 1,
+        # Vision (T5Gemma)
+        use_vision: bool = False,
     ):
         super().__init__()
 
         # Determine model type and load appropriately
         self.model_name = model_name
         self.is_long_t5 = "long-t5" in model_name.lower()
+        self.is_t5gemma = "t5gemma" in model_name.lower()
+        self.has_vision = use_vision and self.is_t5gemma
         self.max_input_length = max_input_length
         self.max_output_length = max_output_length
 
         # Load the appropriate model
-        if self.is_long_t5:
+        if self.is_t5gemma:
+            from transformers import AutoModelForSeq2SeqLM, AutoProcessor
+            print(f"Loading T5Gemma 2 model: {model_name}")
+            self.t5 = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16
+            )
+            # Store processor for vision input handling
+            if self.has_vision:
+                self._processor = AutoProcessor.from_pretrained(model_name)
+                print("Vision input enabled via SigLIP encoder")
+        elif self.is_long_t5:
             from transformers import LongT5ForConditionalGeneration
             print(f"Loading LongT5 model: {model_name}")
             self.t5 = LongT5ForConditionalGeneration.from_pretrained(model_name)
@@ -154,6 +179,21 @@ class NeuroSymbolicLM(nn.Module):
         else:
             self.token_ent = TokenEntityClassifier(self.d_model, n_entity_types)
 
+        # Entity selection -- soft or hard
+        self.use_soft_entity_selection = use_soft_entity_selection
+        if use_soft_entity_selection:
+            from .entity_selector import SoftEntitySelector
+            self.entity_selector = SoftEntitySelector(
+                max_nodes=max_nodes,
+                d_model=self.d_model,
+                node_dim=node_dim,
+                initial_temp=entity_selection_initial_temp,
+                min_temp=entity_selection_min_temp,
+            )
+            print(f"Using soft entity selection (temp={entity_selection_initial_temp})")
+        else:
+            self.entity_selector = None
+
         # Concept bank - flat or hierarchical
         if use_hierarchical_concepts:
             if concept_hierarchy_levels is None:
@@ -170,7 +210,18 @@ class NeuroSymbolicLM(nn.Module):
         self.node_proj = nn.Linear(self.d_model, node_dim)
 
         # GNN - select variant
-        if use_attention_gnn:
+        if use_linear_graph_transformer:
+            from .linear_graph_transformer import LinearGraphTransformer
+            _edge_dim = kg_embed_dim if use_kg_gnn else None
+            self.gnn = LinearGraphTransformer(
+                node_dim,
+                n_heads=gnn_n_heads,
+                n_layers=2,
+                n_random_features=linear_attn_n_random_features,
+                edge_dim=_edge_dim,
+            )
+            print(f"Using linear graph transformer ({linear_attn_n_random_features} random features)")
+        elif use_attention_gnn:
             self.gnn = AttentionGNN(
                 node_dim,
                 n_heads=gnn_n_heads,
@@ -226,6 +277,19 @@ class NeuroSymbolicLM(nn.Module):
         else:
             self.node_to_encoder_proj = nn.Identity()
 
+        # Global workspace for decoder memory integration
+        self.use_global_workspace = use_global_workspace
+        if use_global_workspace:
+            from .global_workspace import GlobalWorkspace
+            self.global_workspace = GlobalWorkspace(
+                d_model=self.d_model,
+                n_slots=workspace_n_slots,
+                n_cycles=workspace_n_cycles,
+            )
+            print(f"Using Global Workspace ({workspace_n_slots} slots, {workspace_n_cycles} cycles)")
+        else:
+            self.global_workspace = None
+
     def set_kg_embeddings(
         self,
         entity_embeddings: Dict[str, torch.Tensor],
@@ -256,13 +320,21 @@ class NeuroSymbolicLM(nn.Module):
         """Return a wrapper for decoder access."""
         return self
     
-    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Encode input tokens using T5 encoder."""
-        encoder_outputs = self.t5.encoder(
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode input tokens (and optional images) using backbone encoder."""
+        kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_dict=True
+            return_dict=True,
         )
+        if self.has_vision and pixel_values is not None:
+            kwargs["pixel_values"] = pixel_values
+        encoder_outputs = self.t5.encoder(**kwargs)
         return encoder_outputs.last_hidden_state
     
     def decode(
@@ -417,6 +489,7 @@ class NeuroSymbolicLM(nn.Module):
         kg_paths: Optional[List[List[List[List[Tuple[str, str]]]]]] = None,
         kg_relation_ids: Optional[torch.Tensor] = None,
         kg_adjacency: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the model.
@@ -439,7 +512,7 @@ class NeuroSymbolicLM(nn.Module):
         B, L = input_ids.shape
 
         # Encode input
-        enc = self.encode(input_ids, attention_mask)
+        enc = self.encode(input_ids, attention_mask, pixel_values=pixel_values)
 
         # Token-level entity classification
         # Context-aware classifier can use attention mask
@@ -452,7 +525,13 @@ class NeuroSymbolicLM(nn.Module):
         token_pool, _ = self.token_pool(enc, attention_mask)
 
         # Extract node features
-        node_feats = self._extract_node_features(enc, token_ent_logits, spans)
+        selection_weights = None
+        if self.use_soft_entity_selection and self.entity_selector is not None:
+            node_feats, selection_weights = self.entity_selector(
+                enc, token_ent_logits, attention_mask
+            )
+        else:
+            node_feats = self._extract_node_features(enc, token_ent_logits, spans)
 
         # GNN processing — pass KG relation embeddings if available
         if self.use_kg_gnn and self.kg_relation_encoder is not None:
@@ -535,15 +614,30 @@ class NeuroSymbolicLM(nn.Module):
         if path_enhanced_feats is not None:
             outputs["path_enhanced_feats"] = path_enhanced_feats
 
+        # Add selection weights if available
+        if selection_weights is not None:
+            outputs["selection_weights"] = selection_weights
+
         # Decoder forward if y_ids provided
         if y_ids is not None:
-            # Combine encoder outputs with node features for richer context
             memory_nodes = self.node_to_encoder_proj(node_feats_refined)
-            combined_memory = torch.cat([enc, memory_nodes], dim=1)
 
-            # Create extended attention mask with matching dtype
-            node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
-            combined_mask = torch.cat([attention_mask, node_mask], dim=1)
+            if self.use_global_workspace and self.global_workspace is not None:
+                # Optionally include concept vector as a specialist
+                concept_input = concept_vec.unsqueeze(1) if concept_vec.dim() == 2 else None
+
+                combined_memory, combined_mask, ws_attn = self.global_workspace(
+                    encoder_states=enc,
+                    node_features=memory_nodes,
+                    concept_features=concept_input,
+                    encoder_mask=attention_mask,
+                )
+                outputs["workspace_attention"] = ws_attn
+            else:
+                # Original concatenation path
+                combined_memory = torch.cat([enc, memory_nodes], dim=1)
+                node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
+                combined_mask = torch.cat([attention_mask, node_mask], dim=1)
 
             # Get decoder outputs
             logits = self.decode(y_ids, combined_memory, combined_mask)
@@ -627,11 +721,12 @@ class NeuroSymbolicLM(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        pixel_values: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
         Generate response using T5's built-in generation.
-        
+
         Args:
             input_ids: (B, L) input token IDs
             attention_mask: (B, L) attention mask
@@ -641,33 +736,61 @@ class NeuroSymbolicLM(nn.Module):
             temperature: Sampling temperature
             top_k: Top-k filtering
             top_p: Nucleus sampling
-        
+            pixel_values: Optional image tensors for vision models
+
         Returns:
             Generated token IDs
         """
         from transformers.modeling_outputs import BaseModelOutput
-        
+
         self.eval()
-        
+
         with torch.no_grad():
             # Encode input
-            enc = self.encode(input_ids, attention_mask)
-            
+            enc = self.encode(input_ids, attention_mask, pixel_values=pixel_values)
+
             # Get node features for enhanced context
-            token_ent_logits = self.token_ent(enc)
-            node_feats = self._extract_node_features(enc, token_ent_logits)
+            if self.use_context_aware_entity:
+                token_ent_logits = self.token_ent(enc, attention_mask)
+            else:
+                token_ent_logits = self.token_ent(enc)
+
+            if self.use_soft_entity_selection and self.entity_selector is not None:
+                node_feats, _ = self.entity_selector(enc, token_ent_logits, attention_mask)
+            else:
+                node_feats = self._extract_node_features(enc, token_ent_logits)
+
             node_feats_refined = self.gnn(node_feats)
             memory_nodes = self.node_to_encoder_proj(node_feats_refined)
-            
-            # Combine encoder outputs with node features
+
             B = enc.shape[0]
-            combined_memory = torch.cat([enc, memory_nodes], dim=1)
-            node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
-            combined_mask = torch.cat([attention_mask, node_mask], dim=1)
-            
+
+            if self.use_global_workspace and self.global_workspace is not None:
+                # Build concept features for workspace
+                token_pool, _ = self.token_pool(enc, attention_mask)
+                concept_query = self.concept_proj(token_pool)
+                if self.use_hierarchical_concepts:
+                    concept_vec, _, _ = self.concept_bank.soft_assign(
+                        concept_query, aggregate_hierarchy=True
+                    )
+                else:
+                    concept_vec, _ = self.concept_bank.soft_assign(concept_query)
+                concept_input = concept_vec.unsqueeze(1) if concept_vec.dim() == 2 else None
+
+                combined_memory, combined_mask, _ = self.global_workspace(
+                    encoder_states=enc,
+                    node_features=memory_nodes,
+                    concept_features=concept_input,
+                    encoder_mask=attention_mask,
+                )
+            else:
+                combined_memory = torch.cat([enc, memory_nodes], dim=1)
+                node_mask = torch.ones(B, memory_nodes.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
+                combined_mask = torch.cat([attention_mask, node_mask], dim=1)
+
             # Wrap in BaseModelOutput for T5's generate method
             encoder_outputs = BaseModelOutput(last_hidden_state=combined_memory)
-            
+
             # Use T5's generate method with enhanced encoder outputs
             generated = self.t5.generate(
                 encoder_outputs=encoder_outputs,
@@ -680,7 +803,7 @@ class NeuroSymbolicLM(nn.Module):
                 top_p=top_p,
                 **kwargs
             )
-        
+
         return generated
 
 

@@ -33,6 +33,7 @@ class CognitiveCollator:
         chat_template: Optional["ChatTemplate"] = None,
         kg_relation_encoder: Optional["KGRelationEncoder"] = None,
         max_nodes: int = 32,
+        vision_processor=None,
     ):
         """
         Initialize the collator.
@@ -62,6 +63,7 @@ class CognitiveCollator:
         self.chat_template = chat_template
         self.kg_relation_encoder = kg_relation_encoder
         self.max_nodes = max_nodes
+        self.vision_processor = vision_processor
     
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
         """
@@ -166,6 +168,16 @@ class CognitiveCollator:
         kg_paths = [sample.get("kg_paths", []) for sample in batch]
         if any(len(p) > 0 for p in kg_paths):
             result["kg_paths"] = kg_paths
+
+        # Vision: process images if vision_processor is available
+        if self.vision_processor is not None:
+            images = [sample.get("image") for sample in batch]
+            if any(img is not None for img in images):
+                pixel_values = self.vision_processor(
+                    images=[img for img in images if img is not None],
+                    return_tensors="pt",
+                ).pixel_values
+                result["pixel_values"] = pixel_values
 
         return result
     

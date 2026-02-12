@@ -83,7 +83,7 @@ def parse_args():
     # Model
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--preset", type=str, default="testing",
-                            choices=list(MODEL_PRESETS.keys()),
+                            choices=sorted(MODEL_PRESETS.keys()),
                             help="Hardware preset configuration")
     model_group.add_argument("--model-name", type=str, default=None,
                             help="Override model backbone")
@@ -245,6 +245,7 @@ def create_dataloader(
     chat_mode: bool = False,
     chat_template: Optional[ChatTemplate] = None,
     kg_relation_encoder: Optional[KGRelationEncoder] = None,
+    vision_processor=None,
 ) -> DataLoader:
     """Create dataloader with collator."""
     collator = CognitiveCollator(
@@ -259,6 +260,7 @@ def create_dataloader(
         chat_template=chat_template,
         kg_relation_encoder=kg_relation_encoder,
         max_nodes=model_config.max_nodes,
+        vision_processor=vision_processor,
     )
 
     return DataLoader(
@@ -625,6 +627,15 @@ def main():
         use_kg_gnn=use_kg_gnn,
         kg_embed_dim=model_config.kg_embed_dim,
         use_path_reasoning=model_config.use_path_reasoning,
+        use_soft_entity_selection=model_config.use_soft_entity_selection,
+        entity_selection_initial_temp=model_config.entity_selection_initial_temp,
+        entity_selection_min_temp=model_config.entity_selection_min_temp,
+        use_linear_graph_transformer=model_config.use_linear_graph_transformer,
+        linear_attn_n_random_features=model_config.linear_attn_n_random_features,
+        use_global_workspace=model_config.use_global_workspace,
+        workspace_n_slots=model_config.workspace_n_slots,
+        workspace_n_cycles=model_config.workspace_n_cycles,
+        use_vision=model_config.use_vision,
     )
 
     # Add chat special tokens to tokenizer and resize embeddings
@@ -633,6 +644,12 @@ def main():
     if tokens_added > 0:
         model.t5.resize_token_embeddings(len(tokenizer))
         print(f"  Added {tokens_added} chat special tokens, resized embeddings to {len(tokenizer)}")
+
+    # Extract vision processor if available
+    vision_processor = None
+    if hasattr(model, '_processor') and model.has_vision:
+        vision_processor = model._processor
+        print("  Vision processor extracted for data collation")
 
     # Resume from checkpoint
     if args.resume:
@@ -698,6 +715,7 @@ def main():
                 model_config, args.batch_size, args.num_workers,
                 include_responses=False,
                 kg_relation_encoder=kg_relation_encoder,
+                vision_processor=vision_processor,
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -749,6 +767,7 @@ def main():
                 model_config, args.batch_size, args.num_workers,
                 include_responses=True,
                 kg_relation_encoder=kg_relation_encoder,
+                vision_processor=vision_processor,
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -789,6 +808,7 @@ def main():
                 model_config, args.batch_size, args.num_workers,
                 include_responses=True,
                 kg_relation_encoder=kg_relation_encoder,
+                vision_processor=vision_processor,
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -847,6 +867,7 @@ def main():
             chat_mode=True,
             chat_template=chat_template,
             kg_relation_encoder=kg_relation_encoder,
+            vision_processor=vision_processor,
         )
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
