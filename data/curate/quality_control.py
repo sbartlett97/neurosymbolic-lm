@@ -34,6 +34,7 @@ class QualityControl:
         valid_concepts: Optional[List[str]] = None,
         valid_relations: Optional[List[str]] = None,
         safety_regulator=None,
+        taxonomy=None,
     ):
         """
         Initialize quality control.
@@ -44,12 +45,25 @@ class QualityControl:
             valid_concepts: List of valid concept names (None = accept all)
             valid_relations: List of valid relation types (None = accept all)
             safety_regulator: Optional SafetyRegulator for content filtering
+            taxonomy: Optional Taxonomy; when given, concept/relation/entity
+                type validation is driven by it (overrides the legacy
+                hardcoded sets unless valid_concepts/valid_relations are
+                passed explicitly)
         """
         self.min_valid_span_ratio = min_valid_span_ratio
         self.max_span_tolerance = max_span_tolerance
         self.valid_concepts = set(valid_concepts) if valid_concepts else None
         self.valid_relations = set(valid_relations) if valid_relations else None
         self.safety_regulator = safety_regulator
+        self.taxonomy = taxonomy
+
+        if taxonomy is not None:
+            if self.valid_concepts is None:
+                self.valid_concepts = set(taxonomy.concept_labels) | set(
+                    taxonomy.entity_types
+                )
+            if self.valid_relations is None:
+                self.valid_relations = set(taxonomy.relation_labels)
 
         # Default concepts if none provided
         if self.valid_concepts is None:
@@ -178,8 +192,23 @@ class QualityControl:
 
         return fixed_spans, issues, valid_count
 
+    def _fallback_concept(self, entity_type: Optional[str]) -> str:
+        """Fallback concept for an entity whose concepts failed validation.
+
+        In taxonomy mode the entity's coarse type doubles as a top-level
+        concept; otherwise the legacy 'object' default applies.
+        """
+        if self.taxonomy is not None:
+            if entity_type and entity_type in self.taxonomy.entity_types:
+                return entity_type
+            return self.taxonomy.entity_types[0]
+        return "object"
+
     def _validate_concepts(
-        self, concepts: List[List[str]], num_entities: int
+        self,
+        concepts: List[List[str]],
+        num_entities: int,
+        entity_types: Optional[List[str]] = None,
     ) -> Tuple[List[List[str]], List[str]]:
         """
         Validate and fix concepts.
@@ -189,10 +218,14 @@ class QualityControl:
         """
         issues = []
         fixed_concepts = []
+        entity_types = entity_types or []
+
+        def etype(i: int) -> Optional[str]:
+            return entity_types[i] if i < len(entity_types) else None
 
         # Ensure concepts list matches entity count
         while len(concepts) < num_entities:
-            concepts.append(["object"])
+            concepts.append([self._fallback_concept(etype(len(concepts)))])
 
         for i, concept_list in enumerate(concepts[:num_entities]):
             if not isinstance(concept_list, list):
@@ -204,20 +237,53 @@ class QualityControl:
                 if self.valid_concepts and concept_lower not in self.valid_concepts:
                     # Try to map to valid concept
                     mapped = self._map_concept(concept_lower)
-                    if mapped:
+                    if mapped and (not self.valid_concepts or mapped in self.valid_concepts):
                         fixed_list.append(mapped)
                     else:
                         issues.append(f"Invalid concept: {concept}")
-                        fixed_list.append("object")  # Default fallback
                 else:
                     fixed_list.append(concept_lower)
 
             if not fixed_list:
-                fixed_list = ["object"]
+                fixed_list = [self._fallback_concept(etype(i))]
 
             fixed_concepts.append(fixed_list[:3])  # Max 3 concepts per entity
 
         return fixed_concepts, issues
+
+    def _validate_entity_types(
+        self, entity_types: List[str], concepts: List[List[str]], num_entities: int
+    ) -> Tuple[List[str], List[str]]:
+        """Validate entity types; derive missing ones from concepts.
+
+        Only meaningful in taxonomy mode; without a taxonomy the (possibly
+        empty) list is passed through untouched.
+        """
+        if self.taxonomy is None:
+            return entity_types, []
+
+        issues = []
+        fixed: List[str] = []
+        valid_types = set(self.taxonomy.entity_types)
+
+        for i in range(num_entities):
+            etype = entity_types[i] if i < len(entity_types) else None
+            if etype not in valid_types:
+                if etype:
+                    issues.append(f"Invalid entity type: {etype}")
+                # Derive from the entity's first mappable concept
+                derived = None
+                if i < len(concepts):
+                    for c in concepts[i]:
+                        derived = self.taxonomy.coarse_type_of(c) or (
+                            c if c in valid_types else None
+                        )
+                        if derived:
+                            break
+                etype = derived or self.taxonomy.entity_types[0]
+            fixed.append(etype)
+
+        return fixed, issues
 
     def _map_concept(self, concept: str) -> Optional[str]:
         """Try to map an invalid concept to a valid one."""
@@ -383,9 +449,15 @@ class QualityControl:
 
         # Validate concepts
         fixed_concepts, concept_issues = self._validate_concepts(
-            result.concepts, len(result.entities)
+            result.concepts, len(result.entities), result.entity_types
         )
         all_issues.extend(concept_issues)
+
+        # Validate entity types (taxonomy mode)
+        fixed_entity_types, type_issues = self._validate_entity_types(
+            result.entity_types, fixed_concepts, len(result.entities)
+        )
+        all_issues.extend(type_issues)
 
         # Validate relations
         fixed_relations, relation_issues = self._validate_relations(
@@ -406,6 +478,7 @@ class QualityControl:
             entity_spans=fixed_spans,
             concepts=fixed_concepts,
             relations=fixed_relations,
+            entity_types=fixed_entity_types,
             should_respond=result.should_respond,
             response=result.response,
             success=True,

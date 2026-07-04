@@ -21,9 +21,22 @@ from .gnn import (
     KGAwareGNN,
     KGPathReasoner,
 )
-from .entity_selector import SoftEntitySelector
-from .linear_graph_transformer import LinearGraphTransformer, LinearGraphTransformerLayer
-from .global_workspace import GlobalWorkspace
+# Optional experimental modules (referenced by ModelConfig flags that
+# default to off). Their source files are not yet in the repo, so import
+# them tolerantly — NeuroSymbolicLM imports them lazily only when the
+# corresponding use_* flag is enabled.
+try:
+    from .entity_selector import SoftEntitySelector
+except ImportError:
+    SoftEntitySelector = None
+try:
+    from .linear_graph_transformer import LinearGraphTransformer, LinearGraphTransformerLayer
+except ImportError:
+    LinearGraphTransformer = LinearGraphTransformerLayer = None
+try:
+    from .global_workspace import GlobalWorkspace
+except ImportError:
+    GlobalWorkspace = None
 from .kg_relation_encoder import (
     KGRelationEncoder,
     CONCEPTNET_RELATIONS,

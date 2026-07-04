@@ -4,23 +4,29 @@
 This script creates training data by:
 1. Loading documents from HuggingFace datasets (Wikipedia, C4, RedPajama)
 2. Filtering for quality (length, language, content)
-3. Annotating with an LLM (entities, concepts, relations, QA pairs)
+3. Annotating with GLiNER2 (entities, spans, concepts, entity types,
+   relations) and/or an LLM (QA pairs)
 4. Quality checking and fixing annotations
 5. Writing to JSONL format compatible with CognitiveCollator
 
 Usage:
-    # Test run with mock backend
-    python data/curate_dataset.py --target-samples 100 --backend mock
-
-    # Production run with vLLM
+    # Stage-1 symbolic data with GLiNER2 (default annotator)
     python data/curate_dataset.py \
         --target-samples 50000 \
+        --annotator gliner \
         --sources allenai/c4 wikipedia \
         --source-ratios 0.6 0.4 \
-        --llm mrtoots/unsloth-gpt-oss-120b-mlx-8Bit \
+        --output-dir data/curated
+
+    # GLiNER2 extraction + LLM QA generation (stage-2/3 data)
+    python data/curate_dataset.py \
+        --annotator hybrid \
         --backend vllm \
-        --output-dir data/curated \
+        --llm meta-llama/Llama-3.1-8B-Instruct \
         --should-respond-ratio 0.7
+
+    # Test run without any models
+    python data/curate_dataset.py --target-samples 100 --annotator llm --backend mock
 
     # Resume from checkpoint
     python data/curate_dataset.py --resume-from data/curated/curated_checkpoint.json
@@ -89,6 +95,45 @@ def parse_args() -> argparse.Namespace:
         help="Output file base name (default: curated)",
     )
 
+    # Annotator selection
+    parser.add_argument(
+        "--annotator",
+        type=str,
+        choices=["gliner", "llm", "hybrid"],
+        default="gliner",
+        help=(
+            "Annotation strategy: 'gliner' (GLiNER2 schema-driven extraction), "
+            "'llm' (legacy free-form LLM JSON), 'hybrid' (GLiNER2 extraction "
+            "+ LLM QA generation) (default: gliner)"
+        ),
+    )
+
+    # GLiNER2 settings
+    parser.add_argument(
+        "--gliner-model",
+        type=str,
+        default="fastino/gliner2-base-v1",
+        help="GLiNER2 model (default: fastino/gliner2-base-v1)",
+    )
+    parser.add_argument(
+        "--entity-threshold",
+        type=float,
+        default=0.5,
+        help="GLiNER2 entity confidence threshold (default: 0.5)",
+    )
+    parser.add_argument(
+        "--relation-threshold",
+        type=float,
+        default=0.4,
+        help="GLiNER2 relation confidence threshold (default: 0.4)",
+    )
+    parser.add_argument(
+        "--gliner-device",
+        type=str,
+        default=None,
+        help="Device for GLiNER2 (e.g. cuda, cpu; default: auto)",
+    )
+
     # LLM settings
     parser.add_argument(
         "--llm",
@@ -101,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["vllm", "transformers", "mock"],
         default="mock",
-        help="LLM backend (default: mock for testing)",
+        help="LLM backend for 'llm'/'hybrid' annotators (default: mock for testing)",
     )
     parser.add_argument(
         "--quantization",
@@ -196,6 +241,11 @@ def create_config(args: argparse.Namespace) -> CurationConfig:
         sources=args.sources,
         source_ratios=source_ratios,
         output_dir=args.output_dir,
+        annotator=args.annotator,
+        gliner_model=args.gliner_model,
+        gliner_entity_threshold=args.entity_threshold,
+        gliner_relation_threshold=args.relation_threshold,
+        gliner_device=args.gliner_device,
         llm_model=args.llm,
         llm_backend=args.backend,
         llm_quantization=None if args.quantization == "none" else args.quantization,
@@ -224,7 +274,11 @@ def run_curation(config: CurationConfig, verbose: bool = False):
     print(f"Target samples: {config.target_samples}")
     print(f"Sources: {config.sources}")
     print(f"Source ratios: {config.source_ratios}")
-    print(f"LLM: {config.llm_model} ({config.llm_backend})")
+    print(f"Annotator: {config.annotator}")
+    if config.annotator in ("gliner", "hybrid"):
+        print(f"GLiNER2: {config.gliner_model}")
+    if config.annotator in ("llm", "hybrid"):
+        print(f"LLM: {config.llm_model} ({config.llm_backend})")
     print(f"Output: {config.output_dir}")
     print("=" * 60)
 
@@ -247,14 +301,41 @@ def run_curation(config: CurationConfig, verbose: bool = False):
     # Content cleaner
     cleaner = ContentCleaner()
 
-    # LLM annotator
-    print(f"Loading LLM backend: {config.llm_backend}...")
-    annotator = LLMAnnotator(
-        model_name=config.llm_model,
-        backend=config.llm_backend,
-        quantization=config.llm_quantization,
-        should_respond_ratio=config.should_respond_ratio,
-    )
+    # Annotator
+    taxonomy = None
+    if config.annotator == "llm":
+        print(f"Loading LLM backend: {config.llm_backend}...")
+        annotator = LLMAnnotator(
+            model_name=config.llm_model,
+            backend=config.llm_backend,
+            quantization=config.llm_quantization,
+            should_respond_ratio=config.should_respond_ratio,
+        )
+    else:
+        from data.curate import GLiNER2Annotator, get_default_taxonomy
+
+        taxonomy = get_default_taxonomy()
+
+        response_backend = None
+        if config.annotator == "hybrid":
+            print(f"Loading LLM backend for QA generation: {config.llm_backend}...")
+            llm = LLMAnnotator(
+                model_name=config.llm_model,
+                backend=config.llm_backend,
+                quantization=config.llm_quantization,
+            )
+            response_backend = llm.backend
+
+        print(f"Loading GLiNER2: {config.gliner_model}...")
+        annotator = GLiNER2Annotator(
+            model_name=config.gliner_model,
+            taxonomy=taxonomy,
+            entity_threshold=config.gliner_entity_threshold,
+            relation_threshold=config.gliner_relation_threshold,
+            device=config.gliner_device,
+            response_backend=response_backend,
+            should_respond_ratio=config.should_respond_ratio,
+        )
 
     # Safety regulator (optional)
     safety_regulator = None
@@ -271,13 +352,14 @@ def run_curation(config: CurationConfig, verbose: bool = False):
             print("Warning: SafetyRegulator not available, skipping safety filtering")
 
     # Quality control
-    qc = QualityControl(safety_regulator=safety_regulator)
+    qc = QualityControl(safety_regulator=safety_regulator, taxonomy=taxonomy)
 
     # Output writer
     writer = OutputWriter(
         output_dir=config.output_dir,
         output_name="curated",
         checkpoint_every=config.checkpoint_every,
+        taxonomy=taxonomy,
     )
 
     # Resume from checkpoint if specified

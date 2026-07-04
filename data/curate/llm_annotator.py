@@ -19,6 +19,7 @@ class AnnotationResult:
     entity_spans: List[List[int]] = field(default_factory=list)
     concepts: List[List[str]] = field(default_factory=list)
     relations: List[List] = field(default_factory=list)
+    entity_types: List[str] = field(default_factory=list)
     should_respond: int = 0
     response: str = ""
     success: bool = True
@@ -33,6 +34,7 @@ class AnnotationResult:
             "entity_spans": self.entity_spans,
             "concepts": self.concepts,
             "relations": self.relations,
+            "entity_types": self.entity_types,
             "should_respond": self.should_respond,
             "response": self.response,
         }

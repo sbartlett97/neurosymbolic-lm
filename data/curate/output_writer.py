@@ -65,6 +65,7 @@ class OutputWriter:
         output_name: str = "curated",
         checkpoint_every: int = 1000,
         compress: bool = False,
+        taxonomy=None,
     ):
         """
         Initialize output writer.
@@ -74,11 +75,15 @@ class OutputWriter:
             output_name: Base name for output files
             checkpoint_every: Save checkpoint every N samples
             compress: Whether to compress output files
+            taxonomy: Optional Taxonomy; when given, the saved vocabulary is
+                the full taxonomy inventory (stable across runs) rather than
+                just the labels observed in this run
         """
         self.output_dir = Path(output_dir)
         self.output_name = output_name
         self.checkpoint_every = checkpoint_every
         self.compress = compress
+        self.taxonomy = taxonomy
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +145,9 @@ class OutputWriter:
         for relation in result.relations:
             if len(relation) >= 3:
                 self.state.relations_vocab.add(relation[2])
+
+        for entity_type in result.entity_types:
+            self.state.entity_types_vocab.add(entity_type)
 
         # Track source
         self.state.source_counts[source] = self.state.source_counts.get(source, 0) + 1
@@ -206,31 +214,54 @@ class OutputWriter:
             return False
 
     def save_vocabulary(self):
-        """Save vocabulary mappings."""
-        # Build 1-indexed mappings (0 reserved for unknown/padding)
-        concepts_sorted = sorted(self.state.concepts_vocab)
-        relations_sorted = sorted(self.state.relations_vocab)
+        """Save vocabulary mappings.
 
-        vocab = {
-            "concepts": {c: i + 1 for i, c in enumerate(concepts_sorted)},
-            "relations": {r: i + 1 for i, r in enumerate(relations_sorted)},
-            "entity_types": {
-                "person": 1,
-                "organization": 2,
-                "location": 3,
-                "date": 4,
-                "time": 5,
-                "quantity": 6,
-                "object": 7,
-                "event": 8,
-                "concept": 9,
-            },
-            "statistics": {
-                "num_concepts": len(concepts_sorted),
-                "num_relations": len(relations_sorted),
+        With a taxonomy, the full (stable) taxonomy vocab is written so
+        index assignments do not depend on which labels happened to occur;
+        observed-label statistics are still recorded. Without a taxonomy,
+        falls back to the labels observed in this run (1-indexed, 0 reserved
+        for unknown/padding).
+        """
+        if self.taxonomy is not None:
+            vocab = self.taxonomy.vocab()
+            vocab["statistics"] = {
+                "num_concepts": len(vocab["concepts"]),
+                "num_relations": len(vocab["relations"]),
                 "num_samples": self.state.samples_written,
-            },
-        }
+                "observed_concepts": len(self.state.concepts_vocab),
+                "observed_relations": len(self.state.relations_vocab),
+                "observed_entity_types": len(self.state.entity_types_vocab),
+            }
+        else:
+            concepts_sorted = sorted(self.state.concepts_vocab)
+            relations_sorted = sorted(self.state.relations_vocab)
+            entity_types_sorted = sorted(self.state.entity_types_vocab)
+
+            entity_types = {t: i + 1 for i, t in enumerate(entity_types_sorted)}
+            if not entity_types:
+                # Legacy default for LLM-annotated data without entity types
+                entity_types = {
+                    "person": 1,
+                    "organization": 2,
+                    "location": 3,
+                    "date": 4,
+                    "time": 5,
+                    "quantity": 6,
+                    "object": 7,
+                    "event": 8,
+                    "concept": 9,
+                }
+
+            vocab = {
+                "concepts": {c: i + 1 for i, c in enumerate(concepts_sorted)},
+                "relations": {r: i + 1 for i, r in enumerate(relations_sorted)},
+                "entity_types": entity_types,
+                "statistics": {
+                    "num_concepts": len(concepts_sorted),
+                    "num_relations": len(relations_sorted),
+                    "num_samples": self.state.samples_written,
+                },
+            }
 
         with open(self.vocab_path, "w") as f:
             json.dump(vocab, f, indent=2)

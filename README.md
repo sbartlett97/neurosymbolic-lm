@@ -74,6 +74,23 @@ python train.py --prepare-data --data-sources rebel dolly --epochs 5
 python train.py --dataset mydata.jsonl --stages symbolic decoder joint
 ```
 
+### Dataset Curation
+
+Build training data from corpus text with GLiNER2 schema-driven extraction
+(entities, spans, concepts, entity types, relations) and optional LLM QA
+generation:
+
+```bash
+# Stage-1 symbolic data (no LLM required)
+python data/curate_dataset.py --annotator gliner \
+    --sources allenai/c4 wikipedia --target-samples 50000
+
+# GLiNER2 extraction + LLM-generated QA pairs (stage-2/3 data)
+python data/curate_dataset.py --annotator hybrid --backend vllm
+```
+
+See `DATASET_FORMAT.md` for the output schema and per-stage usage.
+
 ### Data Labelling
 
 Create custom training data with the Streamlit labelling interface:

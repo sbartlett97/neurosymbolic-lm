@@ -34,6 +34,7 @@ class CognitiveCollator:
         kg_relation_encoder: Optional["KGRelationEncoder"] = None,
         max_nodes: int = 32,
         vision_processor=None,
+        entity_type_map: Optional[Dict[str, int]] = None,
     ):
         """
         Initialize the collator.
@@ -50,6 +51,10 @@ class CognitiveCollator:
             chat_template: ChatTemplate instance (required if chat_mode=True)
             kg_relation_encoder: KGRelationEncoder for building KG tensors
             max_nodes: Maximum number of entity nodes (for KG tensor sizing)
+            entity_type_map: Mapping from entity type names to indices
+                (1-indexed, 0 = none). Used when samples carry an
+                "entity_types" field (e.g. GLiNER2-curated data); falls back
+                to concept_to_entity_type_map otherwise.
         """
         self.tokenizer = tokenizer
         self.concept_map = concept_map
@@ -64,6 +69,7 @@ class CognitiveCollator:
         self.kg_relation_encoder = kg_relation_encoder
         self.max_nodes = max_nodes
         self.vision_processor = vision_processor
+        self.entity_type_map = entity_type_map or {}
     
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
         """
@@ -346,13 +352,18 @@ class CognitiveCollator:
         """Process entities from a sample."""
         entities = sample.get("entities", [])
         concepts = sample.get("concepts", [])
-        
+        entity_types = sample.get("entity_types", [])
+
         for j, ent in enumerate(entities):
             if j >= max_entities:
                 break
-            
+
             entity_ids[batch_idx, j] = j + 1
-            
+
+            # Prefer explicit entity type names (GLiNER2-curated data)
+            if j < len(entity_types) and entity_types[j] in self.entity_type_map:
+                entity_type_labels[batch_idx, j] = self.entity_type_map[entity_types[j]]
+
             # Get concepts for this entity
             if j < len(concepts):
                 ent_concepts = concepts[j]
@@ -366,8 +377,13 @@ class CognitiveCollator:
                     concept_idx = self.concept_map.get(concept, 0)
                     if concept_idx > 0 and concept_idx <= self.n_concepts:
                         concept_labels[batch_idx, j, concept_idx - 1] = 1.0
-                    
-                    if concept in self.concept_to_entity_type_map:
+
+                    # Fallback: derive entity type from concept only when no
+                    # explicit entity_types field set it above
+                    if (
+                        entity_type_labels[batch_idx, j] == 0
+                        and concept in self.concept_to_entity_type_map
+                    ):
                         entity_type_labels[batch_idx, j] = self.concept_to_entity_type_map[concept]
     
     def _process_relations(self, sample: dict) -> List[Tuple[int, int, int]]:
@@ -410,30 +426,50 @@ class CognitiveCollator:
     ) -> List[Tuple[int, int]]:
         """
         Compute token-level spans for entities.
-        
-        Returns list of (start_token_idx, end_token_idx) for each entity.
+
+        Uses gold character spans from the sample when available (curated
+        data provides exact offsets, exclusive end); otherwise falls back to
+        finding the first occurrence of each entity string. Gold spans are
+        only trusted when the tokenized text is the sample's own text (chat
+        templating rewrites the input, invalidating offsets).
         """
         entities = sample.get("entities", [])
+        gold_spans = sample.get("entity_spans") or []
+        gold_spans_valid = (
+            len(gold_spans) == len(entities) and text == sample.get("text")
+        )
         token_spans = []
-        
-        for entity in entities:
-            # Find character span in original text
-            try:
-                char_start = text.lower().find(entity.lower())
-                if char_start == -1:
+
+        for j, entity in enumerate(entities):
+            char_start = char_end = None
+
+            if gold_spans_valid:
+                span = gold_spans[j]
+                if isinstance(span, (list, tuple)) and len(span) == 2:
+                    s, e = int(span[0]), int(span[1])
+                    # Verify the offsets actually point at the entity
+                    if 0 <= s < e <= len(text) and (
+                        text[s:e].strip().lower() == entity.strip().lower()
+                    ):
+                        char_start, char_end = s, e
+
+            if char_start is None:
+                # Fallback: first occurrence of the entity string
+                try:
+                    found = text.lower().find(entity.lower())
+                    if found == -1:
+                        token_spans.append((0, 0))
+                        continue
+                    char_start, char_end = found, found + len(entity)
+                except (AttributeError, TypeError):
                     token_spans.append((0, 0))
                     continue
-                char_end = char_start + len(entity)
-            except:
-                token_spans.append((0, 0))
-                continue
-            
-            # Convert to token span
+
             token_span = self._char_span_to_token_span(
                 text, char_start, char_end, input_ids
             )
             token_spans.append(token_span)
-        
+
         return token_spans
     
     def _char_span_to_token_span(

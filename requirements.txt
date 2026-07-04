@@ -11,6 +11,9 @@ protobuf
 datasets
 jsonlines
 
+# Dataset curation (GLiNER2 schema-driven entity/relation extraction)
+gliner2
+
 # Knowledge graph utilities
 networkx
 

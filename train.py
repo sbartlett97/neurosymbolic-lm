@@ -228,8 +228,44 @@ def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict
     n_entity_types = max(16, len(entity_types) + 4)
     n_relations = max(64, len(relations) + 10)
     n_concepts = max(256, len(concepts) + 50)
-    
+
     return concept_map, relation_map, entity_type_map, n_entity_types, n_relations, n_concepts
+
+
+def load_vocab_file(dataset_path: Path) -> Optional[Dict]:
+    """Load the vocabulary JSON written by the curation pipeline, if present.
+
+    The curation pipeline (data/curate_dataset.py) writes a ``*_vocab.json``
+    next to the dataset with stable 1-indexed concept/relation/entity-type
+    maps and a concept->entity-type mapping. Using it keeps head sizes and
+    label indices consistent across runs and dataset shards, instead of
+    re-deriving them from whichever labels happen to occur in the file.
+    """
+    candidates = [
+        dataset_path.with_name(dataset_path.stem + "_vocab.json"),
+        dataset_path.parent / "curated_vocab.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    vocab = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"  Warning: could not read vocab file {path}: {e}")
+                continue
+            if "concepts" in vocab and "relations" in vocab:
+                print(f"  Using vocabulary file: {path}")
+                return vocab
+    return None
+
+
+def merge_new_labels(base: Dict[str, int], names) -> None:
+    """Append labels to a 1-indexed vocab map without disturbing existing ids."""
+    next_id = max(base.values(), default=0) + 1
+    for name in names:
+        if name not in base:
+            base[name] = next_id
+            next_id += 1
 
 
 def create_dataloader(
@@ -246,6 +282,7 @@ def create_dataloader(
     chat_template: Optional[ChatTemplate] = None,
     kg_relation_encoder: Optional[KGRelationEncoder] = None,
     vision_processor=None,
+    entity_type_name_map: Optional[Dict] = None,
 ) -> DataLoader:
     """Create dataloader with collator."""
     collator = CognitiveCollator(
@@ -261,6 +298,7 @@ def create_dataloader(
         kg_relation_encoder=kg_relation_encoder,
         max_nodes=model_config.max_nodes,
         vision_processor=vision_processor,
+        entity_type_map=entity_type_name_map,
     )
 
     return DataLoader(
@@ -591,20 +629,43 @@ def main():
     else:
         print(f"\nNo eval dataset found at {eval_path} - will skip held-out evaluation")
     
-    # Extract vocabulary
-    concept_map, relation_map, entity_type_map, n_entity_types, n_relations, n_concepts = \
-        extract_vocab_from_dataset(train_dataset)
-    
-    if stage2_dataset:
-        c2, r2, et2, ne2, nr2, nc2 = extract_vocab_from_dataset(stage2_dataset)
-        concept_map.update(c2)
-        relation_map.update(r2)
-        entity_type_map.update(et2)
-        n_entity_types = max(n_entity_types, ne2)
-        n_relations = max(n_relations, nr2)
-        n_concepts = max(n_concepts, nc2)
-    
-    print(f"  Entity types: {len(entity_type_map)} -> capacity {n_entity_types}")
+    # Vocabulary: prefer the stable vocab file written by the curation
+    # pipeline; fall back to deriving vocab from the dataset contents.
+    vocab_file = load_vocab_file(dataset_path)
+    entity_type_name_map: Dict[str, int] = {}
+
+    if vocab_file is not None:
+        concept_map = dict(vocab_file["concepts"])
+        relation_map = dict(vocab_file["relations"])
+        entity_type_name_map = dict(vocab_file.get("entity_types", {}))
+        # concept name -> coarse entity type index (for legacy samples
+        # without an explicit entity_types field)
+        entity_type_map = dict(vocab_file.get("concept_to_entity_type", {}))
+
+        n_entity_types = max(16, max(entity_type_name_map.values(), default=0) + 1)
+        n_relations = max(64, len(relation_map) + 10)
+        n_concepts = max(256, len(concept_map) + 50)
+
+        if stage2_dataset:
+            c2, r2, _, _, _, _ = extract_vocab_from_dataset(stage2_dataset)
+            merge_new_labels(concept_map, c2.keys())
+            merge_new_labels(relation_map, r2.keys())
+            n_relations = max(n_relations, len(relation_map) + 10)
+            n_concepts = max(n_concepts, len(concept_map) + 50)
+    else:
+        concept_map, relation_map, entity_type_map, n_entity_types, n_relations, n_concepts = \
+            extract_vocab_from_dataset(train_dataset)
+
+        if stage2_dataset:
+            c2, r2, et2, ne2, nr2, nc2 = extract_vocab_from_dataset(stage2_dataset)
+            merge_new_labels(concept_map, c2.keys())
+            merge_new_labels(relation_map, r2.keys())
+            merge_new_labels(entity_type_map, et2.keys())
+            n_entity_types = max(n_entity_types, len(entity_type_map) + 4)
+            n_relations = max(n_relations, len(relation_map) + 10)
+            n_concepts = max(n_concepts, len(concept_map) + 50)
+
+    print(f"  Entity types: {len(entity_type_name_map) or len(entity_type_map)} -> capacity {n_entity_types}")
     print(f"  Relations: {len(relation_map)} -> capacity {n_relations}")
     print(f"  Concepts: {len(concept_map)} -> capacity {n_concepts}")
     
@@ -716,6 +777,7 @@ def main():
                 include_responses=False,
                 kg_relation_encoder=kg_relation_encoder,
                 vision_processor=vision_processor,
+                entity_type_name_map=entity_type_name_map,
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -768,6 +830,7 @@ def main():
                 include_responses=True,
                 kg_relation_encoder=kg_relation_encoder,
                 vision_processor=vision_processor,
+                entity_type_name_map=entity_type_name_map,
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -809,6 +872,7 @@ def main():
                 include_responses=True,
                 kg_relation_encoder=kg_relation_encoder,
                 vision_processor=vision_processor,
+                entity_type_name_map=entity_type_name_map,
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -868,6 +932,7 @@ def main():
             chat_template=chat_template,
             kg_relation_encoder=kg_relation_encoder,
             vision_processor=vision_processor,
+            entity_type_name_map=entity_type_name_map,
         )
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]

@@ -39,7 +39,19 @@ class CurationConfig:
     output_dir: str = "data/curated"
     output_format: str = "jsonl"
 
-    # LLM settings
+    # Annotator selection
+    # 'gliner'  — GLiNER2 schema-driven extraction, should_respond=0 samples
+    # 'llm'     — legacy free-form LLM JSON annotation
+    # 'hybrid'  — GLiNER2 extraction + LLM-generated QA pairs
+    annotator: str = "gliner"
+
+    # GLiNER2 settings
+    gliner_model: str = "fastino/gliner2-base-v1"
+    gliner_entity_threshold: float = 0.5
+    gliner_relation_threshold: float = 0.4
+    gliner_device: Optional[str] = None  # None = auto
+
+    # LLM settings (used by 'llm' annotator and 'hybrid' QA generation)
     llm_model: str = "meta-llama/Llama-3.1-8B-Instruct"
     llm_backend: str = "vllm"  # 'vllm', 'transformers', 'api'
     llm_quantization: Optional[str] = "awq"  # 'awq', 'gptq', None
