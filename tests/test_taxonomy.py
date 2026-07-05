@@ -17,8 +17,8 @@ from data.curate.taxonomy import (
 
 def test_budgets_match_model_config():
     """Taxonomy must fit the architecture budgets in config.ModelConfig."""
-    # n_entity_types=16 with index 0 reserved for none/padding
-    assert len(ENTITY_TYPES) <= 15
+    # n_entity_types=24 with index 0 reserved for none/padding
+    assert len(ENTITY_TYPES) <= 23
     # n_concepts defaults to 1024; concepts + coarse types must fit
     assert len(CONCEPT_LABELS) + len(ENTITY_TYPES) <= 1024
     # n_relations defaults to 128 with index 0 reserved
@@ -80,6 +80,22 @@ def test_vocab_is_one_indexed_and_includes_coarse_concepts():
         assert c2t[c] == vocab["entity_types"][CONCEPT_LABELS[c][0]]
     for t in ENTITY_TYPES:
         assert c2t[t] == vocab["entity_types"][t]
+
+
+def test_trace_and_code_branches_present():
+    tax = get_default_taxonomy()
+    assert tax.coarse_type_of("file_path") == "digital_artifact"
+    assert tax.coarse_type_of("tool_name") == "digital_artifact"
+    assert tax.coarse_type_of("function") == "code_construct"
+    assert tax.coarse_type_of("module_or_package") == "code_construct"
+    # Trace/code relations are pruned in when their types are present
+    code_rels = tax.relations_for_types({"code_construct", "digital_artifact"})
+    for rel in ("calls", "defined_in", "imports", "raises", "argument_of"):
+        assert rel in code_rels
+    # ... and pruned out for purely encyclopedic documents
+    wiki_rels = tax.relations_for_types({"person", "location", "organization"})
+    assert "defined_in" not in wiki_rels
+    assert "imports" not in wiki_rels
 
 
 def test_custom_taxonomy():

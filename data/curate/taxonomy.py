@@ -45,6 +45,9 @@ ENTITY_TYPES: List[str] = [
     "activity",
     "attribute",
     "language_or_group",
+    # Assistant-trace / coding domains
+    "digital_artifact",
+    "code_construct",
 ]
 
 ENTITY_TYPE_TO_ID: Dict[str, int] = {t: i + 1 for i, t in enumerate(ENTITY_TYPES)}
@@ -170,6 +173,28 @@ CONCEPT_LABELS: Dict[str, Tuple[str, str]] = {
     "language": ("language_or_group", "A natural language or dialect"),
     "nationality_or_ethnicity": ("language_or_group", "A nationality, ethnic group, or demonym"),
     "community": ("language_or_group", "A named community, tribe, or social group"),
+    # --- digital_artifact (assistant traces, tool use) ---
+    "file_path": ("digital_artifact", "A file or directory path such as 'src/main.py' or '/etc/hosts'"),
+    "url": ("digital_artifact", "A URL or web address"),
+    "email_address": ("digital_artifact", "An email address"),
+    "identifier": ("digital_artifact", "An identifier such as a UUID, hash, ticket number, or account ID"),
+    "version_number": ("digital_artifact", "A software version number such as 'v2.1.0' or 'Python 3.11'"),
+    "environment_variable": ("digital_artifact", "An environment variable or configuration key such as 'API_KEY' or 'PATH'"),
+    "cli_command": ("digital_artifact", "A shell or command-line command such as 'git commit' or 'pip install'"),
+    "error_message": ("digital_artifact", "An error message, exception text, or status code from a program"),
+    "tool_name": ("digital_artifact", "The name of a callable tool, function API, or service an assistant can invoke"),
+    "api_endpoint": ("digital_artifact", "An API endpoint, route, or HTTP method such as 'GET /users'"),
+    "database_object": ("digital_artifact", "A database, table, column, or query object name"),
+    "ui_element": ("digital_artifact", "A user interface element such as a button, menu, or settings field"),
+    # --- code_construct (source code) ---
+    "function": ("code_construct", "A function or method name in source code"),
+    "class_name": ("code_construct", "A class, struct, or interface name in source code"),
+    "variable": ("code_construct", "A variable, constant, or parameter name in source code"),
+    "module_or_package": ("code_construct", "A module, package, or namespace name in source code"),
+    "data_structure": ("code_construct", "A data structure or type such as a list, dict, array, or tensor"),
+    "exception_type": ("code_construct", "An exception or error type name in code such as 'ValueError'"),
+    # --- technology additions ---
+    "library_or_framework": ("technology", "A software library, framework, or SDK such as PyTorch or React"),
 }
 
 
@@ -233,6 +258,17 @@ RELATION_LABELS: Dict[str, Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = {
     "treats": ("drug or treatment treats disease or condition", ("substance", "technology"), ("biological",)),
     "causes_condition": ("agent or factor causes disease or condition", (), ("biological",)),
     "habitat_of": ("location is the habitat of animal or plant", ("location",), ("biological",)),
+    # code / trace relations
+    "calls": ("function, code, or assistant calls a function or tool", ("code_construct", "digital_artifact"), ("code_construct", "digital_artifact", "technology")),
+    "defined_in": ("code construct is defined in a class, module, or file", ("code_construct",), ("code_construct", "digital_artifact")),
+    "imports": ("module or file imports a module or library", ("code_construct", "digital_artifact"), ("code_construct", "technology")),
+    "returns_value": ("function returns a value, object, or type", ("code_construct",), ()),
+    "raises": ("code raises or produces an exception or error", ("code_construct", "digital_artifact"), ("code_construct", "digital_artifact")),
+    "depends_on": ("software depends on a library, service, or version", ("technology", "code_construct", "digital_artifact", "product"), ("technology", "code_construct", "digital_artifact")),
+    "argument_of": ("value is passed as an argument to a tool, command, or function", (), ("code_construct", "digital_artifact", "technology")),
+    "produced_by": ("output or artifact was produced by a tool, command, or function", ("digital_artifact",), ("code_construct", "digital_artifact", "technology")),
+    "configures": ("setting or variable configures software or a system", ("digital_artifact",), ("technology", "digital_artifact", "product")),
+    "located_at": ("resource or content is located at a path or URL", (), ("digital_artifact",)),
     # generic fallbacks
     "instance_of": ("thing is an instance or type of category", (), ()),
     "related_to": ("two things are otherwise related", (), ()),

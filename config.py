@@ -25,7 +25,7 @@ class ModelConfig:
     
     # Architecture settings
     d_model: int = 768  # Will be set from model config
-    n_entity_types: int = 16  # Expanded for production
+    n_entity_types: int = 24  # Headroom over the ~17 coarse taxonomy types (0 = none)
     n_relations: int = 128  # Expanded for production
     n_concepts: int = 1024  # Expanded for production
     concept_dim: int = 256
@@ -77,7 +77,7 @@ class ModelConfig:
             model_name="google/long-t5-tglobal-base",
             max_input_length=16384,
             max_output_length=2048,
-            n_entity_types=16,
+            n_entity_types=24,
             n_relations=128,
             n_concepts=1024,
             max_nodes=48,
@@ -92,7 +92,7 @@ class ModelConfig:
             model_name="google/long-t5-tglobal-base",
             max_input_length=8192,
             max_output_length=2048,
-            n_entity_types=16,
+            n_entity_types=24,
             n_relations=128,
             n_concepts=1024,
             max_nodes=32,
@@ -111,7 +111,7 @@ class ModelConfig:
             model_name="google/long-t5-tglobal-base",
             max_input_length=4096,
             max_output_length=1024,
-            n_entity_types=16,
+            n_entity_types=24,
             n_relations=128,
             n_concepts=1024,
             max_nodes=32,
@@ -141,7 +141,7 @@ class ModelConfig:
             model_name="google/t5gemma-2-1b-1b",
             max_input_length=8192,
             max_output_length=2048,
-            n_entity_types=16,
+            n_entity_types=24,
             n_relations=128,
             n_concepts=1024,
             max_nodes=64,
@@ -156,7 +156,7 @@ class ModelConfig:
             model_name="google/t5gemma-2-270m-270m",
             max_input_length=4096,
             max_output_length=1024,
-            n_entity_types=16,
+            n_entity_types=24,
             n_relations=128,
             n_concepts=512,
             max_nodes=32,

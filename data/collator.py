@@ -81,6 +81,10 @@ class CognitiveCollator:
         Returns:
             Dictionary with batched tensors
         """
+        # Project per-message annotations into encoder-input coordinates
+        # (trace samples carry message_annotations instead of flat fields)
+        batch = [self._flatten_message_annotations(s) for s in batch]
+
         # --- Determine input/target texts ---
         texts = []
         chat_targets = []  # Non-empty when chat_mode overrides response
@@ -187,6 +191,80 @@ class CognitiveCollator:
 
         return result
     
+    def _flatten_message_annotations(self, sample: dict) -> dict:
+        """Flatten per-message symbolic annotations into sample-level fields.
+
+        Trace samples store annotations per message with spans relative to
+        each message's stripped content:
+
+            "message_annotations": [
+                {"message_idx": 1, "entities": [...], "entity_spans": [...],
+                 "concepts": [...], "entity_types": [...], "relations": [...]},
+                ...
+            ]
+
+        This projects those spans into the formatted encoder input via
+        ChatTemplate.format_messages_with_offsets and re-bases the relation
+        entity indices, so the rest of the collator sees an ordinary flat
+        sample whose entity_spans index into the tokenized text.
+        """
+        if (
+            not self.chat_mode
+            or self.chat_template is None
+            or "messages" not in sample
+            or "message_annotations" not in sample
+        ):
+            return sample
+
+        messages = sample["messages"]
+        input_text, _, offsets = self.chat_template.format_messages_with_offsets(
+            messages
+        )
+
+        entities: List[str] = []
+        spans: List[List[int]] = []
+        concepts: List[List[str]] = []
+        entity_types: List[str] = []
+        relations: List[List] = []
+
+        for ann in sample["message_annotations"]:
+            mi = ann.get("message_idx")
+            if mi is None or not (0 <= mi < len(offsets)) or offsets[mi] is None:
+                continue
+            base = offsets[mi]
+            ann_entities = ann.get("entities", [])
+            ann_spans = ann.get("entity_spans", [])
+            ann_concepts = ann.get("concepts", [])
+            ann_types = ann.get("entity_types", [])
+            index_offset = len(entities)
+
+            for j, ent in enumerate(ann_entities):
+                if j >= len(ann_spans) or len(ann_spans[j]) != 2:
+                    continue
+                s, e = ann_spans[j]
+                entities.append(ent)
+                spans.append([base + int(s), base + int(e)])
+                concepts.append(ann_concepts[j] if j < len(ann_concepts) else [])
+                entity_types.append(ann_types[j] if j < len(ann_types) else "")
+
+            for rel in ann.get("relations", []):
+                if len(rel) == 3 and isinstance(rel[0], int) and isinstance(rel[1], int):
+                    relations.append(
+                        [rel[0] + index_offset, rel[1] + index_offset, rel[2]]
+                    )
+
+        flat = dict(sample)
+        del flat["message_annotations"]
+        # text = formatted input so gold spans validate against the same
+        # string that gets tokenized
+        flat["text"] = input_text
+        flat["entities"] = entities
+        flat["entity_spans"] = spans
+        flat["concepts"] = concepts
+        flat["entity_types"] = entity_types
+        flat["relations"] = relations
+        return flat
+
     def _process_responses(self, batch: List[dict]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Process response texts for decoder training.

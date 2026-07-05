@@ -35,7 +35,7 @@ from .taxonomy import (
 )
 
 
-class _EntityMatch:
+class EntityMatch:
     """A single labelled span candidate before merging."""
 
     __slots__ = ("start", "end", "text", "label", "score")
@@ -46,6 +46,63 @@ class _EntityMatch:
         self.text = text
         self.label = label
         self.score = score
+
+
+# Backwards-compatible private alias
+_EntityMatch = EntityMatch
+
+
+def merge_entity_matches(
+    matches: List[EntityMatch],
+    taxonomy: Taxonomy,
+    max_entities: int,
+) -> Tuple[List[str], List[List[int]], List[List[str]], List[str]]:
+    """Merge overlapping label matches into entities.
+
+    Two matches referring to overlapping spans are the same entity seen
+    through different labels: the labels become its concepts, and the
+    best-scoring label's coarse parent becomes its entity type.
+
+    Returns (entities, spans, concepts, entity_types), span end exclusive.
+    """
+    if not matches:
+        return [], [], [], []
+
+    matches = sorted(matches, key=lambda m: (m.start, -(m.end - m.start)))
+    groups: List[List[EntityMatch]] = []
+    for m in matches:
+        placed = False
+        for group in groups:
+            g_start = min(x.start for x in group)
+            g_end = max(x.end for x in group)
+            if m.start < g_end and m.end > g_start:  # overlap
+                group.append(m)
+                placed = True
+                break
+        if not placed:
+            groups.append([m])
+
+    # Rank groups by best score so truncation keeps confident entities
+    groups.sort(key=lambda g: -max(x.score for x in g))
+    groups = groups[:max_entities]
+    groups.sort(key=lambda g: min(x.start for x in g))
+
+    entities, spans, concepts, entity_types = [], [], [], []
+    for group in groups:
+        best = max(group, key=lambda x: x.score)
+        # Dedup labels keeping the highest score per label
+        by_label: Dict[str, float] = {}
+        for x in group:
+            by_label[x.label] = max(by_label.get(x.label, 0.0), x.score)
+        ranked = sorted(by_label.items(), key=lambda kv: -kv[1])
+        group_concepts = [lbl for lbl, _ in ranked[:MAX_CONCEPTS_PER_ENTITY]]
+
+        entities.append(best.text)
+        spans.append([best.start, best.end])
+        concepts.append(group_concepts)
+        entity_types.append(taxonomy.coarse_type_of(best.label) or "abstract_concept")
+
+    return entities, spans, concepts, entity_types
 
 
 class GLiNER2Annotator:
@@ -212,52 +269,17 @@ class GLiNER2Annotator:
     def _merge_matches(
         self, matches: List[_EntityMatch]
     ) -> Tuple[List[str], List[List[int]], List[List[str]], List[str]]:
-        """Merge overlapping label matches into entities.
+        return merge_entity_matches(matches, self.taxonomy, self.max_entities)
 
-        Two matches referring to overlapping spans are the same entity seen
-        through different labels: the labels become its concepts, and the
-        best-scoring label's coarse parent becomes its entity type.
-
-        Returns (entities, spans, concepts, entity_types), span end exclusive.
-        """
-        if not matches:
-            return [], [], [], []
-
-        matches = sorted(matches, key=lambda m: (m.start, -(m.end - m.start)))
-        groups: List[List[_EntityMatch]] = []
-        for m in matches:
-            placed = False
-            for group in groups:
-                g_start = min(x.start for x in group)
-                g_end = max(x.end for x in group)
-                if m.start < g_end and m.end > g_start:  # overlap
-                    group.append(m)
-                    placed = True
-                    break
-            if not placed:
-                groups.append([m])
-
-        # Rank groups by best score so truncation keeps confident entities
-        groups.sort(key=lambda g: -max(x.score for x in g))
-        groups = groups[: self.max_entities]
-        groups.sort(key=lambda g: min(x.start for x in g))
-
-        entities, spans, concepts, entity_types = [], [], [], []
-        for group in groups:
-            best = max(group, key=lambda x: x.score)
-            # Dedup labels keeping the highest score per label
-            by_label: Dict[str, float] = {}
-            for x in group:
-                by_label[x.label] = max(by_label.get(x.label, 0.0), x.score)
-            ranked = sorted(by_label.items(), key=lambda kv: -kv[1])
-            group_concepts = [lbl for lbl, _ in ranked[:MAX_CONCEPTS_PER_ENTITY]]
-
-            entities.append(best.text)
-            spans.append([best.start, best.end])
-            concepts.append(group_concepts)
-            entity_types.append(self.taxonomy.coarse_type_of(best.label) or "abstract_concept")
-
-        return entities, spans, concepts, entity_types
+    def annotate_text(
+        self, text: str
+    ) -> Tuple[List[str], List[List[int]], List[List[str]], List[str], List[List]]:
+        """Extract (entities, spans, concepts, entity_types, relations)
+        from a plain text string. Used directly by the trace annotator."""
+        matches = self._extract_entity_matches(text)
+        entities, spans, concepts, entity_types = self._merge_matches(matches)
+        relations = self._extract_relations(text, entities, entity_types, spans)
+        return entities, spans, concepts, entity_types, relations
 
     # ------------------------------------------------------------------
     # Relation extraction
@@ -458,9 +480,7 @@ class GLiNER2Annotator:
         text = doc.text
 
         try:
-            matches = self._extract_entity_matches(text)
-            entities, spans, concepts, entity_types = self._merge_matches(matches)
-            relations = self._extract_relations(text, entities, entity_types, spans)
+            entities, spans, concepts, entity_types, relations = self.annotate_text(text)
         except Exception as e:
             return AnnotationResult(text=text, success=False, error=str(e))
 

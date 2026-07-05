@@ -34,6 +34,61 @@ Legacy fields still accepted: `messages` (chat mode), `kg_relations`,
 collator falls back to deriving types from concepts via
 `concept_to_entity_type_map`.
 
+## Trace samples (assistant conversations)
+
+Multi-turn traces keep `messages` intact and carry symbolic supervision
+**per message**, so annotations stay valid regardless of how the chat
+template renders the conversation:
+
+```json
+{
+    "messages": [
+        {"role": "system", "content": "You are a coding assistant."},
+        {"role": "user", "content": "Fix the bug in src/app/main.py"},
+        {"role": "assistant", "content": "{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/app/main.py\"}}"},
+        {"role": "tool", "content": "def load(path): ..."},
+        {"role": "assistant", "content": "Fixed - load() now validates its input."}
+    ],
+    "message_annotations": [
+        {"message_idx": 1, "entities": ["src/app/main.py"], "entity_spans": [[15, 30]],
+         "concepts": [["file_path"]], "entity_types": ["digital_artifact"], "relations": []}
+    ],
+    "should_respond": 1,
+    "response": "Fixed - load() now validates its input."
+}
+```
+
+Rules:
+
+- Roles: `system`, `user`, `assistant`, `tool` (tool/function results).
+  Assistant tool calls are inline JSON content; the final assistant turn is
+  the decoder target and is **never** annotated.
+- `entity_spans` in `message_annotations` are relative to that message's
+  **stripped** content (`content.strip()`); relation indices are local to
+  the message's own entity list.
+- At collate time, `ChatTemplate.format_messages_with_offsets` reports where
+  each message landed in the encoder input and the collator projects spans
+  and re-bases relation indices automatically
+  (`CognitiveCollator._flatten_message_annotations`).
+
+Produce trace data with:
+
+```bash
+# Deterministic annotation only (regex artifacts + AST code parsing)
+python data/curate_traces.py --source glaiveai/glaive-function-calling-v2 \
+    --target-samples 20000 --no-gliner
+
+# With GLiNER2 prose extraction as well
+python data/curate_traces.py --source glaiveai/glaive-function-calling-v2 \
+    --target-samples 20000
+```
+
+Per message, fenced code blocks are annotated by the AST-based
+`CodeAnnotator` (functions, classes, imports, calls, raises — exact spans,
+Python via stdlib `ast`, other languages pluggable), digital artifacts
+(URLs, file paths, emails, versions, env vars) by exact regex, and the
+remaining prose by GLiNER2.
+
 ## Vocabulary file
 
 The curation pipeline writes `<name>_vocab.json` next to the dataset:

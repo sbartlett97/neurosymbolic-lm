@@ -23,6 +23,9 @@ from .gliner_annotator import GLiNER2Annotator
 from .quality_control import QualityControl
 from .output_writer import OutputWriter
 from .taxonomy import Taxonomy, get_default_taxonomy
+from .code_annotator import CodeAnnotator
+from .trace_annotator import TraceAnnotator
+from .trace_loader import TraceDocument, TraceSourceLoader
 
 __all__ = [
     "CurationConfig",
@@ -34,4 +37,8 @@ __all__ = [
     "OutputWriter",
     "Taxonomy",
     "get_default_taxonomy",
+    "CodeAnnotator",
+    "TraceAnnotator",
+    "TraceDocument",
+    "TraceSourceLoader",
 ]

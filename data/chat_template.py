@@ -3,14 +3,16 @@
 Defines special tokens for role markers and provides formatting utilities
 for single-turn and multi-turn conversations.
 
-T5 doesn't have native chat templates, so we add <system>, <user>, <assistant>
-as special tokens and format conversations as flat text with role markers.
+T5 doesn't have native chat templates, so we add <system>, <user>,
+<assistant>, and <tool> as special tokens and format conversations as flat
+text with role markers. The <tool> role carries tool/function results in
+assistant traces.
 """
 
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional, Tuple
 
 # Special tokens for chat role markers
-CHAT_SPECIAL_TOKENS = ["<system>", "<user>", "<assistant>"]
+CHAT_SPECIAL_TOKENS = ["<system>", "<user>", "<assistant>", "<tool>"]
 
 
 class ChatTemplate:
@@ -50,48 +52,86 @@ class ChatTemplate:
 
         Args:
             messages: List of dicts with "role" and "content" keys.
-                      Roles: "system", "user", "assistant".
+                      Roles: "system", "user", "assistant", "tool".
 
         Returns:
             (input_text, target_text) where target_text is the last
             assistant message (or empty string if none).
         """
-        parts = []
+        input_text, target_text, _ = self.format_messages_with_offsets(messages)
+        return input_text, target_text
+
+    def format_messages_with_offsets(
+        self, messages: List[Dict[str, str]]
+    ) -> Tuple[str, str, List[Optional[int]]]:
+        """Format a conversation and report where each message's content
+        landed in the encoder input.
+
+        Message content is stripped before formatting, so annotations must
+        be relative to ``msg["content"].strip()``.
+
+        Returns:
+            (input_text, target_text, content_offsets) where
+            content_offsets[i] is the character offset of messages[i]'s
+            stripped content within input_text, or None if that content is
+            not part of the encoder input (the final assistant turn, which
+            becomes the decoder target, or an empty message).
+        """
+        parts: List[str] = []          # formatted chunks joined by " "
+        owners: List[Optional[int]] = []   # message index owning each chunk
+        prefixes: List[int] = []       # chars before content within chunk
         target_text = ""
         system_seen = False
+
+        def add_part(text: str, owner: Optional[int], prefix: int):
+            parts.append(text)
+            owners.append(owner)
+            prefixes.append(prefix)
 
         for i, msg in enumerate(messages):
             role = msg["role"]
             content = msg["content"].strip()
 
             if role == "system":
-                parts.append(f"<system> {content}")
+                add_part(f"<system> {content}", i, len("<system> "))
                 system_seen = True
-            elif role == "user":
+            elif role in ("user", "tool"):
                 if not system_seen:
-                    parts.append(f"<system> {self.default_system_prompt}")
+                    add_part(f"<system> {self.default_system_prompt}", None, 0)
                     system_seen = True
-                parts.append(f"<user> {content}")
+                marker = f"<{role}>"
+                add_part(f"{marker} {content}", i, len(marker) + 1)
             elif role == "assistant":
                 is_last_assistant = all(
                     m["role"] != "assistant" for m in messages[i + 1:]
                 )
                 if is_last_assistant:
                     # Last assistant turn is the target
-                    parts.append("<assistant>")
+                    add_part("<assistant>", None, 0)
                     target_text = content
                 else:
-                    parts.append(f"<assistant> {content}")
+                    add_part(f"<assistant> {content}", i, len("<assistant> "))
 
         if not system_seen:
             parts.insert(0, f"<system> {self.default_system_prompt}")
+            owners.insert(0, None)
+            prefixes.insert(0, 0)
 
-        # Ensure the input ends with <assistant> marker
         input_text = " ".join(parts)
+        # Ensure the input ends with <assistant> marker (appending never
+        # shifts earlier offsets)
         if not input_text.rstrip().endswith("<assistant>"):
             input_text = input_text.rstrip() + " <assistant>"
 
-        return input_text, target_text
+        # Walk the joined parts to compute each message's content offset
+        content_offsets: List[Optional[int]] = [None] * len(messages)
+        pos = 0
+        for part, owner, prefix in zip(parts, owners, prefixes):
+            if owner is not None and messages[owner]["content"].strip():
+                content_offsets[owner] = pos + prefix
+            pos += len(part) + 1  # +1 for the " " join separator
+
+        return input_text, target_text, content_offsets
 
     def format_single_turn(
         self,

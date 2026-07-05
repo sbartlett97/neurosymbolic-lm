@@ -87,6 +87,9 @@ python data/curate_dataset.py --annotator gliner \
 
 # GLiNER2 extraction + LLM-generated QA pairs (stage-2/3 data)
 python data/curate_dataset.py --annotator hybrid --backend vllm
+
+# Assistant traces (tool calling) with per-message symbolic annotation
+python data/curate_traces.py --source glaiveai/glaive-function-calling-v2
 ```
 
 See `DATASET_FORMAT.md` for the output schema and per-stage usage.
