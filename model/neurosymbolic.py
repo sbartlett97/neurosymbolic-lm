@@ -22,8 +22,7 @@ from .entity import (
     ConceptBank,
     HierarchicalConceptBank,
 )
-from .gnn import SimpleGNN, AttentionGNN, KGAwareGNN, KGPathReasoner
-from .kg_relation_encoder import KGRelationEncoder
+from .gnn import SimpleGNN, AttentionGNN
 from .logic import SoftLogicConstraints, pair_logits_to_matrix
 
 
@@ -69,11 +68,6 @@ class NeuroSymbolicLM(nn.Module):
         max_nodes: int = 16,
         freeze_encoder: bool = False,
         freeze_decoder: bool = False,
-        use_kg: bool = False,
-        kg_embed_dim: int = 300,
-        use_kg_gnn: bool = False,
-        use_path_reasoning: bool = False,
-        max_path_length: int = 3,
         gradient_checkpointing: bool = False,
         max_input_length: int = 4096,
         max_output_length: int = 1024,
@@ -96,6 +90,9 @@ class NeuroSymbolicLM(nn.Module):
         workspace_n_cycles: int = 1,
         # Vision (T5Gemma)
         use_vision: bool = False,
+        # Backbone dtype: None = auto (bfloat16 on CUDA, float32 elsewhere —
+        # bf16 support on MPS/CPU is incomplete)
+        torch_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
 
@@ -107,12 +104,15 @@ class NeuroSymbolicLM(nn.Module):
         self.max_input_length = max_input_length
         self.max_output_length = max_output_length
 
+        if torch_dtype is None:
+            torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
         # Load the appropriate model
         if self.is_t5gemma:
             from transformers import AutoModelForSeq2SeqLM, AutoProcessor
-            print(f"Loading T5Gemma 2 model: {model_name}")
+            print(f"Loading T5Gemma 2 model: {model_name} ({torch_dtype})")
             self.t5 = AutoModelForSeq2SeqLM.from_pretrained(
-                model_name, torch_dtype=torch.bfloat16
+                model_name, torch_dtype=torch_dtype
             )
             # Store processor for vision input handling
             if self.has_vision:
@@ -143,11 +143,6 @@ class NeuroSymbolicLM(nn.Module):
         self.concept_dim = concept_dim
         self.node_dim = node_dim
         self.max_nodes = max_nodes
-        self.use_kg = use_kg
-        self.kg_embed_dim = kg_embed_dim
-        self.use_kg_gnn = use_kg_gnn
-        self.use_path_reasoning = use_path_reasoning
-        self.max_path_length = max_path_length
         self.gradient_checkpointing = gradient_checkpointing
         self.use_context_aware_entity = use_context_aware_entity
         self.use_hierarchical_concepts = use_hierarchical_concepts
@@ -212,13 +207,11 @@ class NeuroSymbolicLM(nn.Module):
         # GNN - select variant
         if use_linear_graph_transformer:
             from .linear_graph_transformer import LinearGraphTransformer
-            _edge_dim = kg_embed_dim if use_kg_gnn else None
             self.gnn = LinearGraphTransformer(
                 node_dim,
                 n_heads=gnn_n_heads,
                 n_layers=2,
                 n_random_features=linear_attn_n_random_features,
-                edge_dim=_edge_dim,
             )
             print(f"Using linear graph transformer ({linear_attn_n_random_features} random features)")
         elif use_attention_gnn:
@@ -228,34 +221,8 @@ class NeuroSymbolicLM(nn.Module):
                 n_layers=2,
             )
             print(f"Using attention-based GNN with {gnn_n_heads} heads")
-        elif use_kg_gnn:
-            self.gnn = KGAwareGNN(node_dim, kg_embed_dim, n_layers=2, use_kg=True)
         else:
             self.gnn = SimpleGNN(node_dim, n_layers=2)
-
-        # KG relation encoder for producing dense relation embeddings
-        self.kg_relation_encoder = None
-        if use_kg_gnn:
-            self.kg_relation_encoder = KGRelationEncoder(kg_embed_dim)
-            print("Using KG relation encoder")
-
-        # Path reasoner for multi-hop KG reasoning
-        self.path_reasoner = None
-        self.kg_entity_embeddings: Optional[Dict[str, torch.Tensor]] = None
-        self.kg_relation_embeddings: Optional[Dict[str, torch.Tensor]] = None
-        if use_path_reasoning:
-            self.path_reasoner = KGPathReasoner(
-                node_dim, kg_embed_dim, max_path_length=max_path_length
-            )
-            self.path_to_rel_proj = nn.Linear(node_dim, n_relations)
-            # Fusion layer for combining GNN and path reasoning outputs
-            self.path_fusion = nn.Sequential(
-                nn.Linear(node_dim * 2, node_dim),
-                nn.LayerNorm(node_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-            )
-            print("Using KG path reasoning")
 
         # Relation scorer
         self.rel_scorer = nn.Sequential(
@@ -290,21 +257,6 @@ class NeuroSymbolicLM(nn.Module):
         else:
             self.global_workspace = None
 
-    def set_kg_embeddings(
-        self,
-        entity_embeddings: Dict[str, torch.Tensor],
-        relation_embeddings: Dict[str, torch.Tensor],
-    ):
-        """
-        Set external knowledge graph embeddings for path reasoning.
-
-        Args:
-            entity_embeddings: Dict mapping entity names to embedding tensors
-            relation_embeddings: Dict mapping relation names to embedding tensors
-        """
-        self.kg_entity_embeddings = entity_embeddings
-        self.kg_relation_embeddings = relation_embeddings
-    
     @property
     def entity_head(self):
         """Entity classification head."""
@@ -485,10 +437,6 @@ class NeuroSymbolicLM(nn.Module):
         attention_mask: torch.Tensor,
         spans: Optional[List[List[Tuple[int, int]]]] = None,
         y_ids: Optional[torch.Tensor] = None,
-        entity_names: Optional[List[List[str]]] = None,
-        kg_paths: Optional[List[List[List[List[Tuple[str, str]]]]]] = None,
-        kg_relation_ids: Optional[torch.Tensor] = None,
-        kg_adjacency: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -499,12 +447,7 @@ class NeuroSymbolicLM(nn.Module):
             attention_mask: (B, L) attention mask
             spans: Optional gold entity spans
             y_ids: Decoder input IDs for teacher forcing
-            entity_names: Optional entity name strings for KG lookup (B, num_entities)
-            kg_paths: Optional pre-computed KG paths for path reasoning
-                      Shape: [batch][pair_idx][path_idx][(relation, entity), ...]
-            kg_relation_ids: Optional (B, N, N) long tensor of ConceptNet relation
-                             type indices from KG preprocessing
-            kg_adjacency: Optional (B, N, N) float tensor binary mask for KG edges
+            pixel_values: Optional image tensors for vision models
 
         Returns:
             Dictionary with model outputs
@@ -533,43 +476,8 @@ class NeuroSymbolicLM(nn.Module):
         else:
             node_feats = self._extract_node_features(enc, token_ent_logits, spans)
 
-        # GNN processing — pass KG relation embeddings if available
-        if self.use_kg_gnn and self.kg_relation_encoder is not None:
-            if kg_relation_ids is not None:
-                kg_rel_emb = self.kg_relation_encoder(kg_relation_ids)
-            else:
-                # Create zero-filled relation embeddings so KGAwareGNN
-                # gets the expected 3-way input dimension
-                N = node_feats.shape[1]
-                kg_rel_emb = torch.zeros(
-                    B, N, N, self.kg_embed_dim,
-                    device=node_feats.device, dtype=node_feats.dtype,
-                )
-            node_feats_refined = self.gnn(
-                node_feats,
-                kg_relation_embeddings=kg_rel_emb,
-                kg_adjacency=kg_adjacency,
-            )
-        else:
-            node_feats_refined = self.gnn(node_feats)
-
-        # Path reasoning integration (if enabled and KG available)
-        path_enhanced_feats = None
-        if (
-            self.path_reasoner is not None
-            and self.kg_entity_embeddings is not None
-            and self.kg_relation_embeddings is not None
-            and kg_paths is not None
-        ):
-            path_enhanced_feats = self._apply_path_reasoning(
-                node_feats_refined,
-                entity_names,
-                kg_paths,
-            )
-            # Fuse GNN and path reasoning features
-            node_feats_refined = self.path_fusion(
-                torch.cat([node_feats_refined, path_enhanced_feats], dim=-1)
-            )
+        # GNN relational reasoning over extracted nodes
+        node_feats_refined = self.gnn(node_feats)
 
         # Concept mapping
         concept_query = self.concept_proj(token_pool)
@@ -610,10 +518,6 @@ class NeuroSymbolicLM(nn.Module):
         if hierarchy_probs is not None:
             outputs["hierarchy_concept_probs"] = hierarchy_probs
 
-        # Add path-enhanced features if available
-        if path_enhanced_feats is not None:
-            outputs["path_enhanced_feats"] = path_enhanced_feats
-
         # Add selection weights if available
         if selection_weights is not None:
             outputs["selection_weights"] = selection_weights
@@ -645,72 +549,6 @@ class NeuroSymbolicLM(nn.Module):
 
         return outputs
 
-    def _apply_path_reasoning(
-        self,
-        node_feats: torch.Tensor,
-        entity_names: Optional[List[List[str]]],
-        kg_paths: List[List[List[List[Tuple[str, str]]]]],
-    ) -> torch.Tensor:
-        """
-        Apply KG path reasoning to enhance node features.
-
-        Args:
-            node_feats: (B, N, D) node features from GNN
-            entity_names: Entity names for KG lookup
-            kg_paths: Pre-computed paths between entity pairs
-
-        Returns:
-            Path-enhanced node features (B, N, D)
-        """
-        B, N, D = node_feats.shape
-        device = node_feats.device
-
-        # Initialize path-enhanced features with zeros
-        path_feats = torch.zeros_like(node_feats)
-
-        for b in range(B):
-            batch_paths = kg_paths[b] if b < len(kg_paths) else []
-
-            # Generate entity pairs for this batch
-            entity_pairs = []
-            pair_to_nodes = []
-            for i in range(N):
-                for j in range(i + 1, N):
-                    pair_idx = len(entity_pairs)
-                    if pair_idx < len(batch_paths):
-                        entity_pairs.append((i, j))
-                        pair_to_nodes.append((i, j))
-
-            if not entity_pairs or not batch_paths:
-                continue
-
-            # Get path embeddings using the path reasoner
-            path_embeddings = self.path_reasoner(
-                entity_pairs=entity_pairs,
-                paths=batch_paths[:len(entity_pairs)],
-                kg_entity_embeddings=self.kg_entity_embeddings,
-                kg_relation_embeddings=self.kg_relation_embeddings,
-                device=str(device),
-            )
-
-            # Distribute path embeddings back to nodes
-            for pair_idx, (i, j) in enumerate(pair_to_nodes):
-                if pair_idx < path_embeddings.shape[0]:
-                    path_emb = path_embeddings[pair_idx]
-                    # Add path info to both nodes in the pair
-                    path_feats[b, i] = path_feats[b, i] + path_emb
-                    path_feats[b, j] = path_feats[b, j] + path_emb
-
-            # Normalize by number of paths per node
-            node_path_counts = torch.zeros(N, device=device)
-            for i, j in pair_to_nodes:
-                node_path_counts[i] += 1
-                node_path_counts[j] += 1
-            node_path_counts = node_path_counts.clamp(min=1)
-            path_feats[b] = path_feats[b] / node_path_counts.unsqueeze(-1)
-
-        return path_feats
-    
     def generate(
         self,
         input_ids: torch.Tensor,

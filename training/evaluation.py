@@ -176,9 +176,20 @@ def evaluate_generation(
         print("  No samples with responses found for evaluation")
         return results
     
+    chat_template = None
+
     with torch.no_grad():
         for sample in eval_samples:
-            input_text = sample["text"]
+            if "text" in sample:
+                input_text = sample["text"]
+            elif "messages" in sample:
+                # Trace samples: build encoder input via the chat template
+                if chat_template is None:
+                    from data.chat_template import ChatTemplate
+                    chat_template = ChatTemplate()
+                input_text, _ = chat_template.format_messages(sample["messages"])
+            else:
+                continue
             tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
             input_ids = tokenized["input_ids"].to(device)
             attention_mask = tokenized["attention_mask"].to(device)

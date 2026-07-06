@@ -207,7 +207,9 @@ Training:
   --patience N            Early stopping patience
 
 Hardware:
-  --device                cuda or cpu
+  --device                auto, cuda, mps (Apple Silicon), or cpu
+                          (auto picks cuda > mps > cpu; AMP is CUDA-only,
+                          MPS/CPU run fp32)
   --no-amp                Disable mixed precision
   
 Output:

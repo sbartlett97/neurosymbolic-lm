@@ -37,13 +37,6 @@ class ModelConfig:
     freeze_encoder: bool = False
     freeze_decoder: bool = False
     
-    # Knowledge graph settings
-    use_kg: bool = False
-    kg_embed_dim: int = 300
-    use_kg_gnn: bool = False
-    use_path_reasoning: bool = False
-    max_path_length: int = 3
-    
     # Chat mode
     use_chat_mode: bool = False
     default_system_prompt: str = "You are a helpful assistant."
@@ -174,17 +167,6 @@ MODEL_PRESETS = {
     "t5gemma-1b": ModelConfig.for_t5gemma_1b,
     "t5gemma-270m": ModelConfig.for_t5gemma_270m,
 }
-
-
-@dataclass
-class KGConfig:
-    """Configuration for knowledge graph integration."""
-    
-    kg_type: str = "conceptnet"  # Options: "conceptnet", "wikidata", "wordnet", "generic"
-    embedding_path: Optional[str] = None
-    triples_path: Optional[str] = None
-    entity_mapping: Optional[Dict[str, str]] = None
-    max_triples: int = 50000
 
 
 @dataclass
@@ -417,7 +399,6 @@ class ContinualLearningConfig:
     # Symbolic updates
     enable_concept_expansion: bool = True
     enable_rule_learning: bool = True
-    enable_kg_updates: bool = True
     max_concepts: int = 2048
     max_rules: int = 200
 

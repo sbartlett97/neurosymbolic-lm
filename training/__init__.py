@@ -26,7 +26,6 @@ from .evaluation import (
     compute_aggregate_metrics,
     extract_entities_from_text,
 )
-from .kg_loader import load_kg_data_for_training
 
 __all__ = [
     # Trainers
@@ -51,6 +50,4 @@ __all__ = [
     "compute_entity_f1",
     "compute_aggregate_metrics",
     "extract_entities_from_text",
-    # KG
-    "load_kg_data_for_training",
 ]

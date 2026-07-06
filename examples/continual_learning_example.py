@@ -121,29 +121,27 @@ def main():
     print("Continual Learning Example")
     print("=" * 70)
     
-    # Check device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Check device (CUDA > Apple MPS > CPU)
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"\nUsing device: {device}")
-    
-    # Initialize tokenizer
-    print("\nInitializing tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.unk_token
-    
-    # Initialize model (smaller config for demo)
+
+    # Initialize model and its matching tokenizer (small backbone for demo)
     print("Initializing model...")
+    model_name = "google/long-t5-tglobal-base"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = NeuroSymbolicLM(
-        vocab_size=len(tokenizer),
-        d_model=256,  # Smaller for demo
-        n_entity_types=8,
-        n_relations=32,
-        n_concepts=64,
+        model_name=model_name,
+        n_entity_types=24,
+        n_relations=64,
+        n_concepts=128,
         concept_dim=128,
         node_dim=128,
         max_nodes=8,
-        use_pretrained_encoder=False,  # Use simple encoder for demo
-        use_pretrained_decoder=False,
     )
     model = model.to(device)
     

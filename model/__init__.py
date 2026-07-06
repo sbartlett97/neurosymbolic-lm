@@ -18,8 +18,7 @@ from .entity import (
 )
 from .gnn import (
     SimpleGNN,
-    KGAwareGNN,
-    KGPathReasoner,
+    AttentionGNN,
 )
 # Optional experimental modules (referenced by ModelConfig flags that
 # default to off). Their source files are not yet in the repo, so import
@@ -37,10 +36,6 @@ try:
     from .global_workspace import GlobalWorkspace
 except ImportError:
     GlobalWorkspace = None
-from .kg_relation_encoder import (
-    KGRelationEncoder,
-    CONCEPTNET_RELATIONS,
-)
 from .logic import (
     SoftLogicConstraints,
     pair_logits_to_matrix,
@@ -65,11 +60,7 @@ __all__ = [
     "ConceptBank",
     # GNN
     "SimpleGNN",
-    "KGAwareGNN",
-    "KGPathReasoner",
-    # KG Relation Encoder
-    "KGRelationEncoder",
-    "CONCEPTNET_RELATIONS",
+    "AttentionGNN",
     # Logic
     "SoftLogicConstraints",
     "pair_logits_to_matrix",

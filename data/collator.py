@@ -1,7 +1,7 @@
 """Data collator for batching cognitive dataset samples.
 
-Supports optional chat mode (with ChatTemplate) and KG tensor construction
-for ConceptNet-enriched samples.
+Supports optional chat mode (with ChatTemplate) and per-message trace
+annotations (flattened into encoder-input coordinates).
 """
 
 from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
@@ -9,7 +9,6 @@ import torch
 
 if TYPE_CHECKING:
     from .chat_template import ChatTemplate
-    from model.kg_relation_encoder import KGRelationEncoder
 
 
 class CognitiveCollator:
@@ -31,7 +30,6 @@ class CognitiveCollator:
         max_output_length: int = 256,
         chat_mode: bool = False,
         chat_template: Optional["ChatTemplate"] = None,
-        kg_relation_encoder: Optional["KGRelationEncoder"] = None,
         max_nodes: int = 32,
         vision_processor=None,
         entity_type_map: Optional[Dict[str, int]] = None,
@@ -49,8 +47,7 @@ class CognitiveCollator:
             max_output_length: Maximum output/response sequence length
             chat_mode: Whether to use chat message formatting
             chat_template: ChatTemplate instance (required if chat_mode=True)
-            kg_relation_encoder: KGRelationEncoder for building KG tensors
-            max_nodes: Maximum number of entity nodes (for KG tensor sizing)
+            max_nodes: Maximum number of entity nodes
             entity_type_map: Mapping from entity type names to indices
                 (1-indexed, 0 = none). Used when samples carry an
                 "entity_types" field (e.g. GLiNER2-curated data); falls back
@@ -66,7 +63,6 @@ class CognitiveCollator:
         self.max_output_length = max_output_length
         self.chat_mode = chat_mode
         self.chat_template = chat_template
-        self.kg_relation_encoder = kg_relation_encoder
         self.max_nodes = max_nodes
         self.vision_processor = vision_processor
         self.entity_type_map = entity_type_map or {}
@@ -115,7 +111,7 @@ class CognitiveCollator:
             return_tensors="pt",
         )
 
-        max_entities = max(len(x["entities"]) for x in batch) if batch else 1
+        max_entities = max((len(x.get("entities", [])) for x in batch), default=0) or 1
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
         entity_type_labels = torch.zeros(len(batch), max_entities, dtype=torch.long)
         concept_labels = torch.zeros(len(batch), max_entities, self.n_concepts, dtype=torch.float)
@@ -165,19 +161,6 @@ class CognitiveCollator:
         if decoder_input_ids is not None:
             result["decoder_input_ids"] = decoder_input_ids
             result["decoder_labels"] = decoder_labels
-
-        # KG tensor construction (optional, when samples have kg_relations)
-        kg_result = self._process_kg_data(batch)
-        result.update(kg_result)
-
-        # Entity names for path reasoning
-        entity_names = [sample.get("entities", []) for sample in batch]
-        result["entity_names"] = entity_names
-
-        # KG paths (pre-computed, optional)
-        kg_paths = [sample.get("kg_paths", []) for sample in batch]
-        if any(len(p) > 0 for p in kg_paths):
-            result["kg_paths"] = kg_paths
 
         # Vision: process images if vision_processor is available
         if self.vision_processor is not None:
@@ -385,38 +368,6 @@ class CognitiveCollator:
                 decoder_labels[i, 0] = eos_token_id
 
         return decoder_input_ids, decoder_labels
-
-    def _process_kg_data(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
-        """Build KG relation and adjacency tensors from sample kg_relations fields.
-
-        Returns a dict with optional keys:
-            kg_relation_ids: (B, N, N) long tensor of relation type indices
-            kg_adjacency: (B, N, N) float tensor binary mask for KG edges
-        """
-        has_kg = any("kg_relations" in sample for sample in batch)
-        if not has_kg or self.kg_relation_encoder is None:
-            return {}
-
-        B = len(batch)
-        N = self.max_nodes
-        kg_relation_ids = torch.zeros(B, N, N, dtype=torch.long)
-        kg_adjacency = torch.zeros(B, N, N, dtype=torch.float)
-
-        for i, sample in enumerate(batch):
-            for rel_triplet in sample.get("kg_relations", []):
-                if len(rel_triplet) != 3:
-                    continue
-                head_idx, tail_idx, rel_str = rel_triplet
-                if isinstance(head_idx, int) and isinstance(tail_idx, int):
-                    if head_idx < N and tail_idx < N:
-                        rel_id = self.kg_relation_encoder.encode_relation(rel_str)
-                        kg_relation_ids[i, head_idx, tail_idx] = rel_id
-                        kg_adjacency[i, head_idx, tail_idx] = 1.0
-
-        return {
-            "kg_relation_ids": kg_relation_ids,
-            "kg_adjacency": kg_adjacency,
-        }
 
     def _process_entities(
         self, 

@@ -310,7 +310,11 @@ class ToyCognitiveDataset(Dataset):
         """
         processed_data = []
         for entry in self.data:
-            if entry.get("should_respond", 0) == 1:
+            if "messages" in entry:
+                # Trace/chat samples carry their own conversation structure
+                # and (optionally) per-message annotations — use as-is.
+                processed_data.append(entry)
+            elif entry.get("should_respond", 0) == 1:
                 text = entry["text"]
                 
                 if self._is_question(text):

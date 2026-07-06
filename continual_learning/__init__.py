@@ -6,7 +6,7 @@ This module provides comprehensive support for online/continual learning:
 - Episodic memory and experience replay
 - Regularization to prevent catastrophic forgetting (EWC, SI, LwF)
 - Safety filtering to prevent learning harmful content
-- Symbolic component updates (concepts, rules, KG)
+- Symbolic component updates (concepts, rules)
 
 Main classes:
 - ContinuousLearner: Main orchestrator for continual learning
@@ -68,7 +68,6 @@ from .symbolic_updates import (
     SymbolicUpdateManager,
     ConceptBankUpdater,
     SoftLogicRuleUpdater,
-    KnowledgeGraphUpdater,
     ConceptUpdate,
     RuleUpdate,
 )
@@ -130,7 +129,6 @@ __all__ = [
     "SymbolicUpdateManager",
     "ConceptBankUpdater",
     "SoftLogicRuleUpdater",
-    "KnowledgeGraphUpdater",
     "ConceptUpdate",
     "RuleUpdate",
     

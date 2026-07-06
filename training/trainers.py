@@ -106,10 +106,6 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
                 batch["attention_mask"],
                 spans=None,
                 y_ids=None,
-                entity_names=batch.get("entity_names"),
-                kg_paths=batch.get("kg_paths"),
-                kg_relation_ids=batch.get("kg_relation_ids"),
-                kg_adjacency=batch.get("kg_adjacency"),
             )
 
             enc = out.get("enc")
@@ -287,10 +283,6 @@ class Stage3_Decoder_Trainer(BaseTrainer):
                 batch["attention_mask"],
                 spans=None,
                 y_ids=decoder_input_ids,
-                entity_names=batch.get("entity_names"),
-                kg_paths=batch.get("kg_paths"),
-                kg_relation_ids=batch.get("kg_relation_ids"),
-                kg_adjacency=batch.get("kg_adjacency"),
             )
 
             logits = out["logits"]
@@ -365,10 +357,6 @@ class Stage4_Joint_Trainer(BaseTrainer):
                 batch["attention_mask"],
                 spans=None,
                 y_ids=decoder_input_ids,
-                entity_names=batch.get("entity_names"),
-                kg_paths=batch.get("kg_paths"),
-                kg_relation_ids=batch.get("kg_relation_ids"),
-                kg_adjacency=batch.get("kg_adjacency"),
             )
 
             # Entity loss

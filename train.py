@@ -41,7 +41,6 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from config import ModelConfig, MODEL_PRESETS
 from model import NeuroSymbolicLM
-from model.kg_relation_encoder import KGRelationEncoder
 from data.collator import CognitiveCollator
 from data.chat_template import ChatTemplate
 from data.dataset import ToyCognitiveDataset
@@ -120,19 +119,10 @@ def parse_args():
                             default="You are a helpful assistant.",
                             help="Default system prompt for chat mode")
 
-    # Knowledge graph
-    kg_group = parser.add_argument_group("Knowledge Graph")
-    kg_group.add_argument("--use-kg", action="store_true",
-                         help="Enable KG integration with ConceptNet")
-    kg_group.add_argument("--kg-embeddings", type=str, default=None,
-                         help="Path to ConceptNet Numberbatch embeddings")
-    kg_group.add_argument("--kg-triples", type=str, default=None,
-                         help="Path to ConceptNet triples JSONL")
-    
     # Hardware
     hw_group = parser.add_argument_group("Hardware")
-    hw_group.add_argument("--device", type=str, default="cuda",
-                         help="Device (cuda/cpu)")
+    hw_group.add_argument("--device", type=str, default="auto",
+                         help="Device (auto/cuda/mps/cpu; auto picks cuda > mps > cpu)")
     hw_group.add_argument("--no-amp", action="store_true",
                          help="Disable mixed precision training")
     hw_group.add_argument("--num-workers", type=int, default=2,
@@ -205,19 +195,25 @@ def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict
     concepts = set()
     relations = set()
     entity_types = set()
-    
-    for sample in dataset:
-        for concept_list in sample.get("concepts", []):
+
+    def harvest(record: Dict):
+        for concept_list in record.get("concepts", []):
             if isinstance(concept_list, list):
                 concepts.update(concept_list)
                 entity_types.update(concept_list)
             else:
                 concepts.add(concept_list)
                 entity_types.add(concept_list)
-        
-        for rel in sample.get("relations", []):
+
+        for rel in record.get("relations", []):
             if len(rel) >= 3:
                 relations.add(rel[2])
+
+    for sample in dataset:
+        harvest(sample)
+        # Trace samples carry their labels per message
+        for ann in sample.get("message_annotations", []):
+            harvest(ann)
     
     # Build maps (1-indexed, 0 is padding/unknown)
     concept_map = {c: i + 1 for i, c in enumerate(sorted(concepts))}
@@ -230,6 +226,26 @@ def extract_vocab_from_dataset(dataset: ToyCognitiveDataset) -> Tuple[Dict, Dict
     n_concepts = max(256, len(concepts) + 50)
 
     return concept_map, relation_map, entity_type_map, n_entity_types, n_relations, n_concepts
+
+
+def resolve_device(requested: str = "auto") -> str:
+    """Resolve a device string, preferring cuda > mps > cpu.
+
+    Accepts "auto" or an explicit device; explicit requests that are not
+    available fall back (with a message) instead of crashing.
+    """
+    has_cuda = torch.cuda.is_available()
+    has_mps = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
+
+    if requested in (None, "", "auto"):
+        return "cuda" if has_cuda else ("mps" if has_mps else "cpu")
+    if requested == "cuda" and not has_cuda:
+        print("CUDA not available, " + ("using MPS" if has_mps else "using CPU"))
+        return "mps" if has_mps else "cpu"
+    if requested == "mps" and not has_mps:
+        print("MPS not available, using CPU")
+        return "cpu"
+    return requested
 
 
 def load_vocab_file(dataset_path: Path) -> Optional[Dict]:
@@ -280,9 +296,9 @@ def create_dataloader(
     include_responses: bool,
     chat_mode: bool = False,
     chat_template: Optional[ChatTemplate] = None,
-    kg_relation_encoder: Optional[KGRelationEncoder] = None,
     vision_processor=None,
     entity_type_name_map: Optional[Dict] = None,
+    pin_memory: bool = True,
 ) -> DataLoader:
     """Create dataloader with collator."""
     collator = CognitiveCollator(
@@ -295,7 +311,6 @@ def create_dataloader(
         max_output_length=model_config.max_output_length,
         chat_mode=chat_mode,
         chat_template=chat_template,
-        kg_relation_encoder=kg_relation_encoder,
         max_nodes=model_config.max_nodes,
         vision_processor=vision_processor,
         entity_type_map=entity_type_name_map,
@@ -307,7 +322,7 @@ def create_dataloader(
         shuffle=True,
         num_workers=num_workers,
         collate_fn=collator,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=len(dataset) > batch_size
     )
 
@@ -567,14 +582,14 @@ def main():
     print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Preset: {args.preset}")
     
-    # Check device
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
-        args.device = "cpu"
-    
+    # Resolve device (auto: cuda > mps > cpu)
+    args.device = resolve_device(args.device)
+
     if args.device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    elif args.device == "mps":
+        print("Using Apple Metal Performance Shaders (MPS)")
     
     # Prepare data if requested
     if args.prepare_data:
@@ -669,9 +684,6 @@ def main():
     print(f"  Relations: {len(relation_map)} -> capacity {n_relations}")
     print(f"  Concepts: {len(concept_map)} -> capacity {n_concepts}")
     
-    # Determine if KG-aware GNN should be used
-    use_kg_gnn = args.use_kg
-
     # Create model
     print(f"\nCreating model...")
     model = NeuroSymbolicLM(
@@ -685,9 +697,6 @@ def main():
         gradient_checkpointing=model_config.gradient_checkpointing,
         max_input_length=model_config.max_input_length,
         max_output_length=model_config.max_output_length,
-        use_kg_gnn=use_kg_gnn,
-        kg_embed_dim=model_config.kg_embed_dim,
-        use_path_reasoning=model_config.use_path_reasoning,
         use_soft_entity_selection=model_config.use_soft_entity_selection,
         entity_selection_initial_temp=model_config.entity_selection_initial_temp,
         entity_selection_min_temp=model_config.entity_selection_min_temp,
@@ -718,27 +727,6 @@ def main():
         checkpoint = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
-    # Load KG embeddings if requested
-    kg_relation_encoder = model.kg_relation_encoder  # May be None
-    if args.use_kg:
-        print("\nInitializing KG integration...")
-        if args.kg_embeddings and Path(args.kg_embeddings).exists():
-            from kg_utils import KGEmbeddingLoader
-            kg_loader = KGEmbeddingLoader(kg_type="conceptnet")
-            kg_dim = kg_loader.load_conceptnet_embeddings(args.kg_embeddings)
-            # Convert to torch tensors for the model
-            entity_embeddings = {
-                k: torch.tensor(v, dtype=torch.float32)
-                for k, v in kg_loader.entity_embeddings.items()
-            }
-            # Relation embeddings from Numberbatch don't exist separately —
-            # the KGRelationEncoder learns them. But path reasoner needs
-            # entity embeddings.
-            model.set_kg_embeddings(entity_embeddings, {})
-            print(f"  Loaded {len(entity_embeddings)} entity embeddings (dim={kg_dim})")
-        else:
-            print("  Warning: --use-kg specified but no --kg-embeddings path (or file missing)")
-
     model = model.to(args.device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -749,6 +737,7 @@ def main():
     logger = TrainingLogger(log_dir=args.log_dir, experiment_name=f"unified_{timestamp}")
     checkpoint_manager = CheckpointManager(save_dir=args.output_dir, max_checkpoints=5)
 
+    # AMP uses GradScaler, which only supports CUDA; on MPS/CPU run fp32
     use_amp = not args.no_amp and args.device == "cuda"
     print(f"  Mixed precision (AMP): {use_amp}")
 
@@ -775,9 +764,9 @@ def main():
                 train_dataset, tokenizer, concept_map, relation_map, entity_type_map,
                 model_config, args.batch_size, args.num_workers,
                 include_responses=False,
-                kg_relation_encoder=kg_relation_encoder,
-                vision_processor=vision_processor,
+                        vision_processor=vision_processor,
                 entity_type_name_map=entity_type_name_map,
+                pin_memory=(args.device == "cuda"),
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -828,9 +817,9 @@ def main():
                 decoder_dataset, tokenizer, concept_map, relation_map, entity_type_map,
                 model_config, args.batch_size, args.num_workers,
                 include_responses=True,
-                kg_relation_encoder=kg_relation_encoder,
-                vision_processor=vision_processor,
+                        vision_processor=vision_processor,
                 entity_type_name_map=entity_type_name_map,
+                pin_memory=(args.device == "cuda"),
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -870,9 +859,9 @@ def main():
                 joint_dataset, tokenizer, concept_map, relation_map, entity_type_map,
                 model_config, args.batch_size, args.num_workers,
                 include_responses=True,
-                kg_relation_encoder=kg_relation_encoder,
-                vision_processor=vision_processor,
+                        vision_processor=vision_processor,
                 entity_type_name_map=entity_type_name_map,
+                pin_memory=(args.device == "cuda"),
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -914,11 +903,12 @@ def main():
             print(f"  No chat dataset specified, using primary dataset ({len(chat_dataset)} samples)")
             print("  Tip: Use --chat-dataset for dedicated chat data")
 
-        # Merge vocab from chat dataset
+        # Merge vocab from chat dataset (append-only: never reassign
+        # indices already claimed by the primary vocab)
         c_chat, r_chat, et_chat, _, _, _ = extract_vocab_from_dataset(chat_dataset)
-        concept_map.update(c_chat)
-        relation_map.update(r_chat)
-        entity_type_map.update(et_chat)
+        merge_new_labels(concept_map, c_chat.keys())
+        merge_new_labels(relation_map, r_chat.keys())
+        merge_new_labels(entity_type_map, et_chat.keys())
 
         # Unfreeze all parameters for chat fine-tuning
         for p in model.parameters():
@@ -930,9 +920,9 @@ def main():
             include_responses=True,
             chat_mode=True,
             chat_template=chat_template,
-            kg_relation_encoder=kg_relation_encoder,
-            vision_processor=vision_processor,
+                vision_processor=vision_processor,
             entity_type_name_map=entity_type_name_map,
+            pin_memory=(args.device == "cuda"),
         )
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -975,7 +965,6 @@ def main():
             "n_entity_types": n_entity_types,
             "n_relations": n_relations,
             "n_concepts": n_concepts,
-            "use_kg_gnn": use_kg_gnn,
             "phase": args.phase,
         },
         "concept_map": concept_map,
