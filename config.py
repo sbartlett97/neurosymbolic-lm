@@ -170,6 +170,106 @@ MODEL_PRESETS = {
 
 
 @dataclass
+class CausalModelConfig:
+    """Configuration for the decoder-only NeuroSymbolicCausalLM.
+
+    See docs/DECODER_ONLY_MIGRATION.md. The symbolic heads read a tapped
+    mid-layer of the backbone through a small bidirectional extraction
+    adapter; GNN node features are injected back as gated soft tokens
+    between prompt and response.
+    """
+
+    # Backbone
+    model_name: str = "Qwen/Qwen3-0.6B-Base"
+
+    # Where the heads read from: fraction of decoder depth (0 < r <= 1)
+    tap_layer_ratio: float = 0.66
+
+    # Bidirectional extraction adapter over tapped prompt states
+    # (0 layers = pure-causal baseline for the bidirectionality ablation)
+    adapter_layers: int = 1
+    adapter_heads: int = 4
+    adapter_ff_mult: int = 4
+
+    # Symbolic head budgets (match the taxonomy, same as ModelConfig)
+    n_entity_types: int = 24
+    n_relations: int = 128
+    n_concepts: int = 1024
+    concept_dim: int = 256
+    node_dim: int = 256
+    max_nodes: int = 16  # == number of injected soft tokens
+    dropout: float = 0.1
+
+    # Soft-token injection
+    injection_gate_init: float = 0.1
+
+    # Context lengths
+    max_input_length: int = 2048
+    max_output_length: int = 512
+
+    # Memory efficiency
+    gradient_checkpointing: bool = True
+
+    # LoRA (stage 2/3 on backbones too large for full fine-tuning)
+    use_lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+
+    @classmethod
+    def for_qwen3_0_6b(cls) -> "CausalModelConfig":
+        return cls(model_name="Qwen/Qwen3-0.6B-Base")
+
+    @classmethod
+    def for_qwen3_1_7b(cls) -> "CausalModelConfig":
+        return cls(model_name="Qwen/Qwen3-1.7B-Base", gradient_checkpointing=True)
+
+    @classmethod
+    def for_gemma3_1b(cls) -> "CausalModelConfig":
+        return cls(model_name="google/gemma-3-1b-pt")
+
+    @classmethod
+    def for_llama32_1b(cls) -> "CausalModelConfig":
+        return cls(model_name="meta-llama/Llama-3.2-1B")
+
+    @classmethod
+    def for_qwen3_4b_lora(cls) -> "CausalModelConfig":
+        return cls(
+            model_name="Qwen/Qwen3-4B-Base",
+            use_lora=True,
+            max_input_length=4096,
+        )
+
+    @classmethod
+    def for_testing(cls) -> "CausalModelConfig":
+        """Tiny offline backbone built from config — no downloads needed."""
+        return cls(
+            model_name="__tiny__",
+            n_entity_types=8,
+            n_relations=32,
+            n_concepts=64,
+            concept_dim=32,
+            node_dim=32,
+            max_nodes=4,
+            adapter_layers=1,
+            adapter_heads=2,
+            max_input_length=128,
+            max_output_length=64,
+            gradient_checkpointing=False,
+        )
+
+
+CAUSAL_MODEL_PRESETS = {
+    "qwen3-0.6b": CausalModelConfig.for_qwen3_0_6b,
+    "qwen3-1.7b": CausalModelConfig.for_qwen3_1_7b,
+    "qwen3-4b-lora": CausalModelConfig.for_qwen3_4b_lora,
+    "gemma3-1b": CausalModelConfig.for_gemma3_1b,
+    "llama3.2-1b": CausalModelConfig.for_llama32_1b,
+    "causal-testing": CausalModelConfig.for_testing,
+}
+
+
+@dataclass
 class TrainingConfig:
     """Configuration for training."""
 

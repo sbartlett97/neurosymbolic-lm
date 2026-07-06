@@ -44,6 +44,9 @@ from .neurosymbolic import (
     NeuroSymbolicLM,
     compute_losses,
 )
+from .extraction_adapter import ExtractionAdapter
+from .injection import NodePrefixInjector
+from .neurosymbolic_causal import NeuroSymbolicCausalLM, build_tiny_backbone
 
 __all__ = [
     # Encoders
@@ -74,4 +77,9 @@ __all__ = [
     # Main model
     "NeuroSymbolicLM",
     "compute_losses",
+    # Decoder-only variant
+    "NeuroSymbolicCausalLM",
+    "ExtractionAdapter",
+    "NodePrefixInjector",
+    "build_tiny_backbone",
 ]

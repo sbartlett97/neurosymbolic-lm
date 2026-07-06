@@ -102,6 +102,17 @@ Create custom training data with the Streamlit labelling interface:
 streamlit run labelling_app.py
 ```
 
+### Decoder-Only Variant
+
+A decoder-only version of the architecture (Qwen3/Gemma3/Llama3.2
+backbones, symbolic heads on a tapped mid-layer, GNN nodes injected as
+gated soft tokens) lives in `model/neurosymbolic_causal.py` and trains via
+`train_causal.py`. See `docs/DECODER_ONLY_MIGRATION.md`.
+
+```bash
+python train_causal.py --preset qwen3-0.6b --dataset data/curated/curated.jsonl
+```
+
 ## Training Stages
 
 Training follows a three-stage curriculum:

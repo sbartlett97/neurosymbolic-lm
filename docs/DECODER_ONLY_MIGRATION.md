@@ -1,7 +1,10 @@
 # Migration Plan: Decoder-Only Backbone with Bolted-On Symbolic Modules
 
-Status: **planned** (mechanics validated against transformers 5.13 — see
-"Validated assumptions" at the end).
+Status: **Phases 0–2 implemented and offline-tested** (see
+`model/neurosymbolic_causal.py`, `data/collator_causal.py`,
+`train_causal.py`, `tests/test_causal_model.py`). Remaining: Phase 1/2
+quality gates on real checkpoints + GPU, Phase 3 trace training runs,
+Phase 4 parity + CL verification.
 
 ## Goal
 
