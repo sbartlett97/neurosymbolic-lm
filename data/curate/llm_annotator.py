@@ -584,9 +584,11 @@ class OpenAIBackend(APIBackend):
             ) from e
         return openai.OpenAI(api_key=api_key, max_retries=0, timeout=self.timeout)
 
-    def _complete(
+    def build_request(
         self, prompt: str, system: Optional[str], json_schema: Optional[Dict[str, Any]]
-    ) -> str:
+    ) -> Dict[str, Any]:
+        """Chat Completions request body. The Batch API sends the same body
+        (data/curate_qa_batch.py), so the sync smoke run tests it too."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -605,7 +607,14 @@ class OpenAIBackend(APIBackend):
             }
         else:
             kwargs["response_format"] = {"type": "json_object"}
-        response = self.client.chat.completions.create(**kwargs)
+        return kwargs
+
+    def _complete(
+        self, prompt: str, system: Optional[str], json_schema: Optional[Dict[str, Any]]
+    ) -> str:
+        response = self.client.chat.completions.create(
+            **self.build_request(prompt, system, json_schema)
+        )
         choice = response.choices[0]
         if choice.finish_reason == "length":
             raise ValueError("finish_reason=length")

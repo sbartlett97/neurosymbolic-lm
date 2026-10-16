@@ -261,6 +261,24 @@ def parse_args() -> argparse.Namespace:
         help="Minimum document length (default: 100)",
     )
     parser.add_argument(
+        "--hub-repo",
+        type=str,
+        default=None,
+        help="Push outputs to this private HF dataset repo (token: HF_TOKEN)",
+    )
+    parser.add_argument(
+        "--hub-path",
+        type=str,
+        default=None,
+        help="Folder in the hub repo (default: the output dir name)",
+    )
+    parser.add_argument(
+        "--hub-every",
+        type=int,
+        default=2000,
+        help="Push a snapshot every N samples, at a checkpoint (default: 2000)",
+    )
+    parser.add_argument(
         "--max-entities",
         type=int,
         default=128,
@@ -356,6 +374,9 @@ def create_config(args: argparse.Namespace) -> CurationConfig:
         max_entities=args.max_entities,
         checkpoint_every=args.checkpoint_every,
         resume_from=args.resume_from,
+        hub_repo=args.hub_repo,
+        hub_path=args.hub_path,
+        hub_every=args.hub_every,
         enable_safety_filter=args.enable_safety_filter,
         safety_strictness=args.safety_strictness,
         seed=args.seed,
@@ -419,6 +440,23 @@ def run_curation(config: CurationConfig, verbose: bool = False):
         except FileExistsError as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    # Hub snapshots: the train/val JSONL, vocab and checkpoint of one
+    # checkpoint go in one commit, so a new pod can resume from them
+    hub_repo, hub_every = config.hub_repo, config.hub_every
+    last_push = writer.state.samples_written
+    hub_dir = config.hub_path or Path(config.output_dir).name
+
+    def push_snapshot(required: bool):
+        from data.curate.hub import push_files
+
+        files = {
+            f"{hub_dir}/{p.name}": p
+            for p in (writer.output_path, writer.val_path,
+                      writer.vocab_path, writer.checkpoint_path)
+        }
+        push_files(hub_repo, files, repo_type="dataset", required=required,
+                   message=f"{hub_dir}: {writer.state.samples_written} samples")
 
     # Initialize components
     print("\nInitializing components...")
@@ -581,7 +619,10 @@ def run_curation(config: CurationConfig, verbose: bool = False):
 
         # Checkpoint only between batches, so the source offsets match
         # the rows on disk
-        writer.maybe_checkpoint(loader.get_offsets())
+        if writer.maybe_checkpoint(loader.get_offsets()) and hub_repo:
+            if writer.state.samples_written - last_push >= hub_every:
+                push_snapshot(required=False)
+                last_push = writer.state.samples_written
 
         batch_count += 1
 
@@ -601,6 +642,9 @@ def run_curation(config: CurationConfig, verbose: bool = False):
     # Finalize
     writer.state.source_offsets = loader.get_offsets()
     writer.finalize()
+    if hub_repo:
+        # The pod is temporary: the final snapshot must reach the hub
+        push_snapshot(required=True)
 
     # Print final statistics
     print("\n" + "=" * 60)

@@ -106,6 +106,10 @@ class CurationConfig:
     # Checkpointing
     checkpoint_every: int = 1000
     resume_from: Optional[str] = None
+    # Private HF dataset repo for snapshots (None = no push)
+    hub_repo: Optional[str] = None
+    hub_path: Optional[str] = None
+    hub_every: int = 2000
 
     # Quality control
     min_entity_span_ratio: float = 0.5  # Min ratio of valid entity spans

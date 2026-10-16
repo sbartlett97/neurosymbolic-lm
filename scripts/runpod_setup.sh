@@ -25,6 +25,9 @@ export PIP_CACHE_DIR=$WS/pip-cache
 export UV_CACHE_DIR=$WS/uv-cache
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# API keys and HF_TOKEN: sourced from the repo's .env (copied over SSH,
+# gitignored). The values are never written into this file.
+if [ -f "$REPO_DIR/.env" ]; then set -a; . "$REPO_DIR/.env"; set +a; fi
 EOF
 # shellcheck disable=SC1090
 . "$ENV_FILE"

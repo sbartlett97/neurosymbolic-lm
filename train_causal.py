@@ -157,6 +157,12 @@ def parse_args(argv=None):
                            help="Checkpoint to start from. Its config and label "
                                 "maps are used; pick the remaining --stages.")
     out_group.add_argument("--log-dir", type=str, default="runs")
+    out_group.add_argument("--hub-repo", type=str, default=None,
+                           help="Push stage checkpoints, the final model and the "
+                                "tokenizer to this private HF model repo "
+                                "(token: HF_TOKEN). latest.pt stays local")
+    out_group.add_argument("--hub-path", type=str, default=None,
+                           help="Folder in the hub repo (default: the output dir name)")
     out_group.add_argument("--log-every", type=int, default=50,
                            help="Print train loss every N steps")
     out_group.add_argument("--debug", action="store_true",
@@ -823,9 +829,22 @@ def main(argv=None):
     if is_main_process():
         tokenizer.save_pretrained(out_dir / "tokenizer")
 
+    hub_dir = args.hub_path or out_dir.name
+
     def save_fn(filename, extra):
         if is_main_process():
             save_causal_checkpoint(out_dir / filename, model, config, maps, extra)
+            if args.hub_repo and filename != "latest.pt":
+                from data.curate.hub import push_files
+
+                files = {f"{hub_dir}/{filename}": out_dir / filename}
+                for f in sorted((out_dir / "tokenizer").iterdir()):
+                    files[f"{hub_dir}/tokenizer/{f.name}"] = f
+                # The final model must reach the hub; a failed stage
+                # push is retried with the next one
+                push_files(args.hub_repo, files, repo_type="model",
+                           message=f"{hub_dir}: {filename}",
+                           required=filename == "final_causal_model.pt")
         if dist.is_initialized():
             dist.barrier()
 

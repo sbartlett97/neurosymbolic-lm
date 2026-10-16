@@ -79,6 +79,23 @@ def select_device(requested: Optional[str] = None) -> str:
     return "cpu"
 
 
+def parse_qa_reply(response: Optional[str]) -> Tuple[Optional[Tuple[str, str]], str]:
+    """Parse a QA JSON reply into (question, answer).
+
+    Returns ((question, answer), "") or (None, error text).
+    """
+    try:
+        match = re.search(r"\{[\s\S]*\}", response or "")
+        parsed = json.loads(match.group() if match else response)
+        question = str(parsed.get("question", "")).strip()
+        answer = str(parsed.get("answer", "")).strip()
+        if question and answer:
+            return (question, answer), ""
+        return None, "empty question or answer"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def normalize_surface(text: str) -> str:
     """Normalized surface form: lower case, single spaces."""
     return " ".join(text.lower().split())
@@ -687,17 +704,10 @@ class GLiNER2Annotator:
 
     def _parse_qa_response(self, response: Optional[str]) -> Optional[Tuple[str, str]]:
         """Parse one QA reply. Count it as generated or failed."""
-        error = "empty question or answer"
-        try:
-            match = re.search(r"\{[\s\S]*\}", response or "")
-            parsed = json.loads(match.group() if match else response)
-            question = str(parsed.get("question", "")).strip()
-            answer = str(parsed.get("answer", "")).strip()
-            if question and answer:
-                self._stats["qa_generated"] += 1
-                return question, answer
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
+        qa, error = parse_qa_reply(response)
+        if qa is not None:
+            self._stats["qa_generated"] += 1
+            return qa
         self._stats["qa_failed"] += 1
         if self._stats["qa_failed"] <= _QA_FAILURE_LOG_LIMIT:
             preview = (response or "")[:200].replace("\n", "\\n")

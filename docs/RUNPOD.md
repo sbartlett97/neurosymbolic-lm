@@ -38,7 +38,8 @@ is cut, and its entities are dropped from the labels.
 cd /workspace
 git clone <your-repo-url> neurosymbolic-lm
 cd neurosymbolic-lm
-export HF_TOKEN=hf_...          # needed for Llama / Gemma; optional for Qwen
+# From your machine, copy the keys file (HF_TOKEN, OPENAI_API_KEY, ...):
+#   scp -P <port> -i ~/.ssh/<key> .env root@<pod-ip>:/workspace/neurosymbolic-lm/.env
 bash scripts/runpod_setup.sh    # add WITH_VLLM=1 for hybrid QA curation
 . /workspace/neurosym.env && . /workspace/venv-train/bin/activate
 ```
@@ -90,6 +91,35 @@ python data/curate_dataset.py --annotator gliner \
     --sources allenai/c4 wikipedia --source-ratios 0.6 0.4 \
     --target-samples 50000 --output-dir /workspace/data/curated
 ```
+
+**Push outputs to a private Hugging Face repo.** Pods are temporary.
+`--hub-repo user/name` pushes the train/val JSONL, the vocab and the
+checkpoint in one commit every `--hub-every` samples (default 2000), and
+again at the end. If a pod dies, resume on a new pod:
+
+```bash
+hf download user/name --repo-type dataset --include "curated/*" --local-dir /workspace/data
+python data/curate_dataset.py ... --output-dir /workspace/data/curated \
+    --resume-from /workspace/data/curated/curated_checkpoint.json --hub-repo user/name
+```
+
+**4b'. QA through the OpenAI Batch API (recommended: 50% of the API
+price, no GPU).** It reads a finished GLiNER2 corpus, so it can run from
+your laptop after the pod is gone:
+
+```bash
+python data/curate_qa_batch.py prepare --corpus /workspace/data/curated/curated.jsonl \
+    --out-dir /workspace/data/curated_qa --qa-docs 20000 --should-respond-ratio 0.7
+python data/curate_qa_batch.py run --out-dir /workspace/data/curated_qa
+```
+
+- Pilot first: `prepare ... --qa-docs 30`, then `run`. Check the
+  failure reasons it prints (for example `finish_reason=length`: raise
+  `--max-tokens`).
+- `run` polls every 5 minutes. A batch takes up to 24 hours. All state
+  is in `batch_state.json`, so you can stop and run it again.
+- A failed QA request is dropped; it never becomes an abstain row. Rows
+  keep the train/val split of their corpus document.
 
 **4b. Stage-2/3 QA data (GLiNER2 + vLLM). Use the vLLM environment:**
 
@@ -220,8 +250,12 @@ python train_causal.py --preset qwen3-0.6b \
     --chat-dataset /workspace/data/traces/traces.jsonl --phase both \
     --epochs 3 --batch-size 8 \
     --output-dir /workspace/checkpoints/q06b --log-dir /workspace/runs \
+    --hub-repo user/neurosymbolic-causal-lm \
     2>&1 | tee /workspace/logs/train_q06b.log
 ```
+
+`--hub-repo` pushes each `stage_*.pt`, the final model and the tokenizer to
+the private model repo. `latest.pt` stays on the pod.
 
 - Stage 1 trains only the adapter and heads at `--symbolic-lr`. Stage 2
   trains at `--lr`×0.5, joint at `--lr`×0.1, chat at `--chat-lr`.
