@@ -53,12 +53,20 @@ assert (major, minor) >= (2, 6), \
 print(torch.__version__)
 EOF
 )
+# A venv from an earlier run with a different torch is rebuilt
+if [ -x "$VENV/bin/python" ] && \
+   [ "$("$VENV/bin/python" -c 'import torch; print(torch.__version__)' 2>/dev/null)" != "$SYS_TORCH" ]; then
+  rm -rf "$VENV"
+fi
 if [ ! -x "$VENV/bin/python" ]; then
   # --system-site-packages: inherit the template torch instead of
-  # downloading another multi-GB build
-  uv venv --system-site-packages "$VENV"
+  # downloading another multi-GB build. --seed adds pip.
+  uv venv --system-site-packages --seed "$VENV"
 fi
-uv pip install --python "$VENV/bin/python" -r "$REPO_DIR/requirements.txt"
+# pip, not uv: uv does not count the inherited torch as installed and
+# pulls a new one. The constraint pins torch to the template build.
+echo "torch==$SYS_TORCH" > "$WS/torch-constraint.txt"
+"$VENV/bin/python" -m pip install -q -r "$REPO_DIR/requirements.txt" -c "$WS/torch-constraint.txt"
 
 # The venv must still use the template torch (a dependency that needs a
 # newer torch would silently install a second, possibly CPU-only, build)
