@@ -24,6 +24,11 @@ Each message is segmented into fenced code blocks and prose:
 
 Segment-relative spans are shifted back into message coordinates here; the
 collator later shifts message coordinates into encoder-input coordinates.
+
+``expand_trace`` turns one annotated conversation into one sample per
+assistant turn: the sample for turn i holds ``messages[:i+1]`` (so turn i is
+the last assistant message and the decoder target) and only the
+annotations of messages before i.
 """
 
 import re
@@ -61,6 +66,57 @@ def regex_artifact_matches(text: str) -> List[EntityMatch]:
                 EntityMatch(m.start(), m.start() + len(surface), surface, label, 1.0)
             )
     return matches
+
+
+def assistant_turns(messages: List[Dict[str, Any]]) -> List[int]:
+    """Indices of assistant messages with non-empty content."""
+    return [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "assistant" and (m.get("content") or "").strip()
+    ]
+
+
+def select_target_turns(messages: List[Dict[str, Any]], max_turns: int) -> List[int]:
+    """Pick at most ``max_turns`` assistant turns as decoder targets.
+
+    The pick is evenly spaced and always holds the first and the last turn.
+    The first turn is often the initial tool call (short prompt); the last
+    turn sees every tool result. Keeping only the first N would lose the
+    turns that read tool results; keeping only the last N would lose the
+    first call. Most glaive conversations have at most 8 assistant turns,
+    so the cap rarely applies.
+    """
+    turns = assistant_turns(messages)
+    if max_turns <= 0 or len(turns) <= max_turns:
+        return turns
+    if max_turns == 1:
+        return [turns[-1]]
+    step = (len(turns) - 1) / (max_turns - 1)
+    return [turns[round(k * step)] for k in range(max_turns)]
+
+
+def expand_trace(
+    sample: Dict[str, Any], target_turns: List[int]
+) -> List[Dict[str, Any]]:
+    """Make one training sample per target assistant turn.
+
+    ``sample`` comes from TraceAnnotator.annotate_trace, so its annotations
+    cover every message except the final assistant turn. Each output keeps
+    only the annotations of messages before its target.
+    """
+    messages = sample["messages"]
+    out = []
+    for i in target_turns:
+        response = (messages[i].get("content") or "").strip()
+        out.append({
+            "messages": messages[: i + 1],
+            "message_annotations": [
+                a for a in sample["message_annotations"] if a["message_idx"] < i
+            ],
+            "should_respond": 1 if response else 0,
+            "response": response,
+        })
+    return out
 
 
 class TraceAnnotator:

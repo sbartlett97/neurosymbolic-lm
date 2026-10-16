@@ -94,14 +94,6 @@ python data/curate_traces.py --source glaiveai/glaive-function-calling-v2
 
 See `DATASET_FORMAT.md` for the output schema and per-stage usage.
 
-### Data Labelling
-
-Create custom training data with the Streamlit labelling interface:
-
-```bash
-streamlit run labelling_app.py
-```
-
 ### Decoder-Only Variant
 
 A decoder-only version of the architecture (Qwen3/Gemma3/Llama3.2
@@ -112,6 +104,20 @@ gated soft tokens) lives in `model/neurosymbolic_causal.py` and trains via
 ```bash
 python train_causal.py --preset qwen3-0.6b --dataset data/curated/curated.jsonl
 ```
+
+Presets: `qwen3-0.6b`, `qwen3-1.7b`, `qwen3-1.7b-lora`, `qwen3-4b-lora`,
+`gemma3-1b`, `llama3.2-1b`, and `causal-testing` (tiny random backbone with
+the real Qwen3 tokenizer, for smoke runs). Each stage reports a validation
+loss from `<dataset>_val.jsonl`, and writes `stage_<name>.pt` with the full
+config and label maps. Reload a checkpoint with
+`train_causal.load_causal_checkpoint`.
+
+### RunPod
+
+`docs/RUNPOD.md` is the runbook for dataset generation and training on a
+RunPod GPU pod. It covers GPU sizing per preset, setup
+(`scripts/runpod_setup.sh`), detached runs, the smoke test, and which log
+values to watch.
 
 ## Training Stages
 
@@ -153,7 +159,6 @@ Training data uses JSONL format. See `DATASET_FORMAT.md` for full specification.
 neurosymbolic_model/
     config.py                    # Model and training configurations
     train.py                     # Main training script
-    labelling_app.py             # Streamlit data labelling UI
     comprehensive_dataset.jsonl  # Example training data
     DATASET_FORMAT.md            # Dataset format specification
     

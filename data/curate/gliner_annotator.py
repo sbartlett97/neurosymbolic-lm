@@ -25,7 +25,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .llm_annotator import AnnotationResult, LLMBackend
-from .prompts import get_qa_prompt
+from .prompts import QA_JSON_SCHEMA, get_qa_prompt
 from .source_loader import DocumentSource
 from .taxonomy import (
     DEFAULT_GLINER_MODEL,
@@ -51,17 +51,58 @@ class EntityMatch:
 # Backwards-compatible private alias
 _EntityMatch = EntityMatch
 
+# Number of QA failures to log before going quiet
+_QA_FAILURE_LOG_LIMIT = 5
+# Fail fast: a failed QA document is written as a should_respond=0 row, so
+# a rejected request or schema would silently give an abstain-only "QA"
+# set. Stop when most of the first attempts fail.
+QA_FAIL_FAST_MIN_ATTEMPTS = 50
+QA_FAIL_FAST_RATE = 0.8
+
+# Coarse types for code and tool-use text. Corpus prose skips these labels.
+CODE_ENTITY_TYPES = frozenset({"code_construct", "digital_artifact"})
+
+
+def select_device(requested: Optional[str] = None) -> str:
+    """Pick a torch device: the requested one, else cuda > mps > cpu."""
+    if requested:
+        return requested
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def normalize_surface(text: str) -> str:
+    """Normalized surface form: lower case, single spaces."""
+    return " ".join(text.lower().split())
+
 
 def merge_entity_matches(
     matches: List[EntityMatch],
     taxonomy: Taxonomy,
     max_entities: int,
+    consistent_types: bool = True,
 ) -> Tuple[List[str], List[List[int]], List[List[str]], List[str]]:
     """Merge overlapping label matches into entities.
 
     Two matches referring to overlapping spans are the same entity seen
     through different labels: the labels become its concepts, and the
     best-scoring label's coarse parent becomes its entity type.
+
+    With ``consistent_types`` (the default), all mentions of one surface
+    form in the input get one coarse type. The type is the one with the
+    highest match score over all mentions of that surface form. Each
+    mention keeps its own span. Its concepts are the labels of that type
+    seen on the mention or on other mentions of the same surface form.
+    Labels of other types are dropped. If no label is left, the coarse
+    type name is the concept.
 
     Returns (entities, spans, concepts, entity_types), span end exclusive.
     """
@@ -82,6 +123,20 @@ def merge_entity_matches(
         if not placed:
             groups.append([m])
 
+    # Best score per coarse type and per label, for each surface form
+    type_votes: Dict[str, Dict[str, float]] = {}
+    surface_labels: Dict[str, Dict[str, float]] = {}
+    if consistent_types:
+        for m in matches:
+            coarse = taxonomy.coarse_type_of(m.label)
+            if coarse is None:
+                continue
+            key = normalize_surface(m.text)
+            votes = type_votes.setdefault(key, {})
+            votes[coarse] = max(votes.get(coarse, 0.0), m.score)
+            labels = surface_labels.setdefault(key, {})
+            labels[m.label] = max(labels.get(m.label, 0.0), m.score)
+
     # Rank groups by best score so truncation keeps confident entities
     groups.sort(key=lambda g: -max(x.score for x in g))
     groups = groups[:max_entities]
@@ -94,13 +149,30 @@ def merge_entity_matches(
         by_label: Dict[str, float] = {}
         for x in group:
             by_label[x.label] = max(by_label.get(x.label, 0.0), x.score)
+        entity_type = taxonomy.coarse_type_of(best.label) or "abstract_concept"
+
+        key = normalize_surface(best.text)
+        votes = type_votes.get(key)
+        if votes:
+            # Ties keep the type that was seen first
+            entity_type = max(votes.items(), key=lambda kv: kv[1])[0]
+            for lbl, score in surface_labels.get(key, {}).items():
+                by_label[lbl] = max(by_label.get(lbl, 0.0), score)
+            by_label = {
+                lbl: score
+                for lbl, score in by_label.items()
+                if taxonomy.coarse_type_of(lbl) == entity_type
+            }
+
         ranked = sorted(by_label.items(), key=lambda kv: -kv[1])
         group_concepts = [lbl for lbl, _ in ranked[:MAX_CONCEPTS_PER_ENTITY]]
+        if not group_concepts:
+            group_concepts = [entity_type]
 
         entities.append(best.text)
         spans.append([best.start, best.end])
         concepts.append(group_concepts)
-        entity_types.append(taxonomy.coarse_type_of(best.label) or "abstract_concept")
+        entity_types.append(entity_type)
 
     return entities, spans, concepts, entity_types
 
@@ -113,15 +185,26 @@ class GLiNER2Annotator:
         taxonomy: Label inventory; defaults to :func:`get_default_taxonomy`
         entity_threshold: Minimum confidence for entity matches
         relation_threshold: Minimum confidence for relation matches
-        device: torch device string, or None for auto
+        device: torch device string, or None for auto (cuda > mps > cpu)
         response_backend: Optional LLM backend used only to generate grounded
             question/answer pairs (hybrid mode). When None, all samples are
             emitted with ``should_respond=0`` (pure Stage-1 symbolic data).
         should_respond_ratio: Fraction of samples that get a QA pair appended
             (only used when ``response_backend`` is set)
+        max_len: Maximum word tokens GLiNER2 encodes per text. Longer
+            texts are cut by GLiNER2; spans stay valid because offsets are
+            character positions in the full text. None means no limit.
         extractor: Pre-constructed GLiNER2-compatible object (dependency
             injection for tests). Must expose ``extract_entities`` and
-            ``extract_relations``.
+            ``extract_relations``. ``annotate_batch`` also uses
+            ``batch_extract_entities``, ``batch_extract`` and
+            ``create_schema`` when the extractor has them.
+        include_code_labels: Score the code_construct and digital_artifact
+            labels. True (the default) keeps the old behavior for traces.
+            Set False for corpus prose, where these labels add wrong types.
+        batch_size: Texts per GLiNER2 forward pass in ``annotate_batch``.
+            None means 8 on CUDA and 1 elsewhere. On Apple MPS, passes of
+            more than one text were slower than one text at a time.
     """
 
     def __init__(
@@ -134,7 +217,10 @@ class GLiNER2Annotator:
         response_backend: Optional[LLMBackend] = None,
         should_respond_ratio: float = 0.5,
         max_entities: int = 24,
+        max_len: Optional[int] = None,
         extractor: Any = None,
+        include_code_labels: bool = True,
+        batch_size: Optional[int] = None,
     ):
         self.model_name = model_name
         self.taxonomy = taxonomy or get_default_taxonomy()
@@ -143,6 +229,9 @@ class GLiNER2Annotator:
         self.response_backend = response_backend
         self.should_respond_ratio = should_respond_ratio
         self.max_entities = max_entities
+        self.max_len = max_len
+        self.include_code_labels = include_code_labels
+        self.batch_size = batch_size or 8
 
         if extractor is not None:
             self.extractor = extractor
@@ -155,8 +244,18 @@ class GLiNER2Annotator:
                     "pip install 'gliner2[local]'"
                 ) from e
             self.extractor = GLiNER2.from_pretrained(model_name)
-            if device is not None:
+            device = select_device(device)
+            try:
                 self.extractor = self.extractor.to(device)
+            except Exception as e:
+                print(f"Could not move GLiNER2 to {device} ({e}); using cpu")
+                device = "cpu"
+                self.extractor = self.extractor.to(device)
+            print(f"GLiNER2 device: {device}")
+            if batch_size is None:
+                # 1 by default: on MPS, 8 texts per pass ran at 0.40 docs/s
+                # against 0.95 per document. Measure on the GPU before raising it.
+                self.batch_size = 1
             self.extractor.eval()
 
         self._stats = {
@@ -172,23 +271,57 @@ class GLiNER2Annotator:
     # Entity extraction
     # ------------------------------------------------------------------
 
+    def _entity_label_batches(self) -> List[Dict[str, str]]:
+        """Label batches to score, without code labels if they are off.
+
+        Only labels are taken out. The batches keep their other labels, so
+        the batches without code labels are the same as on the trace path.
+        """
+        batches = self.taxonomy.entity_label_batches()
+        if self.include_code_labels:
+            return batches
+        out = []
+        for batch in batches:
+            kept = {
+                name: desc
+                for name, desc in batch.items()
+                if self.taxonomy.coarse_type_of(name) not in CODE_ENTITY_TYPES
+            }
+            if kept:
+                out.append(kept)
+        return out
+
     def _extract_entity_matches(self, text: str) -> List[_EntityMatch]:
         """Run GLiNER2 over every label batch and collect raw matches."""
         matches: List[_EntityMatch] = []
-        for label_batch in self.taxonomy.entity_label_batches():
-            try:
-                raw = self.extractor.extract_entities(
-                    text,
-                    label_batch,
-                    include_confidence=True,
-                    include_spans=True,
-                    threshold=self.entity_threshold,
-                )
-            except TypeError:
-                # Older/newer API without some kwargs — retry minimally
-                raw = self.extractor.extract_entities(text, label_batch)
+        for label_batch in self._entity_label_batches():
+            raw = self._call_extractor(
+                self.extractor.extract_entities,
+                text,
+                label_batch,
+                include_confidence=True,
+                include_spans=True,
+                threshold=self.entity_threshold,
+            )
             matches.extend(self._normalize_entity_output(raw, text))
         return [m for m in matches if m.score >= self.entity_threshold]
+
+    def _call_extractor(self, fn, text: str, labels, **kwargs) -> Any:
+        """Call a GLiNER2 method, dropping kwargs the API does not accept.
+
+        The first try passes ``max_len`` when it is set. The second try
+        drops ``max_len``. The last try passes only text and labels.
+        """
+        if self.max_len is not None:
+            try:
+                return fn(text, labels, max_len=self.max_len, **kwargs)
+            except TypeError:
+                pass
+        try:
+            return fn(text, labels, **kwargs)
+        except TypeError:
+            # Older/newer API without some kwargs — retry minimally
+            return fn(text, list(labels))
 
     def _normalize_entity_output(self, raw: Any, text: str) -> List[_EntityMatch]:
         """Normalize GLiNER2 entity output shapes into _EntityMatch objects.
@@ -282,6 +415,92 @@ class GLiNER2Annotator:
         return entities, spans, concepts, entity_types, relations
 
     # ------------------------------------------------------------------
+    # Batched extraction (corpus path)
+    # ------------------------------------------------------------------
+
+    def _call_batch_extractor(self, fn, texts: List[str], labels, **kwargs) -> Any:
+        """Call a GLiNER2 batch method. Drop ``max_len`` if it is refused."""
+        kwargs.setdefault("batch_size", self.batch_size)
+        if self.max_len is not None:
+            try:
+                return fn(texts, labels, max_len=self.max_len, **kwargs)
+            except TypeError:
+                pass
+        return fn(texts, labels, **kwargs)
+
+    def _extract_entity_matches_batch(self, texts: List[str]) -> List[List[_EntityMatch]]:
+        """Entity matches for many texts, one GLiNER2 call per label batch.
+
+        Extractors without ``batch_extract_entities`` use the per-text path.
+        """
+        fn = getattr(self.extractor, "batch_extract_entities", None)
+        if fn is None:
+            return [self._extract_entity_matches(t) for t in texts]
+        per_text: List[List[_EntityMatch]] = [[] for _ in texts]
+        for label_batch in self._entity_label_batches():
+            raws = self._call_batch_extractor(
+                fn,
+                texts,
+                label_batch,
+                include_confidence=True,
+                include_spans=True,
+                threshold=self.entity_threshold,
+            )
+            for out, raw, text in zip(per_text, raws, texts):
+                out.extend(self._normalize_entity_output(raw, text))
+        return [[m for m in ms if m.score >= self.entity_threshold] for ms in per_text]
+
+    def _extract_relations_batch(
+        self,
+        texts: List[str],
+        entities_list: List[List[str]],
+        types_list: List[List[str]],
+        spans_list: List[List[List[int]]],
+    ) -> List[List[List[Any]]]:
+        """Relations for many texts.
+
+        Each text has its own candidate relations, because the candidates
+        depend on the entity types in that text. So each text gets its own
+        schema in one ``batch_extract`` call. Call k sends the k-th
+        relation batch of every text that has one. Extractors without
+        ``batch_extract`` use the per-text path.
+        """
+        fn = getattr(self.extractor, "batch_extract", None)
+        create_schema = getattr(self.extractor, "create_schema", None)
+        if fn is None or create_schema is None:
+            return [
+                self._extract_relations(t, e, ty, sp)
+                for t, e, ty, sp in zip(texts, entities_list, types_list, spans_list)
+            ]
+        candidates = [
+            self._candidate_relation_batches(e, ty)
+            for e, ty in zip(entities_list, types_list)
+        ]
+        raw_pairs: List[List[Dict[str, Any]]] = [[] for _ in texts]
+        rounds = max((len(batches) for _, batches in candidates), default=0)
+        for k in range(rounds):
+            idx = [i for i, (_, batches) in enumerate(candidates) if len(batches) > k]
+            schemas = [create_schema().relations(candidates[i][1][k]) for i in idx]
+            raws = self._call_batch_extractor(
+                fn,
+                [texts[i] for i in idx],
+                schemas,
+                threshold=self.relation_threshold,
+                include_confidence=True,
+                include_spans=True,
+            )
+            for i, raw in zip(idx, raws):
+                raw_pairs[i].extend(self._normalize_relation_output(raw))
+        return [
+            self._relations_from_pairs(
+                raw_pairs[i], entities_list[i], types_list[i], spans_list[i], candidates[i][0]
+            )
+            if candidates[i][0]
+            else []
+            for i in range(len(texts))
+        ]
+
+    # ------------------------------------------------------------------
     # Relation extraction
     # ------------------------------------------------------------------
 
@@ -303,18 +522,39 @@ class GLiNER2Annotator:
 
         raw_pairs: List[Dict[str, Any]] = []
         for rel_batch in self.taxonomy.relation_batches(candidate_rels):
-            try:
-                raw = self.extractor.extract_relations(
-                    text,
-                    rel_batch,
-                    threshold=self.relation_threshold,
-                    include_confidence=True,
-                    include_spans=True,
-                )
-            except TypeError:
-                raw = self.extractor.extract_relations(text, list(rel_batch))
+            raw = self._call_extractor(
+                self.extractor.extract_relations,
+                text,
+                rel_batch,
+                threshold=self.relation_threshold,
+                include_confidence=True,
+                include_spans=True,
+            )
             raw_pairs.extend(self._normalize_relation_output(raw))
+        return self._relations_from_pairs(
+            raw_pairs, entities, entity_types, spans, candidate_rels
+        )
 
+    def _candidate_relation_batches(
+        self, entities: List[str], entity_types: List[str]
+    ) -> Tuple[Dict[str, str], List[Dict[str, str]]]:
+        """Candidate relations for one text and their label batches."""
+        if len(entities) < 2:
+            return {}, []
+        candidate_rels = self.taxonomy.relations_for_types(set(entity_types))
+        if not candidate_rels:
+            return {}, []
+        return candidate_rels, self.taxonomy.relation_batches(candidate_rels)
+
+    def _relations_from_pairs(
+        self,
+        raw_pairs: List[Dict[str, Any]],
+        entities: List[str],
+        entity_types: List[str],
+        spans: Optional[List[List[int]]],
+        candidate_rels: Dict[str, str],
+    ) -> List[List[Any]]:
+        """Map normalized relation pairs to [head_idx, tail_idx, relation]."""
         relations: List[List[Any]] = []
         seen = set()
         for pair in raw_pairs:
@@ -445,67 +685,99 @@ class GLiNER2Annotator:
     # QA generation (hybrid mode)
     # ------------------------------------------------------------------
 
-    def _maybe_generate_qa(
-        self, text: str, entities: List[str], relations: List[List[Any]]
-    ) -> Optional[Tuple[str, str]]:
-        """Generate a grounded (question, answer) pair via the LLM backend."""
-        if self.response_backend is None:
-            return None
-        prompt = get_qa_prompt(text, entities, relations)
+    def _parse_qa_response(self, response: Optional[str]) -> Optional[Tuple[str, str]]:
+        """Parse one QA reply. Count it as generated or failed."""
+        error = "empty question or answer"
         try:
-            response = self.response_backend.generate_single(prompt)
-            match = re.search(r"\{[\s\S]*\}", response)
+            match = re.search(r"\{[\s\S]*\}", response or "")
             parsed = json.loads(match.group() if match else response)
             question = str(parsed.get("question", "")).strip()
             answer = str(parsed.get("answer", "")).strip()
             if question and answer:
                 self._stats["qa_generated"] += 1
                 return question, answer
-        except Exception:
-            pass
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
         self._stats["qa_failed"] += 1
+        if self._stats["qa_failed"] <= _QA_FAILURE_LOG_LIMIT:
+            preview = (response or "")[:200].replace("\n", "\\n")
+            print(f"QA generation failed ({error}). Output: {preview!r}")
         return None
 
-    # ------------------------------------------------------------------
-    # Public API (mirrors LLMAnnotator)
-    # ------------------------------------------------------------------
+    def _maybe_generate_qa(
+        self, text: str, entities: List[str], relations: List[List[Any]]
+    ) -> Optional[Tuple[str, str]]:
+        """Generate a grounded (question, answer) pair via the LLM backend."""
+        if self.response_backend is None:
+            return None
+        return self._generate_qa_batch([(text, entities, relations)])[0]
 
-    def annotate(
-        self, doc: DocumentSource, include_response: Optional[bool] = None
-    ) -> AnnotationResult:
-        """Annotate a single document."""
+    def _generate_qa_batch(
+        self, items: List[Tuple[str, List[str], List[List[Any]]]]
+    ) -> List[Optional[Tuple[str, str]]]:
+        """Generate QA pairs for many texts with one backend call.
+
+        vLLM batches the prompts. API backends send them in parallel. The
+        schema gives structured output on API backends.
+        """
+        if not items:
+            return []
+        prompts = [get_qa_prompt(t, e, r) for t, e, r in items]
+        try:
+            # Instruct backends wrap each prompt in their chat template
+            responses = self.response_backend.generate_chat_batch(
+                prompts, json_schema=QA_JSON_SCHEMA
+            )
+        except Exception as e:
+            print(f"QA batch generation failed ({type(e).__name__}: {e})")
+            responses = [None] * len(prompts)
+        results = [self._parse_qa_response(r) for r in responses]
+        self._check_qa_failure_rate()
+        return results
+
+    def _check_qa_failure_rate(self) -> None:
+        generated, failed = self._stats["qa_generated"], self._stats["qa_failed"]
+        attempts = generated + failed
+        if (
+            not getattr(self, "_qa_rate_checked", False)
+            and attempts >= QA_FAIL_FAST_MIN_ATTEMPTS
+        ):
+            self._qa_rate_checked = True
+            if failed / attempts > QA_FAIL_FAST_RATE:
+                raise RuntimeError(
+                    f"QA generation failed for {failed}/{attempts} of the first "
+                    "documents. Failed documents become should_respond=0 rows, "
+                    "so the run stops. Check the logged errors (model name, "
+                    "API key, schema) and run a 5-sample job first."
+                )
+
+    def _wants_qa(self, include_response: Optional[bool]) -> bool:
+        """Decide whether one document gets a QA pair."""
         import random
 
-        self._stats["total"] += 1
-        text = doc.text
-
-        try:
-            entities, spans, concepts, entity_types, relations = self.annotate_text(text)
-        except Exception as e:
-            return AnnotationResult(text=text, success=False, error=str(e))
-
-        if not entities:
-            self._stats["empty"] += 1
-            return AnnotationResult(
-                text=text, success=False, error="No entities extracted"
-            )
-
-        should_respond = 0
-        response = ""
         if include_response is None:
-            include_response = (
+            return (
                 self.response_backend is not None
                 and random.random() < self.should_respond_ratio
             )
-        if include_response:
-            qa = self._maybe_generate_qa(text, entities, relations)
-            if qa is not None:
-                question, answer = qa
-                # Append the question so existing char spans stay valid.
-                text = f"{text.rstrip()}\n\n{question}"
-                should_respond = 1
-                response = answer
+        return include_response
 
+    def _build_result(
+        self,
+        text: str,
+        extracted: Tuple[List[str], List[List[int]], List[List[str]], List[str], List[List]],
+        qa: Optional[Tuple[str, str]],
+    ) -> AnnotationResult:
+        """Build a successful result. Append the QA question if there is one."""
+        entities, spans, concepts, entity_types, relations = extracted
+        should_respond = 0
+        response = ""
+        if qa is not None:
+            question, answer = qa
+            # Append the question so existing char spans stay valid.
+            text = f"{text.rstrip()}\n\n{question}"
+            should_respond = 1
+            response = answer
         self._stats["success"] += 1
         return AnnotationResult(
             text=text,
@@ -519,19 +791,89 @@ class GLiNER2Annotator:
             success=True,
         )
 
+    def _empty_result(self, text: str) -> AnnotationResult:
+        self._stats["empty"] += 1
+        return AnnotationResult(text=text, success=False, error="No entities extracted")
+
+    # ------------------------------------------------------------------
+    # Public API (mirrors LLMAnnotator)
+    # ------------------------------------------------------------------
+
+    def annotate(
+        self, doc: DocumentSource, include_response: Optional[bool] = None
+    ) -> AnnotationResult:
+        """Annotate a single document."""
+        self._stats["total"] += 1
+        text = doc.text
+
+        try:
+            extracted = self.annotate_text(text)
+        except Exception as e:
+            return AnnotationResult(text=text, success=False, error=str(e))
+
+        entities, _, _, _, relations = extracted
+        if not entities:
+            return self._empty_result(text)
+
+        qa = None
+        if self._wants_qa(include_response):
+            qa = self._maybe_generate_qa(text, entities, relations)
+        return self._build_result(text, extracted, qa)
+
     def annotate_batch(
         self, docs: List[DocumentSource], include_response: Optional[bool] = None
     ) -> List[AnnotationResult]:
         """Annotate a batch of documents.
 
-        GLiNER2 batch APIs vary between releases, so this iterates; the
-        per-document passes are already small (encoder-only model).
+        GLiNER2 scores all texts of the batch in one call per label batch
+        (and per relation batch). QA prompts for the batch go to the backend
+        in one call. Random QA draws happen in document order, as in
+        :meth:`annotate`, so seeded runs give the same QA choices. If batch
+        extraction fails, each document goes through :meth:`annotate`.
         """
-        return [self.annotate(doc, include_response) for doc in docs]
+        if not docs:
+            return []
+        texts = [doc.text for doc in docs]
+        try:
+            all_matches = self._extract_entity_matches_batch(texts)
+            merged = [self._merge_matches(m) for m in all_matches]
+            relations = self._extract_relations_batch(
+                texts,
+                [m[0] for m in merged],
+                [m[3] for m in merged],
+                [m[1] for m in merged],
+            )
+        except Exception as e:
+            print(f"Batch extraction failed ({type(e).__name__}: {e}); per-document fallback")
+            return [self.annotate(doc, include_response) for doc in docs]
+
+        extracted = [(*m, r) for m, r in zip(merged, relations)]
+        qa_index = []
+        for i, (entities, *_rest) in enumerate(extracted):
+            if entities and self._wants_qa(include_response):
+                qa_index.append(i)
+        qa_pairs: List[Optional[Tuple[str, str]]] = [None] * len(docs)
+        if qa_index and self.response_backend is not None:
+            generated = self._generate_qa_batch(
+                [(texts[i], extracted[i][0], extracted[i][4]) for i in qa_index]
+            )
+            for i, qa in zip(qa_index, generated):
+                qa_pairs[i] = qa
+
+        results = []
+        for i, text in enumerate(texts):
+            self._stats["total"] += 1
+            if not extracted[i][0]:
+                results.append(self._empty_result(text))
+            else:
+                results.append(self._build_result(text, extracted[i], qa_pairs[i]))
+        return results
 
     def get_statistics(self) -> Dict[str, Any]:
         total = self._stats["total"]
+        qa_attempts = self._stats["qa_generated"] + self._stats["qa_failed"]
         return {
             **self._stats,
             "success_rate": self._stats["success"] / total if total > 0 else 0,
+            "qa_failed_rate": self._stats["qa_failed"] / qa_attempts if qa_attempts > 0 else 0,
         }

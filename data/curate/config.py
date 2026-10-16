@@ -14,8 +14,19 @@ class CurationConfig:
         sources: List of dataset sources (HuggingFace paths or 'wikipedia')
         source_ratios: Ratio of samples from each source (must sum to 1.0)
         output_dir: Directory for output files
-        llm_model: LLM model name/path for annotation
-        llm_backend: Backend for LLM inference ('vllm', 'transformers', 'api')
+        output_name: Base name for output files (<name>.jsonl, <name>_val.jsonl,
+            <name>_vocab.json, <name>_checkpoint.json)
+        overwrite: Replace existing output files of the same name
+        val_ratio: Fraction of samples assigned to the validation split
+        text_field: Text column name, or a {source: column} mapping
+        llm_model: LLM model name/path for annotation (None = backend default)
+        llm_backend: Backend for LLM inference ('vllm', 'transformers',
+            'openai', 'anthropic', 'api', 'mock'). 'api' picks 'anthropic'
+            for 'claude*' model names, else 'openai'. API keys come only
+            from OPENAI_API_KEY / ANTHROPIC_API_KEY and are never stored here.
+        api_concurrency: Parallel requests per batch for API backends
+        api_effort: Effort or reasoning level for API backends (None =
+            provider default)
         batch_size: Batch size for LLM inference
         max_workers: Number of parallel workers for processing
         should_respond_ratio: Ratio of samples with should_respond=1
@@ -37,7 +48,13 @@ class CurationConfig:
 
     # Output
     output_dir: str = "data/curated"
+    output_name: str = "curated"
     output_format: str = "jsonl"
+    overwrite: bool = False
+    val_ratio: float = 0.02
+
+    # Source text column (None = per-source default, usually "text")
+    text_field: Optional[Dict[str, str]] = None
 
     # Annotator selection
     # 'gliner'  — GLiNER2 schema-driven extraction, should_respond=0 samples
@@ -49,14 +66,26 @@ class CurationConfig:
     gliner_model: str = "fastino/gliner2-base-v1"
     gliner_entity_threshold: float = 0.5
     gliner_relation_threshold: float = 0.4
-    gliner_device: Optional[str] = None  # None = auto
+    gliner_device: Optional[str] = None  # None = auto (cuda > mps > cpu)
+    # Word tokens GLiNER2 encodes per text. None = the whole text. GLiNER2
+    # drops words past this cap silently, so a cap below the document
+    # length leaves late entities unlabeled (trained as "none").
+    gliner_max_len: Optional[int] = None
+    gliner_batch_size: Optional[int] = None  # texts per pass; None = 8 on CUDA, 1 elsewhere
 
     # LLM settings (used by 'llm' annotator and 'hybrid' QA generation)
-    llm_model: str = "meta-llama/Llama-3.1-8B-Instruct"
-    llm_backend: str = "vllm"  # 'vllm', 'transformers', 'api'
-    llm_quantization: Optional[str] = "awq"  # 'awq', 'gptq', None
+    # None = backend default: Llama-3.1-8B-Instruct for vllm/transformers,
+    # gpt-6-luna for openai, claude-haiku-4-5 for anthropic
+    llm_model: Optional[str] = None
+    llm_backend: str = "vllm"  # 'vllm', 'transformers', 'openai', 'anthropic', 'api'
+    api_concurrency: int = 8
+    api_effort: Optional[str] = None
+    llm_quantization: Optional[str] = None  # "awq", "gptq", None
     llm_max_tokens: int = 2048
     llm_temperature: float = 0.1
+    # vLLM GPU memory fraction. None = 0.6 in hybrid mode (GLiNER2 shares
+    # the GPU), else 0.9.
+    vllm_gpu_memory_utilization: Optional[float] = None
 
     # Batch processing
     batch_size: int = 16
@@ -67,9 +96,12 @@ class CurationConfig:
 
     # Document filtering
     min_doc_length: int = 100
-    max_doc_length: int = 4000
+    # ~3.7k Qwen tokens (4.3 chars/token): fits the 4096-token training
+    # context with room for the appended QA question
+    max_doc_length: int = 16000
     min_entities: int = 1
-    max_entities: int = 20
+    # Long documents hold many entities; dropped ones would train as "none"
+    max_entities: int = 128
 
     # Checkpointing
     checkpoint_every: int = 1000
@@ -122,7 +154,6 @@ class CurationConfig:
             source_ratios=[0.6, 0.4],
             batch_size=16,
             llm_backend="vllm",
-            llm_quantization="awq",
             checkpoint_every=1000,
             enable_safety_filter=True,
             safety_strictness="medium",
@@ -133,11 +164,10 @@ class CurationConfig:
         """Config for large-scale curation (100K+ samples)."""
         return cls(
             target_samples=100000,
-            sources=["allenai/c4", "wikipedia", "togethercomputer/RedPajama-Data-1T-Sample"],
+            sources=["allenai/c4", "wikipedia", "HuggingFaceFW/fineweb"],
             source_ratios=[0.4, 0.35, 0.25],
             batch_size=32,
             llm_backend="vllm",
-            llm_quantization="awq",
             checkpoint_every=2000,
             max_workers=8,
             enable_safety_filter=True,

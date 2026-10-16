@@ -30,6 +30,12 @@ from .collator import CognitiveCollator
 class CausalCognitiveCollator(CognitiveCollator):
     """CognitiveCollator variant producing causal-LM response targets."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The response follows the prompt end, so long prompts lose their
+        # start, not the question or the final <assistant> marker.
+        self.truncation_side = "left"
+
     def _causal_targets(
         self, responses: List[str], should_respond_mask: List[bool]
     ) -> Tuple[torch.Tensor, torch.Tensor]:

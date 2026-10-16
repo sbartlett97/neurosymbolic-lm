@@ -7,6 +7,40 @@ from dataclasses import dataclass
 from .source_loader import DocumentSource
 
 
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]*\s|\n")
+
+
+def truncate_text(text: str, max_length: int) -> str:
+    """Cut text to at most max_length characters at a clean boundary.
+
+    The cut prefers the last sentence end in the second half of the
+    window. Then it tries the last whitespace. A hard cut is the last
+    resort.
+    """
+    if len(text) <= max_length:
+        return text
+    window = text[:max_length]
+    floor = max_length // 2
+
+    sentence_end = None
+    for m in _SENTENCE_END.finditer(window):
+        if m.start() >= floor:
+            sentence_end = m.start() + 1
+    if sentence_end is not None:
+        # Keep closing quotes or brackets after the punctuation
+        cut = window[:sentence_end]
+        rest = window[sentence_end:]
+        tail = len(rest) - len(rest.lstrip("\"')]"))
+        return (cut + rest[:tail]).rstrip()
+
+    space = window.rfind(" ", floor)
+    if space == -1:
+        space = max(window.rfind("\n", floor), window.rfind("\t", floor))
+    if space != -1:
+        return window[:space].rstrip()
+    return window
+
+
 @dataclass
 class FilterResult:
     """Result of document filtering."""
@@ -34,7 +68,7 @@ class DocumentFilter:
     def __init__(
         self,
         min_length: int = 100,
-        max_length: int = 4000,
+        max_length: int = 16000,
         min_words: int = 20,
         max_repetition_ratio: float = 0.3,
         min_alpha_ratio: float = 0.7,
@@ -114,8 +148,10 @@ class DocumentFilter:
             return FilterResult(False, f"Too short: {len(text)} < {self.min_length}")
 
         if len(text) > self.max_length:
-            # Truncate instead of rejecting
-            text = text[: self.max_length]
+            # Truncate instead of rejecting. The cut text replaces doc.text
+            # so the annotator sees the same text the filter checked.
+            text = truncate_text(text, self.max_length)
+            doc.text = text
 
         # Word count check
         words = text.split()

@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .entity import TokenEntityClassifier, ConceptBank
+from .entity import TokenEntityClassifier, ConceptBank, entity_node_scores
 from .extraction_adapter import ExtractionAdapter
 from .gnn import SimpleGNN
 from .injection import NodePrefixInjector
@@ -56,6 +56,21 @@ def build_tiny_backbone(vocab_size: int = 2048, hidden_size: int = 64):
         max_position_embeddings=512,
     )
     return LlamaForCausalLM(cfg)
+
+
+def _check_right_padded(attention_mask: torch.Tensor) -> None:
+    """Packing copies prompt[:len], so prompts must be right-padded.
+
+    Some tokenizers (e.g. Gemma) default to left padding. The training
+    script sets padding_side="right"; this check catches other callers.
+    """
+    lens = attention_mask.sum(dim=1, keepdim=True)
+    pos = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+    if not torch.equal((pos < lens).to(attention_mask.dtype), attention_mask):
+        raise ValueError(
+            "NeuroSymbolicCausalLM expects right-padded prompts; set "
+            "tokenizer.padding_side = 'right'"
+        )
 
 
 class NeuroSymbolicCausalLM(nn.Module):
@@ -96,17 +111,22 @@ class NeuroSymbolicCausalLM(nn.Module):
         else:
             from transformers import AutoModelForCausalLM
 
+            # fp32 by default: AdamW on bf16 weights drops most small
+            # updates. Mixed precision comes from bf16 autocast in the
+            # trainers. Pass bf16 only for a frozen or LoRA-wrapped base.
             if torch_dtype is None:
-                torch_dtype = (
-                    torch.bfloat16 if torch.cuda.is_available() else torch.float32
-                )
+                torch_dtype = torch.float32
             print(f"Loading causal backbone: {model_name} ({torch_dtype})")
             self.backbone = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=torch_dtype
+                model_name, dtype=torch_dtype
             )
 
         if gradient_checkpointing:
-            self.backbone.gradient_checkpointing_enable()
+            # Non-reentrant: works when the inputs do not require grad
+            # (frozen embeddings, LoRA) and with the two-pass forward.
+            self.backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
             print("Gradient checkpointing enabled")
 
         self.hidden_size = self.backbone.config.hidden_size
@@ -156,6 +176,7 @@ class NeuroSymbolicCausalLM(nn.Module):
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """Backbone over the prompt; tapped mid-layer through the adapter."""
+        _check_right_padded(attention_mask)
         decoder = (
             self.backbone.get_decoder()
             if hasattr(self.backbone, "get_decoder")
@@ -167,7 +188,9 @@ class NeuroSymbolicCausalLM(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-        tapped = out.hidden_states[self.tap_layer]
+        # A bf16 base (LoRA) feeds fp32 heads. Cast here so eval, generate
+        # and continual learning work without autocast too.
+        tapped = out.hidden_states[self.tap_layer].to(self.token_ent.fc.weight.dtype)
         return self.adapter(tapped, attention_mask)
 
     def _extract_node_features(
@@ -185,6 +208,12 @@ class NeuroSymbolicCausalLM(nn.Module):
             for i in range(B):
                 batch_nodes = []
                 for (s, e) in (spans[i] if i < len(spans) else [])[: self.max_nodes]:
+                    if int(s) < 0:
+                        # Entity not in the (truncated) prompt: empty node
+                        batch_nodes.append(
+                            torch.zeros(self.node_dim, device=enc.device, dtype=enc.dtype)
+                        )
+                        continue
                     s = max(0, min(int(s), L - 1))
                     e = max(s, min(int(e), L - 1))
                     batch_nodes.append(self.node_proj(enc[i, s:e + 1].mean(dim=0)))
@@ -195,9 +224,8 @@ class NeuroSymbolicCausalLM(nn.Module):
                 nodes.append(torch.stack(batch_nodes[: self.max_nodes], dim=0))
             return torch.stack(nodes, dim=0)
 
-        # Top-K by max entity-type score, padding positions excluded
-        ent_scores = token_ent_logits.max(dim=-1).values
-        ent_scores = ent_scores.masked_fill(attention_mask == 0, float("-inf"))
+        # Top-K by P(entity), padding positions excluded
+        ent_scores = entity_node_scores(token_ent_logits, attention_mask)
         k = min(self.max_nodes, L)
         _, topk_idx = torch.topk(ent_scores, k=k, dim=-1)
 
@@ -224,13 +252,14 @@ class NeuroSymbolicCausalLM(nn.Module):
             out = torch.zeros(B, N, E, device=device)
             for i in range(B):
                 for j, (s, e) in enumerate((spans[i] if i < len(spans) else [])[:N]):
+                    if int(s) < 0:
+                        continue
                     s = max(0, min(int(s), L - 1))
                     e = max(s, min(int(e), L - 1))
                     out[i, j] = token_ent_logits[i, s:e + 1].mean(dim=0)
             return F.softmax(out, dim=-1)
 
-        ent_scores = token_ent_logits.max(dim=-1).values
-        ent_scores = ent_scores.masked_fill(attention_mask == 0, float("-inf"))
+        ent_scores = entity_node_scores(token_ent_logits, attention_mask)
         k = min(N, L)
         _, topk_idx = torch.topk(ent_scores, k=k, dim=-1)
         gathered = torch.gather(
@@ -277,7 +306,6 @@ class NeuroSymbolicCausalLM(nn.Module):
         B, R = y_ids.shape
         device = input_ids.device
         emb_layer = self.backbone.get_input_embeddings()
-        pad_id = getattr(self.backbone.config, "pad_token_id", None) or 0
 
         prompt_emb = emb_layer(input_ids)
         resp_emb = emb_layer(y_ids)
@@ -287,13 +315,10 @@ class NeuroSymbolicCausalLM(nn.Module):
             node_emb = self.injector(node_feats).to(prompt_emb.dtype)
             K = node_emb.shape[1]
 
-        # Response attention: real tokens attend; the first slot is always
-        # real (abstention rows are a single EOS which may equal pad_id).
-        # Trailing EOS-as-pad slots stay masked — the token at position t is
-        # *predicted* from position t-1, so masking its input slot is safe.
-        resp_attn = (y_ids != pad_id).long()
-        resp_attn[:, 0] = 1
-
+        # Response slots all attend. Padding sits after a sample's last
+        # real token, and causal attention means it can only affect later
+        # positions, whose labels are -100. This avoids any pad-id lookup
+        # (pad often equals EOS, and a None pad id must not mask token 0).
         prompt_lens = attention_mask.sum(dim=1).tolist()
         total = [int(p) + K + R for p in prompt_lens]
         T = max(total)
@@ -312,22 +337,28 @@ class NeuroSymbolicCausalLM(nn.Module):
                 packed_mask[i, pos:pos + K] = 1
                 pos += K
             packed_emb[i, pos:pos + R] = resp_emb[i]
-            packed_mask[i, pos:pos + R] = resp_attn[i]
+            packed_mask[i, pos:pos + R] = 1
 
+        # y_ids[:, j] is predicted at packed position p + K + j - 1. Only
+        # keep logits from the earliest such position on: a full B x T x V
+        # tensor at a 150k vocab does not fit a 24 GB card.
+        starts = torch.tensor(
+            [int(p) + K - 1 for p in prompt_lens], device=device
+        )
+        first = int(starts.min())
         out = self.backbone(
             inputs_embeds=packed_emb,
             attention_mask=packed_mask,
+            logits_to_keep=T - first,
             return_dict=True,
         )
-        full_logits = out.logits  # (B, T, V)
+        tail_logits = out.logits  # (B, T - first, V)
 
-        # Gather response-aligned logits: y_ids[:, j] is predicted at
-        # packed position p + K + j - 1.
-        resp_logits = full_logits.new_zeros(B, R, full_logits.shape[-1])
-        for i in range(B):
-            start = int(prompt_lens[i]) + K - 1
-            resp_logits[i] = full_logits[i, start:start + R]
-        return resp_logits
+        idx = (starts - first).unsqueeze(1) + torch.arange(R, device=device)
+        return torch.gather(
+            tail_logits, 1,
+            idx.unsqueeze(-1).expand(-1, -1, tail_logits.shape[-1]),
+        )
 
     # ------------------------------------------------------------------
     # Public API (parity with NeuroSymbolicLM)
@@ -399,8 +430,23 @@ class NeuroSymbolicCausalLM(nn.Module):
         position for every sample. Returns only the generated tokens
         (HF behavior for ``inputs_embeds`` input).
         """
+        was_training = self.training
         self.eval()
+        try:
+            return self._generate(
+                input_ids, attention_mask, max_length, use_soft_nodes, **kwargs
+            )
+        finally:
+            self.train(was_training)
 
+    def _generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_length: int,
+        use_soft_nodes: bool,
+        **kwargs,
+    ) -> torch.Tensor:
         enc = self._read(input_ids, attention_mask)
         token_ent_logits = self.token_ent(enc)
         node_feats = self._extract_node_features(

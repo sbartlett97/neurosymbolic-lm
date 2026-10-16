@@ -21,6 +21,7 @@ from .entity import (
     ContextAwareEntityClassifier,
     ConceptBank,
     HierarchicalConceptBank,
+    entity_node_scores,
 )
 from .gnn import SimpleGNN, AttentionGNN
 from .logic import SoftLogicConstraints, pair_logits_to_matrix
@@ -90,8 +91,8 @@ class NeuroSymbolicLM(nn.Module):
         workspace_n_cycles: int = 1,
         # Vision (T5Gemma)
         use_vision: bool = False,
-        # Backbone dtype: None = auto (bfloat16 on CUDA, float32 elsewhere —
-        # bf16 support on MPS/CPU is incomplete)
+        # Backbone dtype: None = float32. AdamW on bf16 weights drops most
+        # small updates; the trainers' bf16 autocast gives the speed.
         torch_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
@@ -105,14 +106,14 @@ class NeuroSymbolicLM(nn.Module):
         self.max_output_length = max_output_length
 
         if torch_dtype is None:
-            torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            torch_dtype = torch.float32
 
         # Load the appropriate model
         if self.is_t5gemma:
             from transformers import AutoModelForSeq2SeqLM, AutoProcessor
             print(f"Loading T5Gemma 2 model: {model_name} ({torch_dtype})")
             self.t5 = AutoModelForSeq2SeqLM.from_pretrained(
-                model_name, torch_dtype=torch_dtype
+                model_name, dtype=torch_dtype
             )
             # Store processor for vision input handling
             if self.has_vision:
@@ -351,7 +352,8 @@ class NeuroSymbolicLM(nn.Module):
         self,
         enc: torch.Tensor,
         token_ent_logits: torch.Tensor,
-        spans: Optional[List[List[Tuple[int, int]]]] = None
+        spans: Optional[List[List[Tuple[int, int]]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Extract node features from encoder outputs."""
         B, L, _ = enc.shape
@@ -363,6 +365,10 @@ class NeuroSymbolicLM(nn.Module):
                 batch_spans = spans[i] if i < len(spans) else []
                 batch_nodes = []
                 for (s, e) in batch_spans[:self.max_nodes]:
+                    if s < 0:
+                        # Entity not in the (truncated) input: empty node
+                        batch_nodes.append(torch.zeros(self.node_dim, device=enc.device))
+                        continue
                     span_repr = enc[i, s:e+1].mean(dim=0)
                     batch_nodes.append(self.node_proj(span_repr))
                 # Pad to max_nodes
@@ -372,7 +378,7 @@ class NeuroSymbolicLM(nn.Module):
             node_feats = torch.stack(nodes, dim=0)  # (B, max_nodes, node_dim)
         else:
             # Use top-k entity scores
-            ent_scores = token_ent_logits.max(dim=-1).values
+            ent_scores = entity_node_scores(token_ent_logits, attention_mask)
             topk_vals, topk_idx = torch.topk(
                 ent_scores, k=min(self.max_nodes, L), dim=-1
             )
@@ -395,7 +401,8 @@ class NeuroSymbolicLM(nn.Module):
     def _compute_node_entity_probs(
         self,
         token_ent_logits: torch.Tensor,
-        spans: Optional[List[List[Tuple[int, int]]]] = None
+        spans: Optional[List[List[Tuple[int, int]]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute entity type probabilities for nodes."""
         B, L, _ = token_ent_logits.shape
@@ -407,6 +414,9 @@ class NeuroSymbolicLM(nn.Module):
             for i in range(B):
                 node_logits = []
                 for (s, e) in spans[i]:
+                    if s < 0:
+                        node_logits.append(torch.zeros(self.n_entity_types, device=device))
+                        continue
                     span_logits = token_ent_logits[i, s:e+1].mean(dim=0)
                     node_logits.append(span_logits)
                 while len(node_logits) < N:
@@ -414,7 +424,7 @@ class NeuroSymbolicLM(nn.Module):
                 node_entity_logits.append(torch.stack(node_logits[:N], dim=0))
             node_entity_logits = torch.stack(node_entity_logits, dim=0)
         else:
-            ent_scores = token_ent_logits.max(dim=-1).values
+            ent_scores = entity_node_scores(token_ent_logits, attention_mask)
             topk_vals, topk_idx = torch.topk(
                 ent_scores, k=min(self.max_nodes, L), dim=-1
             )
@@ -474,7 +484,9 @@ class NeuroSymbolicLM(nn.Module):
                 enc, token_ent_logits, attention_mask
             )
         else:
-            node_feats = self._extract_node_features(enc, token_ent_logits, spans)
+            node_feats = self._extract_node_features(
+                enc, token_ent_logits, spans, attention_mask
+            )
 
         # GNN relational reasoning over extracted nodes
         node_feats_refined = self.gnn(node_feats)
@@ -499,7 +511,9 @@ class NeuroSymbolicLM(nn.Module):
         )
 
         # Node entity type probabilities
-        node_entity_type_probs = self._compute_node_entity_probs(token_ent_logits, spans)
+        node_entity_type_probs = self._compute_node_entity_probs(
+            token_ent_logits, spans, attention_mask
+        )
 
         # Base outputs
         outputs = {
@@ -596,7 +610,9 @@ class NeuroSymbolicLM(nn.Module):
             if self.use_soft_entity_selection and self.entity_selector is not None:
                 node_feats, _ = self.entity_selector(enc, token_ent_logits, attention_mask)
             else:
-                node_feats = self._extract_node_features(enc, token_ent_logits)
+                node_feats = self._extract_node_features(
+                    enc, token_ent_logits, attention_mask=attention_mask
+                )
 
             node_feats_refined = self.gnn(node_feats)
             memory_nodes = self.node_to_encoder_proj(node_feats_refined)

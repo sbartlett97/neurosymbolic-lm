@@ -23,7 +23,7 @@ three training stages; which fields are *used* differs per stage.
 | `text` | str | Encoder input. For QA samples the question is appended to the document, so document spans stay valid. |
 | `entities` | list[str] | Entity surface forms, in span order. |
 | `entity_spans` | list[[int,int]] | Character offsets into `text`, **end-exclusive** (`text[start:end]` is the entity). |
-| `entity_types` | list[str] | Coarse type per entity, from the 15-type inventory in `data/curate/taxonomy.py` (index 0 is reserved for none/padding, giving `n_entity_types=16`). |
+| `entity_types` | list[str] | Coarse type per entity, from the 17-type inventory in `data/curate/taxonomy.py` (index 0 is reserved for none/padding, so the model needs `n_entity_types >= 18`). |
 | `concepts` | list[list[str]] | 1–3 fine-grained concept labels per entity, from the taxonomy. Coarse type names are also valid (top-level) concepts. |
 | `relations` | list[[int,int,str]] | `[head_idx, tail_idx, relation]` where indices point into `entities` and `relation` is a taxonomy relation label. |
 | `should_respond` | 0 or 1 | Whether the decoder should produce a response (1) or learn to emit EOS immediately / abstain (0). |
@@ -60,9 +60,15 @@ template renders the conversation:
 
 Rules:
 
-- Roles: `system`, `user`, `assistant`, `tool` (tool/function results).
-  Assistant tool calls are inline JSON content; the final assistant turn is
-  the decoder target and is **never** annotated.
+- Roles: `system`, `user`, `assistant`, `tool`. An assistant tool call is
+  content that is exactly a JSON object `{"name": ..., "arguments": {...}}`.
+  `arguments` is always an object. One turn with several calls is a JSON
+  list. A malformed call cuts the conversation before that turn.
+- Each assistant turn i is its own sample: `messages[:i+1]`, with
+  annotations only for messages before i. The last assistant message is the
+  decoder target and is **never** annotated. All samples of a conversation
+  share one split (`conversation_id`). `--max-turns-per-conversation`
+  (default 8) sets the cap.
 - `entity_spans` in `message_annotations` are relative to that message's
   **stripped** content (`content.strip()`); relation indices are local to
   the message's own entity list.
@@ -91,7 +97,13 @@ remaining prose by GLiNER2.
 
 ## Vocabulary file
 
-The curation pipeline writes `<name>_vocab.json` next to the dataset:
+The curation pipeline writes `<name>.jsonl` (train), `<name>_val.jsonl`
+(validation, a deterministic hash split set by `--val-ratio`, default 0.02)
+and `<name>_vocab.json` next to them. Exact duplicates of normalized text
+are skipped. A run refuses to replace existing outputs unless you pass
+`--overwrite` (`curate_dataset.py` also accepts `--resume-from`).
+
+The vocabulary file has this shape:
 
 ```json
 {
@@ -99,7 +111,7 @@ The curation pipeline writes `<name>_vocab.json` next to the dataset:
     "relations": {"acquired": 1, "born_in": 2, "...": 3},
     "entity_types": {"person": 1, "organization": 2, "...": 3},
     "concept_to_entity_type": {"scientist": 1, "company": 2, "...": 3},
-    "statistics": {"num_concepts": 105, "num_relations": 41, "num_samples": 50000}
+    "statistics": {"num_concepts": 132, "num_relations": 52, "num_samples": 50000}
 }
 ```
 
@@ -140,8 +152,9 @@ python data/curate_dataset.py --annotator hybrid \
 
 GLiNER2 is a *zero-shot* extractor: it selects from the label inventory
 supplied per pass — it does not invent labels. Label diversity therefore
-lives in `data/curate/taxonomy.py` (~100 described concept labels across 15
-coarse types, ~40 relation types). To extend coverage for a domain, add
+lives in `data/curate/taxonomy.py` (115 described concept labels across 17
+coarse types, 52 relation types; the vocab file lists 132 concepts because
+the 17 coarse type names are also top-level concepts). To extend coverage for a domain, add
 labels there; the vocab file, QC validation, and entity-type mapping all
 follow automatically. Keep totals within the model budgets
 (`n_concepts`, `n_relations` in `config.ModelConfig`).

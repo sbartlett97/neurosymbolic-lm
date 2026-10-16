@@ -379,7 +379,8 @@ def run_evaluation(
         device=device,
         num_samples=num_samples,
         max_length=model_config.max_output_length,
-        compute_metrics=True
+        compute_metrics=True,
+        max_input_length=model_config.max_input_length,
     )
     
     # Compute aggregate metrics
@@ -547,7 +548,8 @@ def train_stage(
                     results = evaluate_generation(
                         model, tokenizer, train_dataset,
                         device=device, num_samples=3,
-                        max_length=model_config.max_output_length
+                        max_length=model_config.max_output_length,
+                        max_input_length=model_config.max_input_length,
                     )
                     for r in results[:2]:
                         print(f"    Q: {r['input'][:50]}...")

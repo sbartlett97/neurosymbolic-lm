@@ -66,6 +66,58 @@ class SoftLogicConstraints(nn.Module):
         self.rules = []
         self.n_entity_types = n_entity_types
         self.n_relations = n_relations
+        # (E, E, R) bool: may relation r hold between head type a and tail
+        # type b. Not persistent: it is rebuilt from the label maps, so
+        # checkpoints from before it existed still load strictly.
+        self.register_buffer("type_allowed", None, persistent=False)
+
+    @property
+    def active(self) -> bool:
+        return len(self.rules) > 0 or self.type_allowed is not None
+
+    def set_type_constraints(self, allowed: torch.Tensor):
+        """Set relation domain/range constraints.
+
+        Args:
+            allowed: (n_entity_types, n_entity_types, n_relations) bool.
+                Type 0 ("none") and relation 0 ("no relation") must be
+                allowed everywhere; unknown labels stay unconstrained.
+        """
+        E, R = self.n_entity_types, self.n_relations
+        assert allowed.shape == (E, E, R), (allowed.shape, (E, E, R))
+        allowed = allowed.clone().bool()
+        allowed[0, :, :] = True
+        allowed[:, 0, :] = True
+        allowed[:, :, 0] = True
+        device = self.type_allowed.device if self.type_allowed is not None else None
+        self.type_allowed = allowed.to(device) if device is not None else allowed
+
+    def type_constraint_loss(
+        self,
+        entity_type_probs: torch.Tensor,
+        rel_logits_matrix: torch.Tensor,
+        node_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Expected probability mass on type-violating relations.
+
+        For each ordered node pair, sum over head/tail types of
+        P(type_a) P(type_b) times the relation softmax mass on relations
+        the taxonomy disallows for (a, b). Type probabilities are
+        detached: otherwise the cheapest fix is to push nodes to "none",
+        which fights the entity loss. Only the relation scorer learns here.
+        """
+        p = entity_type_probs.detach().float()  # (B, N, E)
+        rel = F.softmax(rel_logits_matrix.float(), dim=-1)  # (B, N, N, R)
+        violates = (~self.type_allowed.to(p.device)).float()  # (E, E, R)
+        per_pair = torch.einsum("bia,bjc,acr,bijr->bij", p, p, violates, rel)
+
+        B, N = p.shape[:2]
+        pair_mask = ~torch.eye(N, dtype=torch.bool, device=p.device).unsqueeze(0)
+        if node_mask is not None:
+            nm = node_mask.to(p.device).bool()
+            pair_mask = pair_mask & nm.unsqueeze(2) & nm.unsqueeze(1)
+        pair_mask = pair_mask.expand(B, N, N).float()
+        return (per_pair * pair_mask).sum() / pair_mask.sum().clamp(min=1.0)
     
     def add_rule(
         self, 
@@ -94,7 +146,8 @@ class SoftLogicConstraints(nn.Module):
     def forward(
         self, 
         entity_type_probs: torch.Tensor, 
-        rel_logits_matrix: torch.Tensor
+        rel_logits_matrix: torch.Tensor,
+        node_mask: Optional[torch.Tensor] = None,
     ) -> tuple:
         """
         Compute soft logic constraint loss.
@@ -102,6 +155,8 @@ class SoftLogicConstraints(nn.Module):
         Args:
             entity_type_probs: (B, N, E) probability over entity types
             rel_logits_matrix: (B, N, N, R) relation logits
+            node_mask: optional (B, N) bool, True for real entity nodes
+                (padding and truncated entities are excluded)
         
         Returns:
             total_loss: Scalar loss tensor
@@ -114,7 +169,14 @@ class SoftLogicConstraints(nn.Module):
         
         total_loss = torch.tensor(0.0, device=device)
         details = {"rules": []}
-        
+
+        if self.type_allowed is not None:
+            type_loss = self.type_constraint_loss(
+                entity_type_probs, rel_logits_matrix, node_mask
+            )
+            total_loss = total_loss + type_loss
+            details["type_constraint_loss"] = type_loss.detach().cpu()
+
         if len(self.rules) == 0:
             return total_loss, details
         

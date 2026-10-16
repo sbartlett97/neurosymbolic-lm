@@ -218,7 +218,8 @@ def test_parse_glaive():
     messages = parse_glaive_sample(system, chat)
     roles = [m["role"] for m in messages]
     assert roles == ["system", "user", "assistant", "tool", "assistant"]
-    assert "calculate_tip" in messages[2]["content"]
+    # The call is canonical JSON; a missing arguments key becomes {}
+    assert messages[2]["content"] == '{"name": "calculate_tip", "arguments": {}}'
     assert "<|endoftext|>" not in messages[-1]["content"]
     assert messages[-1]["content"] == "The tip is $7.50."
 

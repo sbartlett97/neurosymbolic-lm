@@ -181,6 +181,9 @@ class CausalModelConfig:
 
     # Backbone
     model_name: str = "Qwen/Qwen3-0.6B-Base"
+    # Tokenizer checkpoint (None = model_name). The tiny test backbone
+    # borrows a real tokenizer, so CLI smoke runs use real tokenization.
+    tokenizer_name: Optional[str] = None
 
     # Where the heads read from: fraction of decoder depth (0 < r <= 1)
     tap_layer_ratio: float = 0.66
@@ -203,8 +206,9 @@ class CausalModelConfig:
     # Soft-token injection
     injection_gate_init: float = 0.1
 
-    # Context lengths
-    max_input_length: int = 2048
+    # Context lengths. 4096 tokens holds a 16k-char curated document
+    # (4.3 chars/token for Qwen) plus its QA question
+    max_input_length: int = 4096
     max_output_length: int = 512
 
     # Memory efficiency
@@ -233,6 +237,11 @@ class CausalModelConfig:
         return cls(model_name="meta-llama/Llama-3.2-1B")
 
     @classmethod
+    def for_qwen3_1_7b_lora(cls) -> "CausalModelConfig":
+        """1.7B on a 24 GB card: full FT needs ~30 GB+ (fp32 AdamW)."""
+        return cls(model_name="Qwen/Qwen3-1.7B-Base", use_lora=True)
+
+    @classmethod
     def for_qwen3_4b_lora(cls) -> "CausalModelConfig":
         return cls(
             model_name="Qwen/Qwen3-4B-Base",
@@ -245,6 +254,7 @@ class CausalModelConfig:
         """Tiny offline backbone built from config — no downloads needed."""
         return cls(
             model_name="__tiny__",
+            tokenizer_name="Qwen/Qwen3-0.6B-Base",
             n_entity_types=8,
             n_relations=32,
             n_concepts=64,
@@ -262,6 +272,7 @@ class CausalModelConfig:
 CAUSAL_MODEL_PRESETS = {
     "qwen3-0.6b": CausalModelConfig.for_qwen3_0_6b,
     "qwen3-1.7b": CausalModelConfig.for_qwen3_1_7b,
+    "qwen3-1.7b-lora": CausalModelConfig.for_qwen3_1_7b_lora,
     "qwen3-4b-lora": CausalModelConfig.for_qwen3_4b_lora,
     "gemma3-1b": CausalModelConfig.for_gemma3_1b,
     "llama3.2-1b": CausalModelConfig.for_llama32_1b,

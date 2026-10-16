@@ -66,6 +66,50 @@ class CognitiveCollator:
         self.max_nodes = max_nodes
         self.vision_processor = vision_processor
         self.entity_type_map = entity_type_map or {}
+        # Which end of the input truncation cuts. The causal collator cuts
+        # the start, so the prompt end stays next to the response.
+        self.truncation_side = "right"
+
+    def _use_chat(self, sample: dict) -> bool:
+        """Format a sample with the chat template.
+
+        Trace samples (messages, no flat text) always need the template,
+        also outside chat mode, so a trace row in a pretrain dataset does
+        not crash the batch.
+        """
+        if self.chat_template is None:
+            return False
+        return self.chat_mode or ("messages" in sample and "text" not in sample)
+
+    def _tokenize_inputs(self, texts: List[str]):
+        """Tokenize the batch once, with offsets when the tokenizer has them."""
+        old_side = getattr(self.tokenizer, "truncation_side", None)
+        if old_side is not None:
+            self.tokenizer.truncation_side = self.truncation_side
+        try:
+            try:
+                tok = self.tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                )
+            except (NotImplementedError, TypeError, ValueError):
+                # Slow tokenizers cannot return offsets
+                tok = self.tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+        finally:
+            if old_side is not None:
+                self.tokenizer.truncation_side = old_side
+        offsets = tok.pop("offset_mapping", None) if hasattr(tok, "pop") else None
+        return tok, offsets
     
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
         """
@@ -85,13 +129,14 @@ class CognitiveCollator:
         texts = []
         chat_targets = []  # Non-empty when chat_mode overrides response
         for sample in batch:
-            if self.chat_mode and self.chat_template and "messages" in sample:
+            use_chat = self._use_chat(sample)
+            if use_chat and "messages" in sample:
                 input_text, target_text = self.chat_template.format_messages(
                     sample["messages"]
                 )
                 texts.append(input_text)
                 chat_targets.append(target_text)
-            elif self.chat_mode and self.chat_template:
+            elif use_chat:
                 # No messages field — wrap text/response as single-turn
                 input_text, target_text = self.chat_template.format_single_turn(
                     sample["text"],
@@ -100,16 +145,15 @@ class CognitiveCollator:
                 texts.append(input_text)
                 chat_targets.append(target_text)
             else:
+                if "text" not in sample:
+                    raise ValueError(
+                        "Sample has no 'text' field (a trace sample needs a "
+                        "chat_template on the collator)"
+                    )
                 texts.append(sample["text"])
                 chat_targets.append("")
 
-        tok = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
+        tok, offsets = self._tokenize_inputs(texts)
 
         max_entities = max((len(x.get("entities", [])) for x in batch), default=0) or 1
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
@@ -127,7 +171,7 @@ class CognitiveCollator:
         decoder_input_ids = None
         decoder_labels = None
         if self.include_responses:
-            if self.chat_mode and any(ct != "" for ct in chat_targets):
+            if any(ct != "" for ct in chat_targets):
                 decoder_input_ids, decoder_labels = self._process_chat_responses(
                     batch, chat_targets
                 )
@@ -143,7 +187,8 @@ class CognitiveCollator:
 
             # Compute token-level spans for entity alignment
             token_spans = self._compute_entity_token_spans(
-                sample, texts[i], tok["input_ids"][i]
+                sample, texts[i], tok["input_ids"][i],
+                offsets[i].tolist() if offsets is not None else None,
             )
             entity_token_spans.append(token_spans)
 
@@ -192,8 +237,7 @@ class CognitiveCollator:
         sample whose entity_spans index into the tokenized text.
         """
         if (
-            not self.chat_mode
-            or self.chat_template is None
+            not self._use_chat(sample)
             or "messages" not in sample
             or "message_annotations" not in sample
         ):
@@ -451,10 +495,16 @@ class CognitiveCollator:
         self,
         sample: dict,
         text: str,
-        input_ids: torch.Tensor
+        input_ids: torch.Tensor,
+        offsets: Optional[List[Tuple[int, int]]] = None,
     ) -> List[Tuple[int, int]]:
         """
         Compute token-level spans for entities.
+
+        Returns one (start, end) token span per entity, end inclusive.
+        An entity that is not found, or that truncation cut from the
+        input, gets (-1, -1). Consumers skip it, so index alignment with
+        the entity list (and with relation indices) is kept.
 
         Uses gold character spans from the sample when available (curated
         data provides exact offsets, exclusive end); otherwise falls back to
@@ -487,20 +537,55 @@ class CognitiveCollator:
                 try:
                     found = text.lower().find(entity.lower())
                     if found == -1:
-                        token_spans.append((0, 0))
+                        token_spans.append((-1, -1))
                         continue
                     char_start, char_end = found, found + len(entity)
                 except (AttributeError, TypeError):
-                    token_spans.append((0, 0))
+                    token_spans.append((-1, -1))
                     continue
 
-            token_span = self._char_span_to_token_span(
-                text, char_start, char_end, input_ids
-            )
+            if offsets is not None:
+                token_span = self._char_span_from_offsets(
+                    offsets, char_start, char_end
+                )
+            else:
+                token_span = self._char_span_to_token_span(
+                    text, char_start, char_end, input_ids
+                )
             token_spans.append(token_span)
 
         return token_spans
     
+    @staticmethod
+    def _char_span_from_offsets(
+        offsets: List[Tuple[int, int]], char_start: int, char_end: int
+    ) -> Tuple[int, int]:
+        """Map a char span to tokens of the actual (truncated) encoding.
+
+        Returns (-1, -1) when the span is not fully inside the kept tokens.
+        Special and padding tokens have empty (0, 0) offsets and never match.
+        """
+        start_token = end_token = None
+        first_char = last_char = None
+        for idx, (o_start, o_end) in enumerate(offsets):
+            if o_end <= o_start:
+                continue
+            if first_char is None:
+                first_char = o_start
+            last_char = o_end
+            if o_end > char_start and o_start < char_end:
+                if start_token is None:
+                    start_token = idx
+                end_token = idx
+        if (
+            start_token is None
+            or first_char is None
+            or char_start < first_char
+            or char_end > last_char
+        ):
+            return (-1, -1)
+        return (start_token, end_token)
+
     def _char_span_to_token_span(
         self,
         text: str,
@@ -539,9 +624,11 @@ class CognitiveCollator:
         if end_token is None:
             end_token = start_token
         
-        # Clamp to valid range
+        # Spans past the truncated input are dropped, not clamped onto the
+        # last token (that gives wrong labels)
         max_idx = len(input_ids) - 1
-        start_token = min(start_token, max_idx)
+        if start_token > max_idx:
+            return (-1, -1)
         end_token = min(end_token, max_idx)
-        
+
         return (start_token, end_token)
