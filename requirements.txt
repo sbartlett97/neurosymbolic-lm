@@ -1,17 +1,34 @@
-# Core dependencies
-torch
-numpy
-transformers
+# Training + GLiNER2 curation (one environment).
+#
+# torch is NOT listed: install it for your CUDA build first, or use the
+# torch that ships with a RunPod PyTorch template (scripts/runpod_setup.sh).
+# Tested with torch 2.12, Python 3.11-3.14.
+#
+# vLLM (hybrid QA generation) pins its own torch build. Install it in a
+# separate environment from requirements-vllm.txt.
 
-# For LongT5 and advanced models
+# Model stack (pinned: generate(inputs_embeds=...) and logits_to_keep
+# behavior are validated against these versions)
+transformers==5.13.*
+peft==0.19.*
+accelerate>=1.10
+safetensors
 sentencepiece
 protobuf
+numpy
 
 # Data handling
-datasets
+datasets==5.0.*
 jsonlines
 
-# Knowledge graph utilities
+# Dataset curation (GLiNER2 schema-driven entity/relation extraction)
+gliner2==1.3.*
+
+# Hosted LLM backends for hybrid QA (--backend anthropic / openai)
+anthropic>=1.15.0
+openai>=3.31.0
+
+# Graph utilities
 networkx
 
 # Evaluation metrics
@@ -22,11 +39,5 @@ rouge-score
 tensorboard
 tqdm
 
-# Data labelling interface
-streamlit
-
-# Optional: For faster attention (requires CUDA)
-# flash-attn  # pip install flash-attn --no-build-isolation
-
-# Optional: Memory profiling
-# memory-profiler
+# Tests
+pytest

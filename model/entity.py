@@ -6,6 +6,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def entity_node_scores(
+    token_ent_logits: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Score each token for top-K node selection.
+
+    Class 0 is "none" (not an entity), so the score is log P(entity),
+    not the max over all classes. A max over all classes picks the most
+    confident non-entity tokens once class 0 is trained. Padding scores -inf.
+
+    Returns:
+        (B, L) scores.
+    """
+    log_probs = F.log_softmax(token_ent_logits.float(), dim=-1)
+    scores = torch.logsumexp(log_probs[..., 1:], dim=-1)
+    if attention_mask is not None:
+        scores = scores.masked_fill(attention_mask == 0, float("-inf"))
+    return scores
+
+
 class TokenEntityClassifier(nn.Module):
     """
     Token-level entity type classifier.

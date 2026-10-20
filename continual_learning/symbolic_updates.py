@@ -430,119 +430,11 @@ class SoftLogicRuleUpdater:
         return relevant
 
 
-class KnowledgeGraphUpdater:
-    """
-    Manages updates to the knowledge graph.
-    
-    Supports:
-    - Adding new entities and relations
-    - Updating entity embeddings
-    - Path caching for reasoning
-    - Fact verification
-    """
-    
-    def __init__(self, model: nn.Module):
-        """
-        Args:
-            model: The neurosymbolic model with KG components
-        """
-        self.model = model
-        
-        # Local cache of KG updates
-        self.pending_entities: List[Dict] = []
-        self.pending_relations: List[Tuple[str, str, str]] = []
-        self.entity_update_counts: Dict[str, int] = defaultdict(int)
-    
-    def add_entity(
-        self,
-        entity_text: str,
-        entity_type: Optional[str] = None,
-        embedding: Optional[torch.Tensor] = None
-    ):
-        """Add a new entity to the knowledge graph."""
-        self.pending_entities.append({
-            "text": entity_text,
-            "type": entity_type,
-            "embedding": embedding
-        })
-    
-    def add_relation(
-        self,
-        subject: str,
-        relation: str,
-        obj: str,
-        confidence: float = 1.0
-    ):
-        """Add a new relation to the knowledge graph."""
-        self.pending_relations.append((subject, relation, obj))
-        
-        # Also update the KG graph if available
-        if hasattr(self.model, 'kg_graph') and self.model.kg_graph is not None:
-            self.model.kg_graph.add_edge(subject, relation, obj)
-    
-    def commit_updates(self):
-        """Commit pending updates to the model."""
-        # Update entity mappings
-        if hasattr(self.model, 'entity_mapping'):
-            for entity in self.pending_entities:
-                # Add to mapping (implementation depends on KG format)
-                pass
-        
-        self.pending_entities = []
-        self.pending_relations = []
-    
-    def query_paths(
-        self,
-        source: str,
-        target: str,
-        max_length: int = 3
-    ) -> List[List[Tuple[str, str]]]:
-        """Query paths between entities in the KG."""
-        if not hasattr(self.model, 'kg_graph') or self.model.kg_graph is None:
-            return []
-        
-        return self.model.kg_graph.find_paths(source, target, max_length)
-    
-    def verify_fact(
-        self,
-        subject: str,
-        relation: str,
-        obj: str
-    ) -> Tuple[bool, float]:
-        """
-        Verify if a fact exists in the KG.
-        
-        Returns:
-            (exists, confidence)
-        """
-        if not hasattr(self.model, 'kg_graph') or self.model.kg_graph is None:
-            return False, 0.0
-        
-        # Check direct edge
-        neighbors = self.model.kg_graph.get_neighbors(subject)
-        for rel, target in neighbors:
-            if rel == relation and target == obj:
-                return True, 1.0
-        
-        # Check reverse
-        neighbors = self.model.kg_graph.get_neighbors(obj)
-        for rel, target in neighbors:
-            if f"~{rel}" == relation and target == subject:
-                return True, 0.9
-        
-        # Check paths
-        paths = self.query_paths(subject, obj, max_length=2)
-        if paths:
-            return True, 0.5  # Indirect evidence
-        
-        return False, 0.0
-
-
 class SymbolicUpdateManager:
     """
     Unified manager for all symbolic updates.
-    
-    Coordinates updates across concept bank, rules, and KG.
+
+    Coordinates updates across the concept bank and soft logic rules.
     """
     
     def __init__(self, model: nn.Module):
@@ -550,7 +442,6 @@ class SymbolicUpdateManager:
         
         self.concept_updater = ConceptBankUpdater(model)
         self.rule_updater = SoftLogicRuleUpdater(model)
-        self.kg_updater = KnowledgeGraphUpdater(model)
     
     def process_sample(self, sample: Dict):
         """
@@ -589,21 +480,10 @@ class SymbolicUpdateManager:
                 for hc in head_concepts:
                     for tc in tail_concepts:
                         self.rule_updater.observe_pattern(hc, tc, relation, positive=True)
-        
-        # Update KG
-        for head_idx, tail_idx, relation in relations:
-            if head_idx < len(entities) and tail_idx < len(entities):
-                self.kg_updater.add_relation(
-                    entities[head_idx],
-                    relation,
-                    entities[tail_idx]
-                )
-    
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get statistics about symbolic components."""
         return {
             "num_concepts": len(self.concept_updater.concept_names),
             "num_rules": len(self.rule_updater.active_rules),
-            "pending_kg_entities": len(self.kg_updater.pending_entities),
-            "pending_kg_relations": len(self.kg_updater.pending_relations)
         }

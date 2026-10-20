@@ -1,0 +1,8 @@
+# Hybrid QA curation (data/curate_dataset.py --annotator hybrid --backend vllm).
+#
+# Install in its OWN environment: vLLM pins an exact torch (and its own
+# transformers), which would replace the training torch. See docs/RUNPOD.md.
+vllm
+datasets==5.0.*
+jsonlines
+gliner2==1.3.*

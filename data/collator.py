@@ -1,7 +1,7 @@
 """Data collator for batching cognitive dataset samples.
 
-Supports optional chat mode (with ChatTemplate) and KG tensor construction
-for ConceptNet-enriched samples.
+Supports optional chat mode (with ChatTemplate) and per-message trace
+annotations (flattened into encoder-input coordinates).
 """
 
 from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
@@ -9,7 +9,6 @@ import torch
 
 if TYPE_CHECKING:
     from .chat_template import ChatTemplate
-    from model.kg_relation_encoder import KGRelationEncoder
 
 
 class CognitiveCollator:
@@ -31,9 +30,9 @@ class CognitiveCollator:
         max_output_length: int = 256,
         chat_mode: bool = False,
         chat_template: Optional["ChatTemplate"] = None,
-        kg_relation_encoder: Optional["KGRelationEncoder"] = None,
         max_nodes: int = 32,
         vision_processor=None,
+        entity_type_map: Optional[Dict[str, int]] = None,
     ):
         """
         Initialize the collator.
@@ -48,8 +47,11 @@ class CognitiveCollator:
             max_output_length: Maximum output/response sequence length
             chat_mode: Whether to use chat message formatting
             chat_template: ChatTemplate instance (required if chat_mode=True)
-            kg_relation_encoder: KGRelationEncoder for building KG tensors
-            max_nodes: Maximum number of entity nodes (for KG tensor sizing)
+            max_nodes: Maximum number of entity nodes
+            entity_type_map: Mapping from entity type names to indices
+                (1-indexed, 0 = none). Used when samples carry an
+                "entity_types" field (e.g. GLiNER2-curated data); falls back
+                to concept_to_entity_type_map otherwise.
         """
         self.tokenizer = tokenizer
         self.concept_map = concept_map
@@ -61,9 +63,53 @@ class CognitiveCollator:
         self.max_output_length = max_output_length
         self.chat_mode = chat_mode
         self.chat_template = chat_template
-        self.kg_relation_encoder = kg_relation_encoder
         self.max_nodes = max_nodes
         self.vision_processor = vision_processor
+        self.entity_type_map = entity_type_map or {}
+        # Which end of the input truncation cuts. The causal collator cuts
+        # the start, so the prompt end stays next to the response.
+        self.truncation_side = "right"
+
+    def _use_chat(self, sample: dict) -> bool:
+        """Format a sample with the chat template.
+
+        Trace samples (messages, no flat text) always need the template,
+        also outside chat mode, so a trace row in a pretrain dataset does
+        not crash the batch.
+        """
+        if self.chat_template is None:
+            return False
+        return self.chat_mode or ("messages" in sample and "text" not in sample)
+
+    def _tokenize_inputs(self, texts: List[str]):
+        """Tokenize the batch once, with offsets when the tokenizer has them."""
+        old_side = getattr(self.tokenizer, "truncation_side", None)
+        if old_side is not None:
+            self.tokenizer.truncation_side = self.truncation_side
+        try:
+            try:
+                tok = self.tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                )
+            except (NotImplementedError, TypeError, ValueError):
+                # Slow tokenizers cannot return offsets
+                tok = self.tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+        finally:
+            if old_side is not None:
+                self.tokenizer.truncation_side = old_side
+        offsets = tok.pop("offset_mapping", None) if hasattr(tok, "pop") else None
+        return tok, offsets
     
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
         """
@@ -75,17 +121,22 @@ class CognitiveCollator:
         Returns:
             Dictionary with batched tensors
         """
+        # Project per-message annotations into encoder-input coordinates
+        # (trace samples carry message_annotations instead of flat fields)
+        batch = [self._flatten_message_annotations(s) for s in batch]
+
         # --- Determine input/target texts ---
         texts = []
         chat_targets = []  # Non-empty when chat_mode overrides response
         for sample in batch:
-            if self.chat_mode and self.chat_template and "messages" in sample:
+            use_chat = self._use_chat(sample)
+            if use_chat and "messages" in sample:
                 input_text, target_text = self.chat_template.format_messages(
                     sample["messages"]
                 )
                 texts.append(input_text)
                 chat_targets.append(target_text)
-            elif self.chat_mode and self.chat_template:
+            elif use_chat:
                 # No messages field — wrap text/response as single-turn
                 input_text, target_text = self.chat_template.format_single_turn(
                     sample["text"],
@@ -94,18 +145,17 @@ class CognitiveCollator:
                 texts.append(input_text)
                 chat_targets.append(target_text)
             else:
+                if "text" not in sample:
+                    raise ValueError(
+                        "Sample has no 'text' field (a trace sample needs a "
+                        "chat_template on the collator)"
+                    )
                 texts.append(sample["text"])
                 chat_targets.append("")
 
-        tok = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
+        tok, offsets = self._tokenize_inputs(texts)
 
-        max_entities = max(len(x["entities"]) for x in batch) if batch else 1
+        max_entities = max((len(x.get("entities", [])) for x in batch), default=0) or 1
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
         entity_type_labels = torch.zeros(len(batch), max_entities, dtype=torch.long)
         concept_labels = torch.zeros(len(batch), max_entities, self.n_concepts, dtype=torch.float)
@@ -121,7 +171,7 @@ class CognitiveCollator:
         decoder_input_ids = None
         decoder_labels = None
         if self.include_responses:
-            if self.chat_mode and any(ct != "" for ct in chat_targets):
+            if any(ct != "" for ct in chat_targets):
                 decoder_input_ids, decoder_labels = self._process_chat_responses(
                     batch, chat_targets
                 )
@@ -137,7 +187,8 @@ class CognitiveCollator:
 
             # Compute token-level spans for entity alignment
             token_spans = self._compute_entity_token_spans(
-                sample, texts[i], tok["input_ids"][i]
+                sample, texts[i], tok["input_ids"][i],
+                offsets[i].tolist() if offsets is not None else None,
             )
             entity_token_spans.append(token_spans)
 
@@ -156,19 +207,6 @@ class CognitiveCollator:
             result["decoder_input_ids"] = decoder_input_ids
             result["decoder_labels"] = decoder_labels
 
-        # KG tensor construction (optional, when samples have kg_relations)
-        kg_result = self._process_kg_data(batch)
-        result.update(kg_result)
-
-        # Entity names for path reasoning
-        entity_names = [sample.get("entities", []) for sample in batch]
-        result["entity_names"] = entity_names
-
-        # KG paths (pre-computed, optional)
-        kg_paths = [sample.get("kg_paths", []) for sample in batch]
-        if any(len(p) > 0 for p in kg_paths):
-            result["kg_paths"] = kg_paths
-
         # Vision: process images if vision_processor is available
         if self.vision_processor is not None:
             images = [sample.get("image") for sample in batch]
@@ -181,6 +219,79 @@ class CognitiveCollator:
 
         return result
     
+    def _flatten_message_annotations(self, sample: dict) -> dict:
+        """Flatten per-message symbolic annotations into sample-level fields.
+
+        Trace samples store annotations per message with spans relative to
+        each message's stripped content:
+
+            "message_annotations": [
+                {"message_idx": 1, "entities": [...], "entity_spans": [...],
+                 "concepts": [...], "entity_types": [...], "relations": [...]},
+                ...
+            ]
+
+        This projects those spans into the formatted encoder input via
+        ChatTemplate.format_messages_with_offsets and re-bases the relation
+        entity indices, so the rest of the collator sees an ordinary flat
+        sample whose entity_spans index into the tokenized text.
+        """
+        if (
+            not self._use_chat(sample)
+            or "messages" not in sample
+            or "message_annotations" not in sample
+        ):
+            return sample
+
+        messages = sample["messages"]
+        input_text, _, offsets = self.chat_template.format_messages_with_offsets(
+            messages
+        )
+
+        entities: List[str] = []
+        spans: List[List[int]] = []
+        concepts: List[List[str]] = []
+        entity_types: List[str] = []
+        relations: List[List] = []
+
+        for ann in sample["message_annotations"]:
+            mi = ann.get("message_idx")
+            if mi is None or not (0 <= mi < len(offsets)) or offsets[mi] is None:
+                continue
+            base = offsets[mi]
+            ann_entities = ann.get("entities", [])
+            ann_spans = ann.get("entity_spans", [])
+            ann_concepts = ann.get("concepts", [])
+            ann_types = ann.get("entity_types", [])
+            index_offset = len(entities)
+
+            for j, ent in enumerate(ann_entities):
+                if j >= len(ann_spans) or len(ann_spans[j]) != 2:
+                    continue
+                s, e = ann_spans[j]
+                entities.append(ent)
+                spans.append([base + int(s), base + int(e)])
+                concepts.append(ann_concepts[j] if j < len(ann_concepts) else [])
+                entity_types.append(ann_types[j] if j < len(ann_types) else "")
+
+            for rel in ann.get("relations", []):
+                if len(rel) == 3 and isinstance(rel[0], int) and isinstance(rel[1], int):
+                    relations.append(
+                        [rel[0] + index_offset, rel[1] + index_offset, rel[2]]
+                    )
+
+        flat = dict(sample)
+        del flat["message_annotations"]
+        # text = formatted input so gold spans validate against the same
+        # string that gets tokenized
+        flat["text"] = input_text
+        flat["entities"] = entities
+        flat["entity_spans"] = spans
+        flat["concepts"] = concepts
+        flat["entity_types"] = entity_types
+        flat["relations"] = relations
+        return flat
+
     def _process_responses(self, batch: List[dict]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Process response texts for decoder training.
@@ -302,38 +413,6 @@ class CognitiveCollator:
 
         return decoder_input_ids, decoder_labels
 
-    def _process_kg_data(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
-        """Build KG relation and adjacency tensors from sample kg_relations fields.
-
-        Returns a dict with optional keys:
-            kg_relation_ids: (B, N, N) long tensor of relation type indices
-            kg_adjacency: (B, N, N) float tensor binary mask for KG edges
-        """
-        has_kg = any("kg_relations" in sample for sample in batch)
-        if not has_kg or self.kg_relation_encoder is None:
-            return {}
-
-        B = len(batch)
-        N = self.max_nodes
-        kg_relation_ids = torch.zeros(B, N, N, dtype=torch.long)
-        kg_adjacency = torch.zeros(B, N, N, dtype=torch.float)
-
-        for i, sample in enumerate(batch):
-            for rel_triplet in sample.get("kg_relations", []):
-                if len(rel_triplet) != 3:
-                    continue
-                head_idx, tail_idx, rel_str = rel_triplet
-                if isinstance(head_idx, int) and isinstance(tail_idx, int):
-                    if head_idx < N and tail_idx < N:
-                        rel_id = self.kg_relation_encoder.encode_relation(rel_str)
-                        kg_relation_ids[i, head_idx, tail_idx] = rel_id
-                        kg_adjacency[i, head_idx, tail_idx] = 1.0
-
-        return {
-            "kg_relation_ids": kg_relation_ids,
-            "kg_adjacency": kg_adjacency,
-        }
-
     def _process_entities(
         self, 
         sample: dict, 
@@ -346,13 +425,18 @@ class CognitiveCollator:
         """Process entities from a sample."""
         entities = sample.get("entities", [])
         concepts = sample.get("concepts", [])
-        
+        entity_types = sample.get("entity_types", [])
+
         for j, ent in enumerate(entities):
             if j >= max_entities:
                 break
-            
+
             entity_ids[batch_idx, j] = j + 1
-            
+
+            # Prefer explicit entity type names (GLiNER2-curated data)
+            if j < len(entity_types) and entity_types[j] in self.entity_type_map:
+                entity_type_labels[batch_idx, j] = self.entity_type_map[entity_types[j]]
+
             # Get concepts for this entity
             if j < len(concepts):
                 ent_concepts = concepts[j]
@@ -366,8 +450,13 @@ class CognitiveCollator:
                     concept_idx = self.concept_map.get(concept, 0)
                     if concept_idx > 0 and concept_idx <= self.n_concepts:
                         concept_labels[batch_idx, j, concept_idx - 1] = 1.0
-                    
-                    if concept in self.concept_to_entity_type_map:
+
+                    # Fallback: derive entity type from concept only when no
+                    # explicit entity_types field set it above
+                    if (
+                        entity_type_labels[batch_idx, j] == 0
+                        and concept in self.concept_to_entity_type_map
+                    ):
                         entity_type_labels[batch_idx, j] = self.concept_to_entity_type_map[concept]
     
     def _process_relations(self, sample: dict) -> List[Tuple[int, int, int]]:
@@ -406,36 +495,97 @@ class CognitiveCollator:
         self,
         sample: dict,
         text: str,
-        input_ids: torch.Tensor
+        input_ids: torch.Tensor,
+        offsets: Optional[List[Tuple[int, int]]] = None,
     ) -> List[Tuple[int, int]]:
         """
         Compute token-level spans for entities.
-        
-        Returns list of (start_token_idx, end_token_idx) for each entity.
+
+        Returns one (start, end) token span per entity, end inclusive.
+        An entity that is not found, or that truncation cut from the
+        input, gets (-1, -1). Consumers skip it, so index alignment with
+        the entity list (and with relation indices) is kept.
+
+        Uses gold character spans from the sample when available (curated
+        data provides exact offsets, exclusive end); otherwise falls back to
+        finding the first occurrence of each entity string. Gold spans are
+        only trusted when the tokenized text is the sample's own text (chat
+        templating rewrites the input, invalidating offsets).
         """
         entities = sample.get("entities", [])
+        gold_spans = sample.get("entity_spans") or []
+        gold_spans_valid = (
+            len(gold_spans) == len(entities) and text == sample.get("text")
+        )
         token_spans = []
-        
-        for entity in entities:
-            # Find character span in original text
-            try:
-                char_start = text.lower().find(entity.lower())
-                if char_start == -1:
-                    token_spans.append((0, 0))
+
+        for j, entity in enumerate(entities):
+            char_start = char_end = None
+
+            if gold_spans_valid:
+                span = gold_spans[j]
+                if isinstance(span, (list, tuple)) and len(span) == 2:
+                    s, e = int(span[0]), int(span[1])
+                    # Verify the offsets actually point at the entity
+                    if 0 <= s < e <= len(text) and (
+                        text[s:e].strip().lower() == entity.strip().lower()
+                    ):
+                        char_start, char_end = s, e
+
+            if char_start is None:
+                # Fallback: first occurrence of the entity string
+                try:
+                    found = text.lower().find(entity.lower())
+                    if found == -1:
+                        token_spans.append((-1, -1))
+                        continue
+                    char_start, char_end = found, found + len(entity)
+                except (AttributeError, TypeError):
+                    token_spans.append((-1, -1))
                     continue
-                char_end = char_start + len(entity)
-            except:
-                token_spans.append((0, 0))
-                continue
-            
-            # Convert to token span
-            token_span = self._char_span_to_token_span(
-                text, char_start, char_end, input_ids
-            )
+
+            if offsets is not None:
+                token_span = self._char_span_from_offsets(
+                    offsets, char_start, char_end
+                )
+            else:
+                token_span = self._char_span_to_token_span(
+                    text, char_start, char_end, input_ids
+                )
             token_spans.append(token_span)
-        
+
         return token_spans
     
+    @staticmethod
+    def _char_span_from_offsets(
+        offsets: List[Tuple[int, int]], char_start: int, char_end: int
+    ) -> Tuple[int, int]:
+        """Map a char span to tokens of the actual (truncated) encoding.
+
+        Returns (-1, -1) when the span is not fully inside the kept tokens.
+        Special and padding tokens have empty (0, 0) offsets and never match.
+        """
+        start_token = end_token = None
+        first_char = last_char = None
+        for idx, (o_start, o_end) in enumerate(offsets):
+            if o_end <= o_start:
+                continue
+            if first_char is None:
+                first_char = o_start
+            last_char = o_end
+            if o_end > char_start and o_start < char_end:
+                if start_token is None:
+                    start_token = idx
+                end_token = idx
+        if (
+            start_token is None
+            or first_char is None
+            or char_start < first_char
+            or char_end > last_char
+        ):
+            return (-1, -1)
+        return (start_token, end_token)
+
     def _char_span_to_token_span(
         self,
         text: str,
@@ -474,9 +624,11 @@ class CognitiveCollator:
         if end_token is None:
             end_token = start_token
         
-        # Clamp to valid range
+        # Spans past the truncated input are dropped, not clamped onto the
+        # last token (that gives wrong labels)
         max_idx = len(input_ids) - 1
-        start_token = min(start_token, max_idx)
+        if start_token > max_idx:
+            return (-1, -1)
         end_token = min(end_token, max_idx)
-        
+
         return (start_token, end_token)

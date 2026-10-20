@@ -145,7 +145,8 @@ def evaluate_generation(
     device: str = "cpu", 
     num_samples: int = 5, 
     max_length: int = 128,
-    compute_metrics: bool = True
+    compute_metrics: bool = True,
+    max_input_length: int = 2048,
 ) -> List[Dict]:
     """
     Evaluate model's generation capabilities on a dataset subset.
@@ -176,10 +177,22 @@ def evaluate_generation(
         print("  No samples with responses found for evaluation")
         return results
     
+    chat_template = None
+
     with torch.no_grad():
         for sample in eval_samples:
-            input_text = sample["text"]
-            tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
+            if "text" in sample:
+                input_text = sample["text"]
+            elif "messages" in sample:
+                # Trace samples: build encoder input via the chat template
+                if chat_template is None:
+                    from data.chat_template import ChatTemplate
+                    chat_template = ChatTemplate()
+                input_text, _ = chat_template.format_messages(sample["messages"])
+            else:
+                continue
+            # Truncate the prompt to the input budget, not the generation length
+            tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_input_length)
             input_ids = tokenized["input_ids"].to(device)
             attention_mask = tokenized["attention_mask"].to(device)
             
@@ -288,6 +301,7 @@ def generate_response(
     input_text: str, 
     device: str = "cpu", 
     max_length: int = 128,
+    max_input_length: int = 2048,
     temperature: float = 1.0, 
     do_sample: bool = False, 
     top_k: Optional[int] = None, 
@@ -312,7 +326,7 @@ def generate_response(
     """
     model.eval()
     
-    tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
+    tokenized = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=max_input_length)
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
     

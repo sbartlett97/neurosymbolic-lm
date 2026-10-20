@@ -189,20 +189,28 @@ class ToyCognitiveDataset(Dataset):
         }
     """
     
-    def __init__(self, jsonl_file_path: Optional[str] = None):
+    def __init__(self, jsonl_file_path: Optional[str] = None,
+                 augment: Optional[bool] = None):
         """
         Initialize dataset from JSONL file or use hardcoded toy data.
         
         Args:
             jsonl_file_path: Path to JSONL file. If None, uses hardcoded toy dataset.
+            augment: Rewrite statements into heuristic question/abstain
+                pairs (_process_entries). Default: only for the toy data.
+                Curated files already hold their final samples; rewriting
+                them corrupts QA rows and adds abstain copies.
         """
         if jsonl_file_path is not None:
             self.data = self._load_from_jsonl(jsonl_file_path)
         else:
             self.data = self._get_default_data()
+        if augment is None:
+            augment = jsonl_file_path is None
         
         self._normalize_concepts()
-        self._process_entries()
+        if augment:
+            self._process_entries()
     
     def _load_from_jsonl(self, filepath: str) -> List[dict]:
         """Load dataset from JSONL file."""
@@ -310,7 +318,11 @@ class ToyCognitiveDataset(Dataset):
         """
         processed_data = []
         for entry in self.data:
-            if entry.get("should_respond", 0) == 1:
+            if "messages" in entry:
+                # Trace/chat samples carry their own conversation structure
+                # and (optionally) per-message annotations — use as-is.
+                processed_data.append(entry)
+            elif entry.get("should_respond", 0) == 1:
                 text = entry["text"]
                 
                 if self._is_question(text):

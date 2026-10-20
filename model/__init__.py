@@ -18,16 +18,24 @@ from .entity import (
 )
 from .gnn import (
     SimpleGNN,
-    KGAwareGNN,
-    KGPathReasoner,
+    AttentionGNN,
 )
-from .entity_selector import SoftEntitySelector
-from .linear_graph_transformer import LinearGraphTransformer, LinearGraphTransformerLayer
-from .global_workspace import GlobalWorkspace
-from .kg_relation_encoder import (
-    KGRelationEncoder,
-    CONCEPTNET_RELATIONS,
-)
+# Optional experimental modules (referenced by ModelConfig flags that
+# default to off). Their source files are not yet in the repo, so import
+# them tolerantly — NeuroSymbolicLM imports them lazily only when the
+# corresponding use_* flag is enabled.
+try:
+    from .entity_selector import SoftEntitySelector
+except ImportError:
+    SoftEntitySelector = None
+try:
+    from .linear_graph_transformer import LinearGraphTransformer, LinearGraphTransformerLayer
+except ImportError:
+    LinearGraphTransformer = LinearGraphTransformerLayer = None
+try:
+    from .global_workspace import GlobalWorkspace
+except ImportError:
+    GlobalWorkspace = None
 from .logic import (
     SoftLogicConstraints,
     pair_logits_to_matrix,
@@ -36,6 +44,9 @@ from .neurosymbolic import (
     NeuroSymbolicLM,
     compute_losses,
 )
+from .extraction_adapter import ExtractionAdapter
+from .injection import NodePrefixInjector
+from .neurosymbolic_causal import NeuroSymbolicCausalLM, build_tiny_backbone
 
 __all__ = [
     # Encoders
@@ -52,11 +63,7 @@ __all__ = [
     "ConceptBank",
     # GNN
     "SimpleGNN",
-    "KGAwareGNN",
-    "KGPathReasoner",
-    # KG Relation Encoder
-    "KGRelationEncoder",
-    "CONCEPTNET_RELATIONS",
+    "AttentionGNN",
     # Logic
     "SoftLogicConstraints",
     "pair_logits_to_matrix",
@@ -70,4 +77,9 @@ __all__ = [
     # Main model
     "NeuroSymbolicLM",
     "compute_losses",
+    # Decoder-only variant
+    "NeuroSymbolicCausalLM",
+    "ExtractionAdapter",
+    "NodePrefixInjector",
+    "build_tiny_backbone",
 ]

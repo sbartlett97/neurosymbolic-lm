@@ -107,6 +107,20 @@ Provide a JSON response:
 
 Output ONLY the JSON object:"""
 
+# Structured-output schema for QA_PROMPT. API backends send it so the
+# reply always parses. The fields match the JSON shape in QA_PROMPT. Strict
+# mode needs every property in "required" and no extra properties.
+QA_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question": {"type": "string"},
+        "answer": {"type": "string"},
+        "response_reason": {"type": "string"},
+    },
+    "required": ["question", "answer", "response_reason"],
+    "additionalProperties": False,
+}
+
 # Concepts hierarchy for reference
 CONCEPT_HIERARCHY = {
     "person": ["scientist", "politician", "artist", "athlete", "writer", "actor", "musician", "leader"],

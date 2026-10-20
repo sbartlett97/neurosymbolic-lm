@@ -74,13 +74,50 @@ python train.py --prepare-data --data-sources rebel dolly --epochs 5
 python train.py --dataset mydata.jsonl --stages symbolic decoder joint
 ```
 
-### Data Labelling
+### Dataset Curation
 
-Create custom training data with the Streamlit labelling interface:
+Build training data from corpus text with GLiNER2 schema-driven extraction
+(entities, spans, concepts, entity types, relations) and optional LLM QA
+generation:
 
 ```bash
-streamlit run labelling_app.py
+# Stage-1 symbolic data (no LLM required)
+python data/curate_dataset.py --annotator gliner \
+    --sources allenai/c4 wikipedia --target-samples 50000
+
+# GLiNER2 extraction + LLM-generated QA pairs (stage-2/3 data)
+python data/curate_dataset.py --annotator hybrid --backend vllm
+
+# Assistant traces (tool calling) with per-message symbolic annotation
+python data/curate_traces.py --source glaiveai/glaive-function-calling-v2
 ```
+
+See `DATASET_FORMAT.md` for the output schema and per-stage usage.
+
+### Decoder-Only Variant
+
+A decoder-only version of the architecture (Qwen3/Gemma3/Llama3.2
+backbones, symbolic heads on a tapped mid-layer, GNN nodes injected as
+gated soft tokens) lives in `model/neurosymbolic_causal.py` and trains via
+`train_causal.py`. See `docs/DECODER_ONLY_MIGRATION.md`.
+
+```bash
+python train_causal.py --preset qwen3-0.6b --dataset data/curated/curated.jsonl
+```
+
+Presets: `qwen3-0.6b`, `qwen3-1.7b`, `qwen3-1.7b-lora`, `qwen3-4b-lora`,
+`gemma3-1b`, `llama3.2-1b`, and `causal-testing` (tiny random backbone with
+the real Qwen3 tokenizer, for smoke runs). Each stage reports a validation
+loss from `<dataset>_val.jsonl`, and writes `stage_<name>.pt` with the full
+config and label maps. Reload a checkpoint with
+`train_causal.load_causal_checkpoint`.
+
+### RunPod
+
+`docs/RUNPOD.md` is the runbook for dataset generation and training on a
+RunPod GPU pod. It covers GPU sizing per preset, setup
+(`scripts/runpod_setup.sh`), detached runs, the smoke test, and which log
+values to watch.
 
 ## Training Stages
 
@@ -122,7 +159,6 @@ Training data uses JSONL format. See `DATASET_FORMAT.md` for full specification.
 neurosymbolic_model/
     config.py                    # Model and training configurations
     train.py                     # Main training script
-    labelling_app.py             # Streamlit data labelling UI
     comprehensive_dataset.jsonl  # Example training data
     DATASET_FORMAT.md            # Dataset format specification
     
@@ -187,7 +223,9 @@ Training:
   --patience N            Early stopping patience
 
 Hardware:
-  --device                cuda or cpu
+  --device                auto, cuda, mps (Apple Silicon), or cpu
+                          (auto picks cuda > mps > cpu; AMP is CUDA-only,
+                          MPS/CPU run fp32)
   --no-amp                Disable mixed precision
   
 Output:
