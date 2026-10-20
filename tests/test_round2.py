@@ -274,3 +274,22 @@ def test_api_first_rejection_is_printed_once(capsys):
     b.generate_chat_batch(["a JSON q", "another JSON q"])
     out = capsys.readouterr().out
     assert out.count("request rejected") == 1 and "claude-nope" in out
+
+
+def test_injection_gate_gets_its_own_lr():
+    from train_causal import make_optimizer
+
+    model = _tiny_model()
+    opt = make_optimizer(model, lr=1e-5, weight_decay=0.01, gate_lr=1e-3)
+    gate_groups = [g for g in opt.param_groups
+                   if any(p is model.injector.gate for p in g["params"])]
+    assert len(gate_groups) == 1
+    g = gate_groups[0]
+    assert g["params"] == [model.injector.gate]
+    assert g["lr"] == 1e-3 and g["weight_decay"] == 0.0
+    # The step log reads group 0: it keeps the stage LR
+    assert opt.param_groups[0]["lr"] == 1e-5
+
+    # Default: the gate follows the stage LR
+    opt = make_optimizer(model, lr=1e-5, weight_decay=0.01)
+    assert all(g["lr"] == 1e-5 for g in opt.param_groups)

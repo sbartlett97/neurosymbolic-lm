@@ -104,3 +104,34 @@ Scope: close gaps that crash a run or train it wrong. Prep only — no pod creat
 - [x] Training max_input_length 2048 -> 4096 for all causal presets.
 - [x] max_entities 24 -> 128 per document, new --max-entities (config value was never wired).
 - [x] Runbook GPU table updated for the longer context.
+
+# Round 4: first full training run, qwen3-0.6b (2026-10-20)
+
+## Smoke run (done)
+- [x] A40 48 GB pod in CA-MTL-1, with a 150 GB network volume at /workspace
+- [x] Setup on the pod: 153 tests pass
+- [x] 400 rows, 1 epoch per stage, batch 4: SMOKE_EXIT=0, no skipped batches
+- [x] Hub push to sbartlett97/neurosymbolic-causal-lm/smoke: all stages and final
+- [x] Peak GPU memory 22.1 GB (joint stage, 619M trainable)
+- [x] Gate LR fix: `--gate-lr` (default 1e-3), with its own optimizer group.
+      At the stage LR, the gate moved only 0.1000 -> 0.1001 in 100 steps
+
+Smoke speed at batch 4: symbolic 4.8, decoder 1.8, joint 1.6 samples/s.
+
+## Full run plan
+- [ ] Commit and push the gate LR change. Pull it on the pod
+- [ ] Run detached (setsid), with the log on the volume:
+      python -u train_causal.py --preset qwen3-0.6b \
+        --dataset /workspace/data/curated/curated.jsonl \
+        --stage2-dataset /workspace/data/curated_qa/curated.jsonl \
+        --epochs 2 --batch-size 4 --max-eval-samples 500 --log-every 100 \
+        --output-dir /workspace/ckpt/qwen3-0.6b-v1 --log-dir /workspace/runs/qwen3-0.6b-v1 \
+        --hub-repo sbartlett97/neurosymbolic-causal-lm --hub-path qwen3-0.6b-v1
+- [ ] Time estimate for each epoch: symbolic 2.8 h, decoder 3.0 h, joint 3.4 h.
+      2 epochs: about 19 h, about $11 at $0.59/hr
+- [ ] Checks during the run (stop the run if one fails):
+  1. Symbolic epoch 1: entity_f1 above the smoke value 0.318. relation_f1 above 0
+  2. Decoder: the gate moves off 0.1. val is lower than val_gate0, and the gap grows
+  3. Joint: the response val loss does not rise above the decoder stage value
+- [ ] Recovery: the volume keeps latest.pt. Continue with --resume and the remaining --stages
+- [ ] After the run: delete the pod. Keep the volume until the Hub has the final model

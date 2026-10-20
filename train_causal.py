@@ -133,6 +133,9 @@ def parse_args(argv=None):
     train_group.add_argument("--lr", type=float, default=5e-5,
                              help="Stage 2 LR is lr*0.5, joint lr*0.1")
     train_group.add_argument("--chat-lr", type=float, default=1e-5)
+    train_group.add_argument("--gate-lr", type=float, default=1e-3,
+                             help="LR of the scalar injection gate in every "
+                                  "stage. At the stage LR it barely moves")
     train_group.add_argument("--weight-decay", type=float, default=0.01)
     train_group.add_argument("--warmup-ratio", type=float, default=0.1)
     train_group.add_argument("--patience", type=int, default=3)
@@ -450,18 +453,24 @@ def set_stage_trainable(model: NeuroSymbolicCausalLM, symbolic: bool,
         p.requires_grad = injector
 
 
-def make_optimizer(model, lr: float, weight_decay: float):
-    decay, no_decay = [], []
+def make_optimizer(model, lr: float, weight_decay: float,
+                   gate_lr: Optional[float] = None):
+    decay, no_decay, gate = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # No decay on biases, norms, and the injection gate
-        if p.ndim < 2 or "norm" in n.lower() or n.endswith("gate"):
+        # The injection gate is one scalar: own LR, no decay
+        if n.endswith("injector.gate"):
+            gate.append(p)
+        # No decay on biases and norms
+        elif p.ndim < 2 or "norm" in n.lower():
             no_decay.append(p)
         else:
             decay.append(p)
+    # The decay group stays first: the step log reads get_last_lr()[0]
     groups = [{"params": decay, "weight_decay": weight_decay},
-              {"params": no_decay, "weight_decay": 0.0}]
+              {"params": no_decay, "weight_decay": 0.0},
+              {"params": gate, "weight_decay": 0.0, "lr": gate_lr or lr}]
     n_params = sum(p.numel() for g in groups for p in g["params"])
     print(f"  Trainable parameters: {n_params:,}")
     return AdamW([g for g in groups if g["params"]], lr=lr)
@@ -893,7 +902,7 @@ def main(argv=None):
         train_loader = loader(dataset, include_responses, chat)
         val_loader = (loader(eval_dataset, include_responses, chat, shuffle=False)
                       if eval_dataset is not None else None)
-        optimizer = make_optimizer(model, lr, args.weight_decay)
+        optimizer = make_optimizer(model, lr, args.weight_decay, args.gate_lr)
         total_steps = max(1, math.ceil(len(train_loader) / args.grad_accum) * epochs)
         scheduler = get_linear_schedule_with_warmup(
             optimizer, int(total_steps * args.warmup_ratio), total_steps
