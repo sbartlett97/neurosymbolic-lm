@@ -159,6 +159,11 @@ def parse_args(argv=None):
     out_group.add_argument("--resume", type=str, default=None,
                            help="Checkpoint to start from. Its config and label "
                                 "maps are used; pick the remaining --stages.")
+    out_group.add_argument("--init-from", type=str, default=None,
+                           help="Checkpoint whose non-backbone weights (adapter, "
+                                "heads, GNN, injector) and label maps start this "
+                                "run. The backbone comes from --preset, so a "
+                                "LoRA preset can reuse a stage_symbolic.pt")
     out_group.add_argument("--log-dir", type=str, default="runs")
     out_group.add_argument("--hub-repo", type=str, default=None,
                            help="Push stage checkpoints, the final model and the "
@@ -426,6 +431,60 @@ def load_causal_checkpoint(path: str, device: str = "cpu"):
     result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     report_key_mismatch(result)
     return model.to(device), tokenizer, ckpt
+
+
+# Fields that come from the --preset when --init-from takes the rest of the
+# config from a checkpoint: how the backbone trains, not what the heads are
+BACKBONE_TRAINING_FIELDS = ("use_lora", "lora_r", "lora_alpha", "lora_dropout",
+                            "gradient_checkpointing")
+
+
+def init_config(preset: CausalModelConfig, ckpt_config: Dict) -> CausalModelConfig:
+    """Config for --init-from: head sizes and architecture from the
+    checkpoint (its weights must fit), backbone training from the preset."""
+    config = config_from_dict(ckpt_config)
+    if preset.model_name != config.model_name:
+        raise SystemExit(
+            f"--init-from checkpoint has backbone {config.model_name}, but the "
+            f"preset uses {preset.model_name}"
+        )
+    for name in BACKBONE_TRAINING_FIELDS:
+        setattr(config, name, getattr(preset, name))
+    return config
+
+
+def _final_norm(state: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+    """The backbone's final norm weight, under plain or peft key names."""
+    for k, v in state.items():
+        if k.startswith("backbone.") and k.endswith("model.norm.weight") \
+                and "layers." not in k:
+            return v
+    return None
+
+
+def load_init_weights(model: NeuroSymbolicCausalLM, ckpt: Dict) -> None:
+    """--init-from: load every weight except the backbone."""
+    state = {k: v for k, v in ckpt["model_state_dict"].items()
+             if not k.startswith("backbone.")}
+    own = {k for k in model.state_dict() if not k.startswith("backbone.")}
+    result = model.load_state_dict(state, strict=False)
+    missing = [k for k in result.missing_keys if k in own]
+    if missing or result.unexpected_keys:
+        for k in (missing[:5] + result.unexpected_keys[:5]):
+            print(f"    {k}")
+        raise SystemExit(
+            f"--init-from: {len(missing)} missing, {len(result.unexpected_keys)} "
+            "unexpected non-backbone keys. The checkpoint does not fit this model."
+        )
+    print(f"  Loaded {len(state)} non-backbone tensors")
+    # Stage 1 freezes the backbone, so a stage_symbolic.pt holds the base
+    # weights. Heads trained on another backbone read different features.
+    theirs = _final_norm(ckpt["model_state_dict"])
+    ours = _final_norm(model.state_dict())
+    if theirs is not None and ours is not None and not torch.allclose(
+            theirs.float(), ours.float().cpu(), atol=1e-2):
+        print("  Warning: the checkpoint's backbone differs from this one. "
+              "Its heads were trained on other features.")
 
 
 def report_key_mismatch(result):
@@ -736,13 +795,22 @@ def main(argv=None):
     if world > 1:
         print(f"Distributed: {world} processes")
 
+    if args.resume and args.init_from:
+        raise SystemExit("Use --resume or --init-from, not both")
     resume_ckpt = None
+    init_ckpt = None
+    if args.init_from:
+        require_path(args.init_from, "--init-from")
+        init_ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        config = init_config(build_model_config(args), init_ckpt["config"])
+        print(f"Init from {args.init_from} (non-backbone weights, head sizes "
+              "and label maps)")
     if args.resume:
         require_path(args.resume, "--resume")
         resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         config = config_from_dict(resume_ckpt["config"])
         print(f"Resuming from {args.resume} (config and label maps from checkpoint)")
-    else:
+    elif init_ckpt is None:
         config = build_model_config(args)
 
     print("=" * 70)
@@ -795,11 +863,12 @@ def main(argv=None):
         raise SystemExit("--phase chat needs --chat-dataset")
 
     # --- vocabulary (fixed before the model is built) -------------------
-    if resume_ckpt is not None:
-        concept_map = resume_ckpt["concept_map"]
-        relation_map = resume_ckpt["relation_map"]
-        entity_type_name_map = resume_ckpt.get("entity_type_map", {})
-        concept_to_type = resume_ckpt.get("concept_to_entity_type_map", {})
+    maps_ckpt = resume_ckpt if resume_ckpt is not None else init_ckpt
+    if maps_ckpt is not None:
+        concept_map = maps_ckpt["concept_map"]
+        relation_map = maps_ckpt["relation_map"]
+        entity_type_name_map = maps_ckpt.get("entity_type_map", {})
+        concept_to_type = maps_ckpt.get("concept_to_entity_type_map", {})
     else:
         sources = [(train_dataset, dataset_path)]
         if stage2_dataset is not None:
@@ -829,6 +898,9 @@ def main(argv=None):
             model.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
         )
         del resume_ckpt
+    if init_ckpt is not None:
+        load_init_weights(model, init_ckpt)
+        del init_ckpt
     model = model.to(args.device)
     total = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total:,} (tap layer {model.tap_layer})")

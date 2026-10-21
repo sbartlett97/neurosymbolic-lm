@@ -146,3 +146,52 @@ Smoke speed at batch 4: symbolic 4.8, decoder 1.8, joint 1.6 samples/s.
       (base model, this model, this model with gate = 0). Fill in the benchmark table
 - [ ] Decoder-only val loss for stage_decoder.pt and stage_joint.pt (the joint check)
 - [ ] Push the card to the Hub as README.md (after approval)
+
+# Round 5: v2 run plan, qwen3-0.6b-lora (2026-10-21)
+
+Goal: keep the base model's general ability (v1 lost 4-15 points on every
+zero-shot task) and keep the graph's gain on document QA.
+
+## Changes
+- [ ] Preset `qwen3-0.6b-lora` in config.py: Qwen3-0.6B-Base, use_lora=True
+      (r 16, alpha 32, all-linear, chat token rows trainable). Base in bf16
+- [ ] `--epochs 1` for the decoder and joint stages
+- [ ] `--lr 2e-4` (LoRA range): decoder 1e-4, joint 2e-5. Gate LR stays 1e-3
+- [ ] Reuse the v1 symbolic stage: new `--init-from <ckpt>` loads every weight
+      except `backbone.*`. It refuses if the label maps differ. Valid because
+      stage 1 froze the backbone, so v1 stage_symbolic.pt = Qwen base + heads.
+      Saves the 6 h symbolic stage. Run `--stages decoder joint`
+- [ ] New `data/mix_stage2.py`: builds the v2 stage 2/3 set from the v1 files
+      (no new API calls):
+  1. respond: the 13,766 v1 QA rows, unchanged
+  2. unanswerable (replaces the v1 no-question abstain rows): a document plus
+     a question from another document that shares an entity type.
+     should_respond=0, target EOS
+  3. general text: a prefix of a corpus document not used in QA. The target is
+     the next 64-128 tokens. Entity spans and relations are kept only if they
+     sit inside the prefix. About 4,000 rows (15% of rows, about half of the
+     response tokens: the loss is a per-token mean)
+  - Train/val split follows the source document's split
+  - Writes curated_v2.jsonl, curated_v2_val.jsonl, curated_v2_vocab.json
+- [ ] Tests: preset, --init-from (loads, refuses a map mismatch), mix script
+      (span filtering, relation reindex, no answer leaks, split kept)
+
+## Why the abstain rows change
+v1 abstain rows were documents with no question (target EOS). General-text
+rows are also documents with no question, but their target is a continuation.
+The two kinds would contradict each other. Unanswerable questions fix this,
+and they teach real abstention, which v1 did not learn.
+
+## Run
+- Train rows: about 13.8k respond + 6.2k unanswerable + 4k general = 24k.
+  About 6,000 steps per stage at batch 4
+- Time: decoder + joint about 7-8 h (LoRA, bf16 base). Cost about $4.50 at $0.59/hr
+- Benchmarks: the same 6 zero-shot tasks, MMLU 5-shot and SQuAD v2, on v2
+  (graph on and graph off). The base model results from v1 stay valid.
+  About 3 h, about $2
+
+## Checks
+1. Zero-shot scores with graph off: within 2 points of Qwen3-0.6B-Base
+2. Decoder and joint: val < val_gate0
+3. abstain_acc (now on unanswerable questions) > 0.8 and respond_rate > 0.9
+4. SQuAD v2: better than v1, mainly on the no-answer questions
