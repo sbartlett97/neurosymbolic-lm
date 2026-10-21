@@ -63,8 +63,9 @@ The model has three steps for each prompt:
 
 The backbone then predicts the response as a normal causal LM.
 
-**Abstention.** If the prompt does not contain the answer, the model emits EOS as
-its first token.
+**Abstention.** If the prompt is a document with no question, the model emits
+EOS as its first token. The training data has no unanswerable questions, so the
+model did not learn to refuse a question that the document cannot answer.
 
 **Ablation.** Set the gate to 0 (`use_soft_nodes=False`) to remove the graph
 signal. The difference between the two settings shows how much the graph helps.
@@ -74,7 +75,7 @@ signal. The difference between the two settings shows how much the graph helps.
 | Set | Rows (train / val) | How it was made |
 |---|---|---|
 | Symbolic corpus | 49,009 / 991 | 50k documents, 60% from `allenai/c4` and 40% from Wikipedia. Each document has at most 16,000 characters. [GLiNER2](https://huggingface.co/fastino/gliner2-base-v1) (`fastino/gliner2-base-v1`) annotated the entities, entity types and relations. |
-| QA set | 19,598 / 402 | 20k extractive question/answer pairs on curated documents. `gpt-6-luna` wrote them through the OpenAI Batch API. 13,766 rows have an answer in the document. 6,234 rows have no answer, and the target is EOS (abstain). A check found 0 answer spans outside their documents. |
+| QA set | 19,598 / 402 | 20k extractive question/answer pairs on curated documents. `gpt-6-luna` wrote them through the OpenAI Batch API. 13,766 rows (respond) are a document plus a question, with the answer as target. 6,234 rows (abstain) are a document with no question, and the target is EOS. A check found 0 answer spans outside their documents. |
 
 Both sets are in a private dataset repository (`sbartlett97/neurosymbolic-curated`).
 
@@ -101,7 +102,7 @@ rate (1e-3) and no weight decay.
 | 3. Joint | all modules | none | 618.7M | QA set | 5e-6 | 9,798 |
 
 **Compute:**
-- Hardware: 1x A40 48 GB, fp32 weights and AdamW states.
+- Hardware: 1x A40 48 GB. fp32 weights and AdamW states, bf16 autocast.
 - Peak GPU memory: 22.7 GB.
 - Speed: about 1.1 steps/s in stage 1, about 0.42 steps/s in stages 2 and 3.
 - Wall time: about 20 h. Cost: about $12 at $0.59/hr.
@@ -130,7 +131,8 @@ How to read the table:
   losses. Do not compare it with the decoder-stage val loss.
 - **Abstain acc / respond rate** only examine the first generated token: EOS or not
   EOS. They do not measure answer quality. A score of 1.000 shows that the
-  model separates answerable and unanswerable questions on this val set.
+  model emits EOS when the prompt has no question, and answers when it has one.
+  This is an easy cue: the prompt ends with a question or it does not.
 
 ### Benchmarks
 
@@ -198,8 +200,7 @@ To read the extracted graph, call `model(input_ids, attention_mask)` without
 
 - Research on neurosymbolic language models: graph extraction plus graph injection
   in one decoder-only model.
-- Extractive QA over one document, with abstention when the document does not
-  contain the answer.
+- Extractive QA over one document.
 - Entity and relation extraction from the same forward pass.
 
 ## Out of scope
@@ -222,9 +223,11 @@ To read the extracted graph, call `model(input_ids, attention_mask)` without
   not with human labels.
 - **Synthetic QA.** An LLM wrote all the questions and answers. Their style is narrower
   than real user questions.
-- **Abstention cue.** Abstention is perfect on the val set. The unanswerable
-  questions possibly have a pattern that is easy to detect. Abstention on real
-  questions is not tested.
+- **No unanswerable questions in training.** Abstain rows have no question, so
+  abstention is perfect on the val set for an easy reason. The model did not
+  learn to refuse a question that its document cannot answer. SQuAD v2 tests
+  this case. The next data version adds questions with no answer in the
+  document.
 - **English only.** All training text is English web and Wikipedia text.
 - **Inherited bias.** The model keeps the biases of Qwen3-0.6B-Base, C4,
   Wikipedia and the QA generator.
