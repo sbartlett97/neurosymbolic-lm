@@ -237,6 +237,12 @@ class CausalModelConfig:
         return cls(model_name="meta-llama/Llama-3.2-1B")
 
     @classmethod
+    def for_qwen3_0_6b_lora(cls) -> "CausalModelConfig":
+        """Frozen bf16 base + LoRA: keeps the base model's general ability
+        (v1 full fine-tuning lost 4-15 points on zero-shot benchmarks)."""
+        return cls(model_name="Qwen/Qwen3-0.6B-Base", use_lora=True)
+
+    @classmethod
     def for_qwen3_1_7b_lora(cls) -> "CausalModelConfig":
         """1.7B on a 24 GB card: full FT needs ~30 GB+ (fp32 AdamW)."""
         return cls(model_name="Qwen/Qwen3-1.7B-Base", use_lora=True)
@@ -248,6 +254,13 @@ class CausalModelConfig:
             use_lora=True,
             max_input_length=4096,
         )
+
+    @classmethod
+    def for_testing_lora(cls) -> "CausalModelConfig":
+        """for_testing with LoRA on the backbone."""
+        config = cls.for_testing()
+        config.use_lora = True
+        return config
 
     @classmethod
     def for_testing(cls) -> "CausalModelConfig":
@@ -271,12 +284,14 @@ class CausalModelConfig:
 
 CAUSAL_MODEL_PRESETS = {
     "qwen3-0.6b": CausalModelConfig.for_qwen3_0_6b,
+    "qwen3-0.6b-lora": CausalModelConfig.for_qwen3_0_6b_lora,
     "qwen3-1.7b": CausalModelConfig.for_qwen3_1_7b,
     "qwen3-1.7b-lora": CausalModelConfig.for_qwen3_1_7b_lora,
     "qwen3-4b-lora": CausalModelConfig.for_qwen3_4b_lora,
     "gemma3-1b": CausalModelConfig.for_gemma3_1b,
     "llama3.2-1b": CausalModelConfig.for_llama32_1b,
     "causal-testing": CausalModelConfig.for_testing,
+    "causal-testing-lora": CausalModelConfig.for_testing_lora,
 }
 
 

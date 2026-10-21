@@ -133,6 +133,9 @@ def parse_args(argv=None):
     train_group.add_argument("--lr", type=float, default=5e-5,
                              help="Stage 2 LR is lr*0.5, joint lr*0.1")
     train_group.add_argument("--chat-lr", type=float, default=1e-5)
+    train_group.add_argument("--gate-lr", type=float, default=1e-3,
+                             help="LR of the scalar injection gate in every "
+                                  "stage. At the stage LR it barely moves")
     train_group.add_argument("--weight-decay", type=float, default=0.01)
     train_group.add_argument("--warmup-ratio", type=float, default=0.1)
     train_group.add_argument("--patience", type=int, default=3)
@@ -156,6 +159,11 @@ def parse_args(argv=None):
     out_group.add_argument("--resume", type=str, default=None,
                            help="Checkpoint to start from. Its config and label "
                                 "maps are used; pick the remaining --stages.")
+    out_group.add_argument("--init-from", type=str, default=None,
+                           help="Checkpoint whose non-backbone weights (adapter, "
+                                "heads, GNN, injector) and label maps start this "
+                                "run. The backbone comes from --preset, so a "
+                                "LoRA preset can reuse a stage_symbolic.pt")
     out_group.add_argument("--log-dir", type=str, default="runs")
     out_group.add_argument("--hub-repo", type=str, default=None,
                            help="Push stage checkpoints, the final model and the "
@@ -425,6 +433,60 @@ def load_causal_checkpoint(path: str, device: str = "cpu"):
     return model.to(device), tokenizer, ckpt
 
 
+# Fields that come from the --preset when --init-from takes the rest of the
+# config from a checkpoint: how the backbone trains, not what the heads are
+BACKBONE_TRAINING_FIELDS = ("use_lora", "lora_r", "lora_alpha", "lora_dropout",
+                            "gradient_checkpointing")
+
+
+def init_config(preset: CausalModelConfig, ckpt_config: Dict) -> CausalModelConfig:
+    """Config for --init-from: head sizes and architecture from the
+    checkpoint (its weights must fit), backbone training from the preset."""
+    config = config_from_dict(ckpt_config)
+    if preset.model_name != config.model_name:
+        raise SystemExit(
+            f"--init-from checkpoint has backbone {config.model_name}, but the "
+            f"preset uses {preset.model_name}"
+        )
+    for name in BACKBONE_TRAINING_FIELDS:
+        setattr(config, name, getattr(preset, name))
+    return config
+
+
+def _final_norm(state: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+    """The backbone's final norm weight, under plain or peft key names."""
+    for k, v in state.items():
+        if k.startswith("backbone.") and k.endswith("model.norm.weight") \
+                and "layers." not in k:
+            return v
+    return None
+
+
+def load_init_weights(model: NeuroSymbolicCausalLM, ckpt: Dict) -> None:
+    """--init-from: load every weight except the backbone."""
+    state = {k: v for k, v in ckpt["model_state_dict"].items()
+             if not k.startswith("backbone.")}
+    own = {k for k in model.state_dict() if not k.startswith("backbone.")}
+    result = model.load_state_dict(state, strict=False)
+    missing = [k for k in result.missing_keys if k in own]
+    if missing or result.unexpected_keys:
+        for k in (missing[:5] + result.unexpected_keys[:5]):
+            print(f"    {k}")
+        raise SystemExit(
+            f"--init-from: {len(missing)} missing, {len(result.unexpected_keys)} "
+            "unexpected non-backbone keys. The checkpoint does not fit this model."
+        )
+    print(f"  Loaded {len(state)} non-backbone tensors")
+    # Stage 1 freezes the backbone, so a stage_symbolic.pt holds the base
+    # weights. Heads trained on another backbone read different features.
+    theirs = _final_norm(ckpt["model_state_dict"])
+    ours = _final_norm(model.state_dict())
+    if theirs is not None and ours is not None and not torch.allclose(
+            theirs.float(), ours.float().cpu(), atol=1e-2):
+        print("  Warning: the checkpoint's backbone differs from this one. "
+              "Its heads were trained on other features.")
+
+
 def report_key_mismatch(result):
     if result.missing_keys or result.unexpected_keys:
         print(f"  Checkpoint key mismatch: {len(result.missing_keys)} missing, "
@@ -450,18 +512,24 @@ def set_stage_trainable(model: NeuroSymbolicCausalLM, symbolic: bool,
         p.requires_grad = injector
 
 
-def make_optimizer(model, lr: float, weight_decay: float):
-    decay, no_decay = [], []
+def make_optimizer(model, lr: float, weight_decay: float,
+                   gate_lr: Optional[float] = None):
+    decay, no_decay, gate = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # No decay on biases, norms, and the injection gate
-        if p.ndim < 2 or "norm" in n.lower() or n.endswith("gate"):
+        # The injection gate is one scalar: own LR, no decay
+        if n.endswith("injector.gate"):
+            gate.append(p)
+        # No decay on biases and norms
+        elif p.ndim < 2 or "norm" in n.lower():
             no_decay.append(p)
         else:
             decay.append(p)
+    # The decay group stays first: the step log reads get_last_lr()[0]
     groups = [{"params": decay, "weight_decay": weight_decay},
-              {"params": no_decay, "weight_decay": 0.0}]
+              {"params": no_decay, "weight_decay": 0.0},
+              {"params": gate, "weight_decay": 0.0, "lr": gate_lr or lr}]
     n_params = sum(p.numel() for g in groups for p in g["params"])
     print(f"  Trainable parameters: {n_params:,}")
     return AdamW([g for g in groups if g["params"]], lr=lr)
@@ -727,13 +795,22 @@ def main(argv=None):
     if world > 1:
         print(f"Distributed: {world} processes")
 
+    if args.resume and args.init_from:
+        raise SystemExit("Use --resume or --init-from, not both")
     resume_ckpt = None
+    init_ckpt = None
+    if args.init_from:
+        require_path(args.init_from, "--init-from")
+        init_ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        config = init_config(build_model_config(args), init_ckpt["config"])
+        print(f"Init from {args.init_from} (non-backbone weights, head sizes "
+              "and label maps)")
     if args.resume:
         require_path(args.resume, "--resume")
         resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         config = config_from_dict(resume_ckpt["config"])
         print(f"Resuming from {args.resume} (config and label maps from checkpoint)")
-    else:
+    elif init_ckpt is None:
         config = build_model_config(args)
 
     print("=" * 70)
@@ -786,11 +863,12 @@ def main(argv=None):
         raise SystemExit("--phase chat needs --chat-dataset")
 
     # --- vocabulary (fixed before the model is built) -------------------
-    if resume_ckpt is not None:
-        concept_map = resume_ckpt["concept_map"]
-        relation_map = resume_ckpt["relation_map"]
-        entity_type_name_map = resume_ckpt.get("entity_type_map", {})
-        concept_to_type = resume_ckpt.get("concept_to_entity_type_map", {})
+    maps_ckpt = resume_ckpt if resume_ckpt is not None else init_ckpt
+    if maps_ckpt is not None:
+        concept_map = maps_ckpt["concept_map"]
+        relation_map = maps_ckpt["relation_map"]
+        entity_type_name_map = maps_ckpt.get("entity_type_map", {})
+        concept_to_type = maps_ckpt.get("concept_to_entity_type_map", {})
     else:
         sources = [(train_dataset, dataset_path)]
         if stage2_dataset is not None:
@@ -820,6 +898,9 @@ def main(argv=None):
             model.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
         )
         del resume_ckpt
+    if init_ckpt is not None:
+        load_init_weights(model, init_ckpt)
+        del init_ckpt
     model = model.to(args.device)
     total = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total:,} (tap layer {model.tap_layer})")
@@ -893,7 +974,7 @@ def main(argv=None):
         train_loader = loader(dataset, include_responses, chat)
         val_loader = (loader(eval_dataset, include_responses, chat, shuffle=False)
                       if eval_dataset is not None else None)
-        optimizer = make_optimizer(model, lr, args.weight_decay)
+        optimizer = make_optimizer(model, lr, args.weight_decay, args.gate_lr)
         total_steps = max(1, math.ceil(len(train_loader) / args.grad_accum) * epochs)
         scheduler = get_linear_schedule_with_warmup(
             optimizer, int(total_steps * args.warmup_ratio), total_steps

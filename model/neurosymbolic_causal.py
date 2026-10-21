@@ -233,6 +233,11 @@ class NeuroSymbolicCausalLM(nn.Module):
             enc, 1, topk_idx.unsqueeze(-1).expand(-1, -1, enc.size(-1))
         )
         node_feats = self.node_proj(gathered)
+        # A prompt shorter than k (padded to a longer one in the batch)
+        # selects padding too. Those slots get empty nodes, as when the
+        # prompt runs alone, so a score does not depend on its batch.
+        real = torch.gather(attention_mask, 1, topk_idx).unsqueeze(-1)
+        node_feats = node_feats * real.to(node_feats.dtype)
         if k < self.max_nodes:
             pad = node_feats.new_zeros(B, self.max_nodes - k, self.node_dim)
             node_feats = torch.cat([node_feats, pad], dim=1)

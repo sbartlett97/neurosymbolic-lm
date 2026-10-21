@@ -104,3 +104,94 @@ Scope: close gaps that crash a run or train it wrong. Prep only — no pod creat
 - [x] Training max_input_length 2048 -> 4096 for all causal presets.
 - [x] max_entities 24 -> 128 per document, new --max-entities (config value was never wired).
 - [x] Runbook GPU table updated for the longer context.
+
+# Round 4: first full training run, qwen3-0.6b (2026-10-20)
+
+## Smoke run (done)
+- [x] A40 48 GB pod in CA-MTL-1, with a 150 GB network volume at /workspace
+- [x] Setup on the pod: 153 tests pass
+- [x] 400 rows, 1 epoch per stage, batch 4: SMOKE_EXIT=0, no skipped batches
+- [x] Hub push to sbartlett97/neurosymbolic-causal-lm/smoke: all stages and final
+- [x] Peak GPU memory 22.1 GB (joint stage, 619M trainable)
+- [x] Gate LR fix: `--gate-lr` (default 1e-3), with its own optimizer group.
+      At the stage LR, the gate moved only 0.1000 -> 0.1001 in 100 steps
+
+Smoke speed at batch 4: symbolic 4.8, decoder 1.8, joint 1.6 samples/s.
+
+## Full run plan
+- [ ] Commit and push the gate LR change. Pull it on the pod
+- [ ] Run detached (setsid), with the log on the volume:
+      python -u train_causal.py --preset qwen3-0.6b \
+        --dataset /workspace/data/curated/curated.jsonl \
+        --stage2-dataset /workspace/data/curated_qa/curated.jsonl \
+        --epochs 2 --batch-size 4 --max-eval-samples 500 --log-every 100 \
+        --output-dir /workspace/ckpt/qwen3-0.6b-v1 --log-dir /workspace/runs/qwen3-0.6b-v1 \
+        --hub-repo sbartlett97/neurosymbolic-causal-lm --hub-path qwen3-0.6b-v1
+- [ ] Time estimate for each epoch: symbolic 2.8 h, decoder 3.0 h, joint 3.4 h.
+      2 epochs: about 19 h, about $11 at $0.59/hr
+- [ ] Checks during the run (stop the run if one fails):
+  1. Symbolic epoch 1: entity_f1 above the smoke value 0.318. relation_f1 above 0
+  2. Decoder: the gate moves off 0.1. val is lower than val_gate0, and the gap grows
+  3. Joint: the response val loss does not rise above the decoder stage value
+- [ ] Recovery: the volume keeps latest.pt. Continue with --resume and the remaining --stages
+- [ ] After the run: delete the pod. Keep the volume until the Hub has the final model
+
+## Benchmarks and model card (2026-10-21)
+- [x] `eval_harness.py`: lm-eval wrapper (loglikelihood, rolling, generate_until). 8 tests on the tiny model.
+      End-to-end check through lm-eval on arc_easy, gsm8k, wikitext (limit 3)
+- [x] Fix: top-K nodes of a short prompt in a padded batch took padding positions.
+      Now those slots are empty nodes, as when the prompt runs alone. Regression test added
+- [x] `docs/MODEL_CARD.md` draft. Joint epoch 2 and benchmark rows are pending
+- [ ] After the run: fill in joint epoch 2. Run the benchmarks on a new A40 pod with volume 9y5kxdqc86
+      (base model, this model, this model with gate = 0). Fill in the benchmark table
+- [ ] Decoder-only val loss for stage_decoder.pt and stage_joint.pt (the joint check)
+- [ ] Push the card to the Hub as README.md (after approval)
+
+# Round 5: v2 run plan, qwen3-0.6b-lora (2026-10-21)
+
+Goal: keep the base model's general ability (v1 lost 4-15 points on every
+zero-shot task) and keep the graph's gain on document QA.
+
+## Changes
+- [ ] Preset `qwen3-0.6b-lora` in config.py: Qwen3-0.6B-Base, use_lora=True
+      (r 16, alpha 32, all-linear, chat token rows trainable). Base in bf16
+- [ ] `--epochs 1` for the decoder and joint stages
+- [ ] `--lr 2e-4` (LoRA range): decoder 1e-4, joint 2e-5. Gate LR stays 1e-3
+- [ ] Reuse the v1 symbolic stage: new `--init-from <ckpt>` loads every weight
+      except `backbone.*`. It refuses if the label maps differ. Valid because
+      stage 1 froze the backbone, so v1 stage_symbolic.pt = Qwen base + heads.
+      Saves the 6 h symbolic stage. Run `--stages decoder joint`
+- [ ] New `data/mix_stage2.py`: builds the v2 stage 2/3 set from the v1 files
+      (no new API calls):
+  1. respond: the 13,766 v1 QA rows, unchanged
+  2. unanswerable (replaces the v1 no-question abstain rows): a document plus
+     a question from another document that shares an entity type.
+     should_respond=0, target EOS
+  3. general text: a prefix of a corpus document not used in QA. The target is
+     the next 64-128 tokens. Entity spans and relations are kept only if they
+     sit inside the prefix. About 4,000 rows (15% of rows, about half of the
+     response tokens: the loss is a per-token mean)
+  - Train/val split follows the source document's split
+  - Writes curated_v2.jsonl, curated_v2_val.jsonl, curated_v2_vocab.json
+- [ ] Tests: preset, --init-from (loads, refuses a map mismatch), mix script
+      (span filtering, relation reindex, no answer leaks, split kept)
+
+## Why the abstain rows change
+v1 abstain rows were documents with no question (target EOS). General-text
+rows are also documents with no question, but their target is a continuation.
+The two kinds would contradict each other. Unanswerable questions fix this,
+and they teach real abstention, which v1 did not learn.
+
+## Run
+- Train rows: about 13.8k respond + 6.2k unanswerable + 4k general = 24k.
+  About 6,000 steps per stage at batch 4
+- Time: decoder + joint about 7-8 h (LoRA, bf16 base). Cost about $4.50 at $0.59/hr
+- Benchmarks: the same 6 zero-shot tasks, MMLU 5-shot and SQuAD v2, on v2
+  (graph on and graph off). The base model results from v1 stay valid.
+  About 3 h, about $2
+
+## Checks
+1. Zero-shot scores with graph off: within 2 points of Qwen3-0.6B-Base
+2. Decoder and joint: val < val_gate0
+3. abstain_acc (now on unanswerable questions) > 0.8 and respond_rate > 0.9
+4. SQuAD v2: better than v1, mainly on the no-answer questions
