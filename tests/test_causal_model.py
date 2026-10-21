@@ -89,6 +89,27 @@ def test_topk_node_selection_ignores_padding(model):
     assert all(int(i) < 9 for i in topk[1])  # sample 1 real length is 9
 
 
+def test_short_prompt_nodes_do_not_depend_on_batch(model):
+    """A prompt shorter than max_nodes gets the same nodes alone and
+    right-padded in a batch: selected padding slots are empty nodes."""
+    model.eval()
+    short = torch.randint(2, VOCAB, (1, 2))
+    long_ids = torch.randint(2, VOCAB, (1, 10))
+    alone = model._extract_node_features(
+        model._read(short, torch.ones(1, 2, dtype=torch.long)),
+        model.token_ent(model._read(short, torch.ones(1, 2, dtype=torch.long))),
+        torch.ones(1, 2, dtype=torch.long),
+    )
+    ids = torch.zeros(2, 10, dtype=torch.long)
+    ids[0, :2], ids[1] = short[0], long_ids[0]
+    mask = torch.zeros(2, 10, dtype=torch.long)
+    mask[0, :2], mask[1] = 1, 1
+    enc = model._read(ids, mask)
+    batched = model._extract_node_features(enc, model.token_ent(enc), mask)
+    assert torch.allclose(alone[0], batched[0], atol=1e-5)
+    model.train()
+
+
 def test_write_pass_logits_aligned_to_response(model):
     input_ids, mask = make_prompt_batch()
     y_ids = torch.randint(2, VOCAB, (2, 5))

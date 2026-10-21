@@ -41,3 +41,6 @@ tqdm
 
 # Tests
 pytest
+
+# Benchmarks (eval_harness.py)
+lm-eval==0.4.*

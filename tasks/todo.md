@@ -135,3 +135,14 @@ Smoke speed at batch 4: symbolic 4.8, decoder 1.8, joint 1.6 samples/s.
   3. Joint: the response val loss does not rise above the decoder stage value
 - [ ] Recovery: the volume keeps latest.pt. Continue with --resume and the remaining --stages
 - [ ] After the run: delete the pod. Keep the volume until the Hub has the final model
+
+## Benchmarks and model card (2026-10-21)
+- [x] `eval_harness.py`: lm-eval wrapper (loglikelihood, rolling, generate_until). 8 tests on the tiny model.
+      End-to-end check through lm-eval on arc_easy, gsm8k, wikitext (limit 3)
+- [x] Fix: top-K nodes of a short prompt in a padded batch took padding positions.
+      Now those slots are empty nodes, as when the prompt runs alone. Regression test added
+- [x] `docs/MODEL_CARD.md` draft. Joint epoch 2 and benchmark rows are pending
+- [ ] After the run: fill in joint epoch 2. Run the benchmarks on a new A40 pod with volume 9y5kxdqc86
+      (base model, this model, this model with gate = 0). Fill in the benchmark table
+- [ ] Decoder-only val loss for stage_decoder.pt and stage_joint.pt (the joint check)
+- [ ] Push the card to the Hub as README.md (after approval)
