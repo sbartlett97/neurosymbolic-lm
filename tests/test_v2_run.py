@@ -205,3 +205,83 @@ def test_mix_cli_writes_splits_and_vocab(tmp_path):
             assert not any(d.startswith(r["text"]) for d in qa_docs)
     assert (tmp_path / "v2" / "mix_val.jsonl").exists()
     assert (tmp_path / "v2" / "mix_vocab.json").exists()
+
+
+# --- v3 negatives: same document, entity swap --------------------------------
+
+DOC = ("Marie Curie was born in Warsaw. She worked at the University of Paris. "
+       "In 1903 she won the Nobel Prize in Physics. She died in 1934.")
+
+
+def qa_row(doc=DOC, question="When did she win the Nobel Prize?",
+           answer="In 1903."):
+    ents = ["Marie Curie", "Warsaw", "University of Paris", "1903", "1934"]
+    types = ["person", "location", "organization", "temporal", "temporal"]
+    rels = [[0, 1, "born_in"], [0, 3, "won_in"], [0, 4, "died_in"]]
+    if doc != DOC:  # another document: no labels
+        ents, types, rels = [], [], []
+    return {"text": doc + "\n\n" + question, "entities": ents,
+            "entity_spans": [[doc.index(e), doc.index(e) + len(e)] for e in ents],
+            "entity_types": types, "concepts": [[t] for t in types],
+            "relations": rels,
+            "should_respond": 1, "response": answer, "kind": "respond"}
+
+
+def test_same_doc_deletes_answer_and_shifts_spans():
+    neg = mix_stage2.make_same_doc(qa_row())
+    assert neg is not None and neg["kind"] == "unanswerable_same"
+    assert neg["should_respond"] == 0 and neg["response"] == ""
+    doc, question = mix_stage2.split_question(neg["text"])
+    assert question == "When did she win the Nobel Prize?"
+    assert "1903" not in doc and "Nobel" not in doc
+    assert "1934" in doc  # the sentence after the cut stays
+    # "1903" sat in the cut: dropped with its relation. Later spans moved
+    assert "1903" not in neg["entities"]
+    for (s, e), name in zip(neg["entity_spans"], neg["entities"]):
+        assert doc[s:e] == name
+    names = neg["entities"]
+    assert [[names[h], names[t], r] for h, t, r in neg["relations"]] == [
+        ["Marie Curie", "Warsaw", "born_in"], ["Marie Curie", "1934", "died_in"]]
+
+
+def test_same_doc_skips_unsafe_rows():
+    # The answer occurs in 4 sentences: too many to delete
+    doc = " ".join(f"Line {i} names Warsaw." for i in range(4))
+    assert mix_stage2.make_same_doc(
+        qa_row(doc, "Which city is named?", "Warsaw.")) is None
+    # One plain word: too weak to find the answer sentence
+    assert mix_stage2.make_same_doc(
+        qa_row(question="What did she do?", answer="Research.")) is None
+    # No sentence holds the answer
+    assert mix_stage2.make_same_doc(
+        qa_row(question="Who was her husband?", answer="Pierre Curie.")) is None
+
+
+def test_swap_changes_a_name_that_the_document_lacks():
+    row = qa_row(question="Where was Marie Curie born?", answer="Warsaw.")
+    by_type = {"person": ["Marie Curie", "Ada Lovelace"]}
+    neg = mix_stage2.make_swap(row, by_type, random.Random(0))
+    assert neg is not None and neg["kind"] == "unanswerable_swap"
+    doc, question = mix_stage2.split_question(neg["text"])
+    assert doc == DOC and question == "Where was Ada Lovelace born?"
+    assert neg["should_respond"] == 0 and neg["response"] == ""
+    # A date is not a name: no swap
+    row = qa_row(question="What happened in 1903?", answer="The Nobel Prize.")
+    assert mix_stage2.make_swap(row, {"temporal": ["1850"]}, random.Random(0)) is None
+
+
+def test_build_split_counts_each_kind():
+    respond = [qa_row(), qa_row(question="Where was Marie Curie born?",
+                                answer="She was born in Warsaw.")]
+    abstain = [dict(base_row(), should_respond=0, response="")]
+    rows, stats = mix_stage2.build_split(
+        [], respond + abstain, 0, random.Random(0), 275, 550,
+        n_cross=-1, n_same=1, n_swap=1)
+    kinds = sorted(r["kind"] for r in rows)
+    assert stats["unanswerable_same"] == 1
+    assert kinds.count("respond") == 2
+    assert kinds.count("unanswerable_same") == 1
+    # Defaults: no new kinds, so the output stays the v2 set
+    rows, stats = mix_stage2.build_split([], respond + abstain, 0,
+                                         random.Random(0), 275, 550)
+    assert stats["unanswerable_same"] == stats["unanswerable_swap"] == 0

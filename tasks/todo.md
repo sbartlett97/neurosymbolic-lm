@@ -195,3 +195,98 @@ and they teach real abstention, which v1 did not learn.
 2. Decoder and joint: val < val_gate0
 3. abstain_acc (now on unanswerable questions) > 0.8 and respond_rate > 0.9
 4. SQuAD v2: better than v1, mainly on the no-answer questions
+
+# Round 6: v3 plan (2026-10-22)
+
+Goals:
+1. Abstain on questions that the document cannot answer, also when the
+   question is on the same topic (SQuAD v2 NoAns: v2 7.7%, val 100%).
+2. Keep general language modelling and text generation at the base level,
+   also with the graph on (v2 graph on: ARC-Easy acc_norm -9.3 vs graph off).
+3. Keep the graph's gain on document QA (v2: val loss -0.19 with the graph).
+
+## Step 0: find the cause of the graph-on loss (decision point)
+v2 graph on vs off: ARC-E acc -2.4 but acc_norm -9.3; HellaSwag acc +0.2 but
+acc_norm -1.5. A constant log-prob shift on every answer choice cancels in
+acc but not in acc_norm. Hypothesis: the 16 node slots between the prompt and
+the answer cause the loss (position), not the node content.
+- [x] ARC-Easy, limit 500, v2 final model, fp32, local MPS run. Result:
+      | Mode                          | acc  | acc_norm |
+      | graph off                     | 64.0 | 62.8     |
+      | graph on                      | 60.4 | 53.8     |
+      | 16 zero slots (gate = 0)      | 56.8 | 52.6     |
+      | nodes from another question   | 61.8 | 54.0     |
+      Wrong-question nodes score the same as the right nodes. The node
+      content does not cause the loss. The 16 slots between the prompt and
+      the answer cause it (position). The standard error at 500 questions is
+      about 2.1 points: on vs other-question nodes is noise, off vs on (-9.0
+      acc_norm) is about 4 standard errors.
+      Recommendation: Option 2. Approved by the user (2026-10-22)
+- [ ] If gate 0 loses about as much as graph on: the cause is the position.
+      Then a routing gate does not fix the loss when it routes "on"
+- [ ] If gate 0 is close to graph off: the cause is the content
+
+## Part A: data (data/mix_stage2.py), no API calls
+- [x] Same-document negatives: a respond row with the answer sentences
+      deleted. Same question, target EOS. Key = answer words not in the
+      question. Skip a row if the key is weak or longer than 6 words, if more
+      than 3 sentences match, or if the key survives the deletion. Only
+      factual questions (who, when, where, which, what, how many/much/...).
+      Yield: 7,528 of 13,481 respond rows. Hand check of 50 samples: no clear
+      error, 3 that the diff display did not let me judge
+- [x] Entity-swap negatives: the document stays the same. A question name
+      (person, organization, location) changes to a same-type name that the
+      document does not contain. Dates and quantities gave nonsense questions
+- [x] Span fix after a deletion: drop spans in the cut, shift later spans,
+      reindex relations. Test text[s:e] == entity for every span
+- [x] Counts are CLI options. Keep negatives at about 30-35% of rows
+      (v2: 28%), so respond_rate stays high
+- [x] A "kind" field on each row (respond, general, unanswerable_cross,
+      unanswerable_same, unanswerable_swap)
+- [x] Tests for each new row kind. Default options still give the v2
+      files byte for byte (checked on the Hub data)
+- [ ] Later (needs the OpenAI Batch API, ask first): a few thousand yes/no
+      questions, for BoolQ (v2: -8.6 vs base)
+- [ ] More general text: v2 used 2,000 general rows (`--general-rows 2000`),
+      and 29,411 free corpus documents are left. Try 4,000-6,000. A new source
+      is needed only beyond that. Rows without labels need a check of what the
+      collator does with an empty entity list
+
+## Part B: graph injection (after Step 0, ask before the work starts)
+Option 1, routing gate (user's idea): a small head predicts if the graph
+helps. If not, the model adds no node tokens (= v2 graph off).
+- Good: the "off" path is exactly v2 graph off (within 2 points of base)
+- Bad: it needs labels (loss with vs without nodes, an extra forward pass),
+  and the yes/no choice is not differentiable. It must route prompt types it
+  never saw (MMLU). Each misrouted general prompt pays the full position
+  loss (about 9 acc_norm on ARC-Easy). On document QA the slots cost nothing
+  measurable (SQuAD HasAns_f1 65.2 on vs 65.5 off)
+Option 2, gated cross-attention (Flamingo style): the token sequence stays
+the same as in the base model. A few added cross-attention layers let
+response tokens read the node features. Each layer has a tanh gate that
+starts at 0, so at init the model is exactly the base model.
+- Good: the use of the graph is per token and depends on the content. The LM
+  loss trains it, with no extra labels. No position loss
+- Bad: more code (wrap Qwen3 layers under peft, mask prompt positions from
+  the nodes, KV cache in generate). Stages 2 and 3 train again (v1
+  stage_symbolic.pt stays usable)
+Both: node dropout in stages 2 and 3 (per sample), so the backbone works
+with and without the graph.
+Option 3, nodes before the prompt: keeps "Answer:" next to the answer, with
+a small code change. Needs a retrain to test. The first position is an
+attention sink in Qwen, so prefix tokens can change the whole prompt.
+Recommendation: Option 2 if Step 0 shows a position cause. Option 1 if it
+shows a content cause.
+Main risk of Option 2: Step 0 does not show that cross-attention keeps the
+QA gain (val loss -0.19, SQuAD NoAns 7.7% vs 2.9%). Only Run B shows it.
+No option helps pure language modelling: prompt positions cannot read nodes
+built from the whole prompt. The goal there is no loss.
+
+## Runs
+- Run A: v2 recipe + Part A data. Compare with v2 to measure the data change
+- Run B: Part A data + Part B change. Compare with Run A
+- About $5 each (A40, $0.59/hr)
+
+## Evaluation additions
+- [ ] Val abstain_acc for each kind (same-doc negatives separately)
+- [ ] Perplexity on wikitext. Check loglikelihood_rolling in eval_harness.py
