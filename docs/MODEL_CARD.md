@@ -120,13 +120,13 @@ Each validation set holds at most 500 rows of the stage's val file.
 | Decoder | 1 | 0.6225 | 0.5544 | 0.5657 | abstain acc 1.000, respond rate 1.000 |
 | Decoder | 2 | 0.2014 | 0.5837 | 0.5988 | abstain acc 1.000, respond rate 1.000 |
 | Joint | 1 | 0.8744 | 1.5296 | 1.5521 | abstain acc 1.000, respond rate 1.000 |
-| Joint | 2 | _pending_ | _pending_ | _pending_ | _pending_ |
+| Joint | 2 | 0.6714 | 1.7103 | 1.7472 | n/a |
 
 How to read the table:
 
 - **Gate = 0** removes the graph tokens. The val loss is lower with the graph in
-  every stage after stage 1. The gap grows from 0.011 (decoder epoch 1) to 0.023
-  (joint epoch 1). The model uses the graph signal, but the gain is small.
+  every stage after stage 1. The gap grows from 0.011 (decoder epoch 1) to 0.037
+  (joint epoch 2). The model uses the graph signal, but the gain is small.
 - **Joint val loss** is the sum of the extraction, relation, logic and response
   losses. Do not compare it with the decoder-stage val loss.
 - **Abstain acc / respond rate** only examine the first generated token: EOS or not
@@ -136,23 +136,105 @@ How to read the table:
 
 ### Benchmarks
 
-_Pending._ These runs use lm-evaluation-harness through `eval_harness.py`. Each
-benchmark compares three models:
+These runs use lm-evaluation-harness through `eval_harness.py`. Each
+benchmark compares the base model (Qwen/Qwen3-0.6B-Base) with v1 and v2
+(see [v2](#v2-lora-run-with-unanswerable-questions)), with and without the
+graph tokens. "Off" means gate = 0 (`--no-soft-nodes`).
 
-1. the base model, Qwen/Qwen3-0.6B-Base
-2. this model, with the graph tokens
-3. this model, without the graph tokens
+| Task | Shots | Metric | Base | v1 | v1, off | v2 | v2, off |
+|---|---|---|---|---|---|---|---|
+| MMLU | 5 | acc | **52.5** | 35.3 | 39.8 | 49.1 | 50.8 |
+| ARC-Easy | 0 | acc | 65.3 | 57.6 | 59.2 | 64.1 | **66.5** |
+| ARC-Easy | 0 | acc_norm | 58.0 | 51.3 | 55.0 | 55.5 | **64.8** |
+| ARC-Challenge | 0 | acc_norm | **38.1** | 33.5 | 34.0 | 37.4 | 38.0 |
+| HellaSwag | 0 | acc_norm | **53.8** | 39.2 | 40.5 | 50.8 | 52.3 |
+| PIQA | 0 | acc_norm | **69.8** | 63.0 | 64.4 | 69.1 | 69.6 |
+| WinoGrande | 0 | acc | 58.7 | 49.9 | 51.9 | 57.6 | **59.4** |
+| BoolQ | 0 | acc | **70.0** | 64.0 | 61.9 | 63.1 | 61.4 |
 
-| Task | Shots | Qwen3-0.6B-Base | This model | This model, gate = 0 |
+MMLU by group (5-shot acc):
+
+| Group | Base | v1 | v1, off | v2 | v2, off |
+|---|---|---|---|---|---|
+| Humanities | 45.0 | 32.1 | 35.8 | 43.0 | 44.7 |
+| STEM | 49.6 | 34.8 | 39.0 | 47.2 | 47.6 |
+| Social sciences | 62.1 | 38.9 | 44.3 | 56.3 | 59.5 |
+| Other | 57.3 | 36.9 | 42.2 | 53.1 | 54.4 |
+
+SQuAD v2 (0-shot, the first 2,000 validation questions):
+
+| Metric | Base | v1 | v1, off | v2 | v2, off |
+|---|---|---|---|---|---|
+| exact | 22.75 | 14.15 | 14.05 | **23.75** | 21.20 |
+| f1 | 29.21 | 26.65 | 26.68 | **36.55** | 34.28 |
+| HasAns_f1 | 58.25 | 52.55 | 52.99 | 65.21 | **65.46** |
+| NoAns_exact | 0.00 | 0.60 | 0.20 | **7.72** | 2.91 |
+| best_f1 | 50.07 | 50.34 | 51.17 | **54.14** | 53.32 |
+
+How to read the tables:
+
+- **Precision.** The base and v1 runs use fp32. The v2 runs use bf16. In a
+  check, bf16 moved scores by about 1 point or less.
+- **SQuAD generation limit.** The v1 and v2 runs stop after 256 new tokens.
+  The base run used the lm-eval default of 2,048 new tokens: the hf backend
+  ignored `max_gen_toks=256`. The score uses only the answer text, so the
+  results stay comparable. A long answer is wrong with either limit.
+- **v1** lost 5–17 points against the base model. Full fine-tuning on a narrow
+  QA set damaged the general ability of the backbone.
+- **v2** is within 2 points of the base model on 6 of 7 tasks with the graph
+  off. BoolQ is the exception: it is 8.6 points lower, and v2 did not improve
+  it over v1.
+- **Graph on vs off.** The graph lowers most general benchmarks by 0.5–9
+  points. It raises BoolQ by 1.7 points and SQuAD f1 by 2.3 points. The SQuAD
+  gain comes from unanswerable questions: the model abstains on 7.7% of them
+  with the graph and on 2.9% without it.
+
+## v2: LoRA run with unanswerable questions
+
+v2 keeps the v1 architecture and the v1 stage 1 weights. It changes the
+backbone training and the stage 2/3 data, to keep the general ability of the
+base model.
+
+**Changes from v1:**
+
+1. **LoRA backbone.** Preset `qwen3-0.6b-lora`: bf16 base weights, LoRA rank
+   16, alpha 32, on all linear layers. The backbone weights stay frozen.
+2. **Stage 1 from v1.** `--init-from` loads the v1 `stage_symbolic.pt` heads,
+   adapter and GNN. Stage 1 does not run again.
+3. **1 epoch per stage.** v1 overfit in its second decoder epoch.
+4. **New stage 2/3 data** (`curated_v2`, built by `data/mix_stage2.py`):
+
+   | Kind | Train rows | Target |
+   |---|---|---|
+   | respond | 13,766 | the v1 QA answer |
+   | unanswerable | 6,117 | EOS. The prompt is a v1 abstain document plus a question from another document. The borrowed answer does not occur in the document. |
+   | general | 1,715 | the next 64–128 tokens of a corpus document that the QA set does not use |
+
+   The train set has 21,598 rows. The val set has 443 rows.
+
+| Stage | Trains | Trainable params | Peak LR | Optimizer steps |
 |---|---|---|---|---|
-| MMLU | 5 | | | |
-| ARC-Easy | 0 | | | |
-| ARC-Challenge | 0 | | | |
-| HellaSwag | 0 | | | |
-| PIQA | 0 | | | |
-| WinoGrande | 0 | | | |
-| BoolQ | 0 | | | |
-| SQuAD v2 | 0 | | | |
+| 2. Decoder | LoRA, injector | 10.4M | 1e-4 | 5,400 |
+| 3. Joint | LoRA, injector, symbolic modules | 32.7M | 2e-5 | 5,400 |
+
+**Compute:** 1x A40 48 GB. Batch 2 with gradient accumulation 2 (effective
+batch 4), no gradient checkpointing. Peak GPU memory 39.7 GB. Speed about 0.68
+optimizer steps/s. Wall time about 4.5 h for stages 2 and 3.
+
+**Validation:**
+
+| Stage | Train loss | Val loss | Val loss, gate = 0 | Other |
+|---|---|---|---|---|
+| Decoder | 0.7887 | 0.7923 | 0.9892 | abstain acc 1.000, respond rate 1.000 |
+| Joint | 1.4081 | 1.6577 | 1.8495 | abstain acc 1.000, respond rate 1.000 |
+
+- The val loss gap between gate on and gate off is 0.197 (decoder) and 0.192
+  (joint). In v1 it was 0.011–0.037. The graph tokens now carry more of the
+  signal. The final gate value is 0.127.
+- Abstain acc now tests unanswerable questions, not documents with no
+  question. The val set gives 1.000, but SQuAD v2 gives a NoAns exact score of
+  only 7.7%. A possible cause: the val questions come from the same generator
+  as the training questions. This run does not test that cause.
 
 ## Use
 
@@ -195,6 +277,12 @@ To read the extracted graph, call `model(input_ids, attention_mask)` without
 | `qwen3-0.6b-v1/stage_joint.pt` | weights after stage 3 |
 | `qwen3-0.6b-v1/tokenizer/` | Qwen3 tokenizer with the added chat tokens |
 | `qwen3-0.6b-v1/logs/`, `tensorboard/` | training log, GPU log, TensorBoard events |
+| `qwen3-0.6b-v1/benchmarks/` | lm-eval results: v1 (`ours`, `nonodes`) and the base model (`base`) |
+| `qwen3-0.6b-v2/final_causal_model.pt` | v2 final weights (after the joint stage) |
+| `qwen3-0.6b-v2/stage_decoder.pt`, `stage_joint.pt` | v2 weights after stages 2 and 3 |
+| `qwen3-0.6b-v2/tokenizer/` | tokenizer for v2 |
+| `qwen3-0.6b-v2/logs/`, `tensorboard/` | v2 training logs and TensorBoard events |
+| `qwen3-0.6b-v2/benchmarks/` | lm-eval results for v2 (`ours`, `nonodes`) |
 
 ## Intended use
 
