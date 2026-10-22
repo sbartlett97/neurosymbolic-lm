@@ -298,11 +298,23 @@ built from the whole prompt. The goal there is no loss.
       each with the graph on and off (*_nograph)
 - [x] generate refuses use_cache=False in xattn mode (the newest-position
       rule needs the cache)
-- [ ] Before Run A: v2 val response loss with real nodes, nodes from
-      another question, and no slots (local). A prefix-mode gate of 0 keeps
-      16 zero slots, which hurt by themselves, so v2's val_gate0 gap (0.19)
-      overstates the graph gain. If real = other-question, the Run B
-      criterion is abstention (graph on vs off), not val_gate0
+- [x] v2 val response loss (443 rows, fp32, local MPS), mean per row:
+      | Kind               | real nodes | other-question nodes | no slots |
+      | all                | 0.5255     | 0.5263               | 1.2130   |
+      | respond (285)      | 0.3565     | 0.3579               | 1.4079   |
+      | general (41)       | 3.2000     | 3.1994               | 3.3167   |
+      | unanswerable (117) | 0.0000     | 0.0000               | 0.0010   |
+      The node content is worth 0.0008. The large gap to "no slots" comes
+      from the slots: v2 learned them as an "answer starts here" marker.
+      So v2 shows no evidence that the graph content helps. The model card
+      claim "the graph tokens now carry more of the signal" is wrong
+- [x] Run B criterion: content, not slot presence. In xattn mode a gate of
+      0 is exactly no graph, so val_gate0 measures content. Added
+      val_shuffled: each row gets the nodes of the next row in its batch
+      (only the injected nodes; the heads keep the right ones). Needs a val
+      batch of 2 or more
+- [x] Model card (PR #3, Hub README): the v2 gain comes from the slots
+- User decision (2026-10-22): skip Run A. Run B only, after a memory test
 - [ ] Before Run B on a pod: a memory test in a separate process (13.1M
       more trainable params; v2 peaked at 39.7 GB of 48 GB)
 - [x] Tests (tests/test_xattn.py): init = backbone, prompt positions

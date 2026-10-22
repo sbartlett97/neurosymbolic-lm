@@ -218,3 +218,19 @@ def test_xattn_generate_needs_the_cache():
     with pytest.raises(ValueError, match="use_cache"):
         model.generate(ids, mask, max_length=2, use_cache=False, pad_token_id=0)
     assert model._xattn_ctx is None
+
+
+@pytest.mark.parametrize("injection", ["prefix", "xattn"])
+def test_shuffle_nodes_swaps_only_the_injected_content(injection):
+    model = make_model(injection=injection, gate=1.0).eval()
+    ids, mask = prompts()
+    y = torch.randint(2, VOCAB, (2, 5))
+    with torch.no_grad():
+        right = model(ids, mask, y_ids=y)
+        model.shuffle_nodes = True
+        wrong = model(ids, mask, y_ids=y)
+        model.shuffle_nodes = False
+    assert not torch.allclose(right["logits"], wrong["logits"])
+    # The heads still see each sample's own nodes
+    assert torch.equal(right["rel_logits_matrix"], wrong["rel_logits_matrix"])
+    assert torch.equal(right["node_feats"], wrong["node_feats"])

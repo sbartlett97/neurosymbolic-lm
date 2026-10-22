@@ -754,6 +754,15 @@ def run_stage(name: str, model, trainer, train_loader, val_loader, epochs: int,
                         g.data.copy_(saved)
                     msg += f" val_gate0={ablated:.4f}"
                     logger.log_scalar(f"{name}/val_loss_gate0", ablated, step)
+                    # Content control: nodes of another row (same shape).
+                    # val < val_shuffled means the model reads the content
+                    model.shuffle_nodes = True
+                    try:
+                        shuffled = mean_val_loss(trainer, val_loader, args.device)
+                    finally:
+                        model.shuffle_nodes = False
+                    msg += f" val_shuffled={shuffled:.4f}"
+                    logger.log_scalar(f"{name}/val_loss_shuffled", shuffled, step)
                 else:
                     m = symbolic_metrics(model, val_loader, args.device)
                     msg += f" entity_f1={m['entity_f1']:.3f} relation_f1={m['relation_f1']:.3f}"

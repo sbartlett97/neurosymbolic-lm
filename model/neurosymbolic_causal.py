@@ -181,6 +181,10 @@ class NeuroSymbolicCausalLM(nn.Module):
         # Training only, xattn only: the share of samples that get no graph,
         # so the backbone keeps working without it
         self.node_dropout = float(node_dropout)
+        # Validation control: each sample gets the nodes of the next sample
+        # in the batch. Same input shape, wrong content. The extraction and
+        # relation outputs keep the right nodes
+        self.shuffle_nodes = False
         if injection == "prefix":
             self.injector = NodePrefixInjector(
                 node_dim, self.hidden_size, gate_init=injection_gate_init
@@ -500,12 +504,15 @@ class NeuroSymbolicCausalLM(nn.Module):
         }
 
         if y_ids is not None:
+            inject, inject_valid = node_feats_refined, node_valid
+            if self.shuffle_nodes:
+                inject, inject_valid = inject.roll(1, dims=0), inject_valid.roll(1, dims=0)
             outputs["logits"] = self._write(
                 input_ids,
                 attention_mask,
-                node_feats_refined if use_soft_nodes else None,
+                inject if use_soft_nodes else None,
                 y_ids,
-                node_valid,
+                inject_valid,
             )
 
         return outputs
