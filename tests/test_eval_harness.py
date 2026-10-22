@@ -16,15 +16,21 @@ from eval_harness import NeuroSymLM  # noqa: E402
 from train_causal import build_backbone_and_tokenizer, build_model  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def parts():
+@pytest.fixture(scope="module", params=["prefix", "xattn"])
+def parts(request):
     torch.manual_seed(0)
     config = CAUSAL_MODEL_PRESETS["causal-testing"]()
+    config.injection = request.param
     try:
         backbone, tokenizer = build_backbone_and_tokenizer(config, "cpu")
     except OSError as e:  # no cached tokenizer and no network
         pytest.skip(f"tokenizer unavailable: {e}")
-    return build_model(config, backbone, tokenizer), tokenizer
+    model = build_model(config, backbone, tokenizer)
+    if request.param == "xattn":  # gates start at 0: open them
+        with torch.no_grad():
+            for g in model.injection_gates():
+                g.fill_(0.5)
+    return model, tokenizer
 
 
 def make_lm(parts, **kw):
