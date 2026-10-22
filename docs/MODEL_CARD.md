@@ -206,11 +206,12 @@ base model.
 
    | Kind | Train rows | Target |
    |---|---|---|
-   | respond | 13,766 | the v1 QA answer |
+   | respond | 13,481 | the v1 QA answer |
    | unanswerable | 6,117 | EOS. The prompt is a v1 abstain document plus a question from another document. The borrowed answer does not occur in the document. |
-   | general | 1,715 | the next 64–128 tokens of a corpus document that the QA set does not use |
+   | general | 2,000 | the next 64–128 tokens of a corpus document that the QA set does not use |
 
-   The train set has 21,598 rows. The val set has 443 rows.
+   The train set has 21,598 rows. The val set has 443 rows (285 respond, 117
+   unanswerable, 41 general).
 
 | Stage | Trains | Trainable params | Peak LR | Optimizer steps |
 |---|---|---|---|---|
