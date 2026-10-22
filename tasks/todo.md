@@ -282,6 +282,36 @@ QA gain (val loss -0.19, SQuAD NoAns 7.7% vs 2.9%). Only Run B shows it.
 No option helps pure language modelling: prompt positions cannot read nodes
 built from the whole prompt. The goal there is no loss.
 
+## Part B status (Option 2, approved 2026-10-22)
+- [x] NodeCrossAttention (model/injection.py): pre-norm, q from hidden,
+      k/v from nodes, out proj, tanh gate at 0. Empty node slots masked
+- [x] injection="xattn": hooks on every 2nd decoder layer from the tap
+      layer on (Qwen3-0.6B: 18, 20, 22, 24, 26; 13.1M params). Positions
+      from the last prompt token on read the nodes. generate: the newest
+      position only. Context stays set after the write pass for gradient
+      checkpointing
+- [x] node_dropout (training only); preset qwen3-0.6b-lora-xattn (0.1)
+- [x] train_causal: gate log, val_gate0 zeroes all gates, optimizer gate
+      group, stage freezing, --init-from a prefix checkpoint (its injector
+      is skipped, xattn starts fresh)
+- [x] Val generation check: up to 20 rows of each kind, abstain_acc_<kind>,
+      each with the graph on and off (*_nograph)
+- [x] generate refuses use_cache=False in xattn mode (the newest-position
+      rule needs the cache)
+- [ ] Before Run A: v2 val response loss with real nodes, nodes from
+      another question, and no slots (local). A prefix-mode gate of 0 keeps
+      16 zero slots, which hurt by themselves, so v2's val_gate0 gap (0.19)
+      overstates the graph gain. If real = other-question, the Run B
+      criterion is abstention (graph on vs off), not val_gate0
+- [ ] Before Run B on a pod: a memory test in a separate process (13.1M
+      more trainable params; v2 peaked at 39.7 GB of 48 GB)
+- [x] Tests (tests/test_xattn.py): init = backbone, prompt positions
+      unchanged, generate logits = training-pass logits, gradients (gate
+      first, then attention), checkpointing gives the same gradients,
+      init-from. Mutation checks on the masks fail the tests
+- [x] Real backbone smoke run (CPU): hooks attach through peft, init equals
+      the backbone, 3 steps train, generate works
+
 ## Runs
 - Run A: v2 recipe + Part A data. Compare with v2 to measure the data change
 - Run B: Part A data + Part B change. Compare with Run A

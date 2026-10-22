@@ -6,16 +6,17 @@ Same curriculum as train.py, adapted to the causal architecture
 
   Stage 1 (symbolic): backbone frozen; trains the extraction adapter and
       symbolic heads on curated corpus data — very cheap.
-  Stage 2 (decoder):  heads/adapter frozen; trains the soft-token injector
-      and the backbone (full fine-tune, or LoRA with --preset *-lora).
+  Stage 2 (decoder):  heads/adapter frozen; trains the graph injection
+      (soft tokens, or cross-attention with --preset *-xattn) and the
+      backbone (full fine-tune, or LoRA with --preset *-lora).
   Stage 3 (joint):    everything, low LR.
   Chat phase:         trace/chat data via CausalCognitiveCollator.
 
 Each stage logs train loss and a validation loss, and early-stops on the
 validation loss. Stage 1 also reports token-entity and relation F1 (the
 Phase-1 gate). Decoder/joint/chat also report the validation loss with the
-injection gate zeroed (the Phase-2 "is injection a no-op" gate) and the
-abstention accuracy on should_respond=0 samples.
+injection gates zeroed (the Phase-2 "is injection a no-op" gate) and the
+abstention accuracy on should_respond=0 samples, for each row kind.
 
 Outputs in --output-dir:
   tokenizer/            tokenizer incl. the added chat tokens
@@ -395,6 +396,10 @@ def build_model(config: CausalModelConfig, backbone, tokenizer,
         max_nodes=config.max_nodes,
         dropout=config.dropout,
         injection_gate_init=config.injection_gate_init,
+        injection=config.injection,
+        xattn_every=config.xattn_every,
+        xattn_heads=config.xattn_heads,
+        node_dropout=config.node_dropout,
         gradient_checkpointing=config.gradient_checkpointing,
         max_input_length=config.max_input_length,
         max_output_length=config.max_output_length,
@@ -434,9 +439,12 @@ def load_causal_checkpoint(path: str, device: str = "cpu"):
 
 
 # Fields that come from the --preset when --init-from takes the rest of the
-# config from a checkpoint: how the backbone trains, not what the heads are
+# config from a checkpoint: how the backbone trains and how the graph gets
+# into it, not what the heads are
 BACKBONE_TRAINING_FIELDS = ("use_lora", "lora_r", "lora_alpha", "lora_dropout",
-                            "gradient_checkpointing")
+                            "gradient_checkpointing", "injection",
+                            "injection_gate_init", "xattn_every", "xattn_heads",
+                            "node_dropout")
 
 
 def init_config(preset: CausalModelConfig, ckpt_config: Dict) -> CausalModelConfig:
@@ -462,11 +470,24 @@ def _final_norm(state: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
     return None
 
 
+INJECTION_PREFIXES = ("injector.", "xattn.")
+
+
 def load_init_weights(model: NeuroSymbolicCausalLM, ckpt: Dict) -> None:
-    """--init-from: load every weight except the backbone."""
+    """--init-from: load every weight except the backbone. If the checkpoint
+    used the other injection mode, its injection weights are skipped and
+    this model's injection modules keep their fresh init."""
+    ours = {k for k in model.state_dict() if k.startswith(INJECTION_PREFIXES)}
+    theirs = {k for k in ckpt["model_state_dict"] if k.startswith(INJECTION_PREFIXES)}
+    same_injection = bool(ours & theirs)
     state = {k: v for k, v in ckpt["model_state_dict"].items()
-             if not k.startswith("backbone.")}
-    own = {k for k in model.state_dict() if not k.startswith("backbone.")}
+             if not k.startswith("backbone.")
+             and (same_injection or not k.startswith(INJECTION_PREFIXES))}
+    own = {k for k in model.state_dict() if not k.startswith("backbone.")
+           and (same_injection or k not in ours)}
+    if not same_injection:
+        print(f"  Injection mode differs from the checkpoint: skipped {len(theirs)} "
+              f"of its tensors, {len(ours)} start fresh ({model.injection})")
     result = model.load_state_dict(state, strict=False)
     missing = [k for k in result.missing_keys if k in own]
     if missing or result.unexpected_keys:
@@ -508,8 +529,9 @@ def set_stage_trainable(model: NeuroSymbolicCausalLM, symbolic: bool,
     model.freeze_symbolic(not symbolic)
     for n, p in model.backbone.named_parameters():
         p.requires_grad = backbone and n in model._backbone_trainable
-    for p in model.injector.parameters():
-        p.requires_grad = injector
+    for m in model.injection_modules():
+        for p in m.parameters():
+            p.requires_grad = injector
 
 
 def make_optimizer(model, lr: float, weight_decay: float,
@@ -518,8 +540,8 @@ def make_optimizer(model, lr: float, weight_decay: float,
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # The injection gate is one scalar: own LR, no decay
-        if n.endswith("injector.gate"):
+        # The injection gates are scalars: own LR, no decay
+        if n.endswith("injector.gate") or (n.startswith("xattn.") and n.endswith(".gate")):
             gate.append(p)
         # No decay on biases and norms
         elif p.ndim < 2 or "norm" in n.lower():
@@ -589,23 +611,30 @@ def symbolic_metrics(model, loader, device) -> Dict[str, float]:
 
 @torch.no_grad()
 def generation_report(model, tokenizer, collator, samples: List[Dict],
-                      device, max_new_tokens: int, n_show: int = 3) -> Dict[str, float]:
+                      device, max_new_tokens: int, n_show: int = 3,
+                      use_soft_nodes: bool = True) -> Dict[str, float]:
     """Greedy generation on validation samples, with prompts built by the
     training collator (identical formatting). Reports abstention accuracy:
-    should_respond=0 samples must emit EOS first."""
+    should_respond=0 samples must emit EOS first. Rows with a "kind" field
+    (data/mix_stage2.py) also get abstain_acc_<kind> for each negative kind:
+    a same-document negative is harder than a cross-document one."""
     eos = tokenizer.eos_token_id
     abstain_total = abstain_ok = 0
     respond_total = respond_nonempty = 0
+    by_kind: Dict[str, List[int]] = {}
     shown = 0
     for sample in samples:
         batch = to_device(collator([sample]), device)
         gen = model.generate(batch["input_ids"], batch["attention_mask"],
                              max_length=max_new_tokens, do_sample=False,
-                             eos_token_id=eos, pad_token_id=tokenizer.pad_token_id)
+                             eos_token_id=eos, pad_token_id=tokenizer.pad_token_id,
+                             use_soft_nodes=use_soft_nodes)
         first = int(gen[0, 0]) if gen.shape[1] > 0 else eos
         if int(sample.get("should_respond", 0)) == 0:
             abstain_total += 1
             abstain_ok += int(first == eos)
+            if "kind" in sample:
+                by_kind.setdefault(sample["kind"], []).append(int(first == eos))
         else:
             respond_total += 1
             respond_nonempty += int(first != eos)
@@ -614,10 +643,13 @@ def generation_report(model, tokenizer, collator, samples: List[Dict],
                 text = tokenizer.decode(gen[0], skip_special_tokens=True)
                 print(f"    target: {str(sample.get('response', ''))[:80]!r}")
                 print(f"    output: {text[:80]!r}")
-    return {
+    out = {
         "abstain_acc": abstain_ok / max(abstain_total, 1),
         "respond_rate": respond_nonempty / max(respond_total, 1),
     }
+    for kind, hits in sorted(by_kind.items()):
+        out[f"abstain_acc_{kind}"] = sum(hits) / len(hits)
+    return out
 
 
 def to_device(batch, device):
@@ -682,7 +714,7 @@ def run_stage(name: str, model, trainer, train_loader, val_loader, epochs: int,
                     rate = step / max(time.time() - t0, 1e-9)
                     print(f"  step {step}: loss={loss:.4f} "
                           f"lr={scheduler.get_last_lr()[0]:.2e} "
-                          f"gate={float(model.injector.gate):.4f} ({rate:.2f} steps/s)")
+                          f"gate={model.injection_gate_value():.4f} ({rate:.2f} steps/s)")
             if loss == 0.0 or loss != loss:
                 n_skipped += 1
                 continue
@@ -714,10 +746,12 @@ def run_stage(name: str, model, trainer, train_loader, val_loader, epochs: int,
                     monitor = val_loss
                 if not symbolic_eval:
                     # Phase-2 gate: does the model use the injected nodes?
-                    gate = model.injector.gate.data.clone()
-                    model.injector.gate.data.zero_()
+                    gates = [g.data.clone() for g in model.injection_gates()]
+                    for g in model.injection_gates():
+                        g.data.zero_()
                     ablated = mean_val_loss(trainer, val_loader, args.device)
-                    model.injector.gate.data.copy_(gate)
+                    for g, saved in zip(model.injection_gates(), gates):
+                        g.data.copy_(saved)
                     msg += f" val_gate0={ablated:.4f}"
                     logger.log_scalar(f"{name}/val_loss_gate0", ablated, step)
                 else:
@@ -730,8 +764,7 @@ def run_stage(name: str, model, trainer, train_loader, val_loader, epochs: int,
             if gen_eval_fn is not None:
                 m = gen_eval_fn()
                 if m:
-                    print(f"  abstain_acc={m['abstain_acc']:.3f} "
-                          f"respond_rate={m['respond_rate']:.3f}")
+                    print("  " + " ".join(f"{k}={v:.3f}" for k, v in m.items()))
                     for k, v in m.items():
                         logger.log_scalar(f"{name}/{k}", v, step)
 
@@ -1000,14 +1033,23 @@ def main(argv=None):
             gen_collator = make_collator(False, chat)
             # Both kinds: answers (respond_rate) and abstentions (abstain_acc)
             rows = list(eval_dataset)
-            gen_samples = (
-                [r for r in rows if int(r.get("should_respond", 0)) == 1][:10]
-                + [r for r in rows if int(r.get("should_respond", 0)) == 0][:10]
-            )
-            gen_eval_fn = lambda: generation_report(  # noqa: E731
-                model, tokenizer, gen_collator, gen_samples, args.device,
-                max_new_tokens=min(64, config.max_output_length),
-            )
+            # Up to 20 of each kind (respond, general, each negative kind)
+            groups: Dict[str, List[Dict]] = {}
+            for r in rows:
+                kind = r.get("kind") or ("respond" if int(r.get("should_respond", 0))
+                                         else "abstain")
+                groups.setdefault(kind, []).append(r)
+            gen_samples = [r for g in groups.values() for r in g[:20]]
+            def gen_eval_fn():
+                # With and without the graph: abstention is where v2's graph
+                # showed a clean gain (SQuAD v2 NoAns 7.7% vs 2.9%)
+                kw = dict(max_new_tokens=min(64, config.max_output_length))
+                m = generation_report(model, tokenizer, gen_collator, gen_samples,
+                                      args.device, **kw)
+                off = generation_report(model, tokenizer, gen_collator, gen_samples,
+                                        args.device, n_show=0, use_soft_nodes=False, **kw)
+                m.update({f"{k}_nograph": v for k, v in off.items()})
+                return m
 
         run_stage(name, model, trainer, train_loader, val_loader, epochs,
                   scheduler, logger, EarlyStopping(patience=args.patience + patience_bonus),

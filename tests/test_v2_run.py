@@ -285,3 +285,36 @@ def test_build_split_counts_each_kind():
     rows, stats = mix_stage2.build_split([], respond + abstain, 0,
                                          random.Random(0), 275, 550)
     assert stats["unanswerable_same"] == stats["unanswerable_swap"] == 0
+
+
+def test_generation_report_scores_each_negative_kind():
+    import train_causal
+
+    EOS = 7
+
+    class Model:
+        def generate(self, input_ids, attention_mask, use_soft_nodes=True, **kw):
+            # Abstain when the prompt token says so (graph on only)
+            hit = int(input_ids[0, 0]) == 1 and use_soft_nodes
+            return torch.tensor([[EOS if hit else 3]])
+
+    class Tok:
+        eos_token_id, pad_token_id = EOS, 0
+
+    def collator(rows):
+        return {"input_ids": torch.tensor([[rows[0]["abstains"]]]),
+                "attention_mask": torch.ones(1, 1, dtype=torch.long)}
+
+    rows = ([{"kind": "unanswerable_cross", "should_respond": 0, "abstains": 1}] * 4
+            + [{"kind": "unanswerable_same", "should_respond": 0, "abstains": a}
+               for a in (1, 0, 0, 0)]
+            + [{"kind": "respond", "should_respond": 1, "abstains": 0}] * 2)
+    m = train_causal.generation_report(Model(), Tok(), collator, rows, "cpu",
+                                       max_new_tokens=4, n_show=0)
+    assert m["abstain_acc"] == 5 / 8 and m["respond_rate"] == 1.0
+    assert m["abstain_acc_unanswerable_cross"] == 1.0
+    assert m["abstain_acc_unanswerable_same"] == 0.25
+    off = train_causal.generation_report(Model(), Tok(), collator, rows, "cpu",
+                                         max_new_tokens=4, n_show=0,
+                                         use_soft_nodes=False)
+    assert off["abstain_acc_unanswerable_cross"] == 0.0

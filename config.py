@@ -203,8 +203,15 @@ class CausalModelConfig:
     max_nodes: int = 16  # == number of injected soft tokens
     dropout: float = 0.1
 
-    # Soft-token injection
-    injection_gate_init: float = 0.1
+    # Graph injection: "prefix" (gated soft tokens between the prompt and
+    # the response; v1, v2) or "xattn" (gated cross-attention in every
+    # xattn_every-th decoder layer from the tap layer on; v3)
+    injection: str = "prefix"
+    injection_gate_init: float = 0.1  # prefix only. xattn gates start at 0
+    xattn_every: int = 2
+    xattn_heads: int = 8
+    # xattn only: the share of training samples that get no graph
+    node_dropout: float = 0.0
 
     # Context lengths. 4096 tokens holds a 16k-char curated document
     # (4.3 chars/token for Qwen) plus its QA question
@@ -241,6 +248,14 @@ class CausalModelConfig:
         """Frozen bf16 base + LoRA: keeps the base model's general ability
         (v1 full fine-tuning lost 4-15 points on zero-shot benchmarks)."""
         return cls(model_name="Qwen/Qwen3-0.6B-Base", use_lora=True)
+
+    @classmethod
+    def for_qwen3_0_6b_lora_xattn(cls) -> "CausalModelConfig":
+        """v3: LoRA + cross-attention injection. With soft tokens, the node
+        slots between the prompt and the answer cost about 9 acc_norm
+        points on ARC-Easy whatever their content."""
+        return cls(model_name="Qwen/Qwen3-0.6B-Base", use_lora=True,
+                   injection="xattn", node_dropout=0.1)
 
     @classmethod
     def for_qwen3_1_7b_lora(cls) -> "CausalModelConfig":
@@ -285,6 +300,7 @@ class CausalModelConfig:
 CAUSAL_MODEL_PRESETS = {
     "qwen3-0.6b": CausalModelConfig.for_qwen3_0_6b,
     "qwen3-0.6b-lora": CausalModelConfig.for_qwen3_0_6b_lora,
+    "qwen3-0.6b-lora-xattn": CausalModelConfig.for_qwen3_0_6b_lora_xattn,
     "qwen3-1.7b": CausalModelConfig.for_qwen3_1_7b,
     "qwen3-1.7b-lora": CausalModelConfig.for_qwen3_1_7b_lora,
     "qwen3-4b-lora": CausalModelConfig.for_qwen3_4b_lora,

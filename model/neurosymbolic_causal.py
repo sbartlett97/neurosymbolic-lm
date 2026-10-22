@@ -16,12 +16,21 @@ Two passes per training step:
    tapped mid-layer goes through a small bidirectional adapter and feeds
    the symbolic heads (entity classifier, concept bank, GNN, relation
    scorer, soft logic) — the same modules the encoder-decoder model uses.
-2. **Write**: node features are injected as gated soft tokens between
-   prompt and response embeddings, and the full packed sequence runs
-   through the backbone once for the LM loss. Returned ``logits`` are
-   pre-aligned to the response tokens (position ``p+K+j-1`` predicts
-   response token ``j``), so trainers compute plain cross-entropy against
-   the collator's ``decoder_labels`` with no shifting.
+2. **Write**: the full packed sequence runs through the backbone once for
+   the LM loss. The node features reach it in one of two ways
+   (``injection``):
+
+   - ``"prefix"``: gated soft tokens between the prompt and the response
+     (``[prompt | K nodes | response]``). Used by v1 and v2.
+   - ``"xattn"``: gated cross-attention in the decoder layers after the tap
+     layer (``[prompt | response]``, as in the base model). Only the
+     positions from the last prompt token on read the nodes: the nodes come
+     from the whole prompt, and the last prompt token predicts the first
+     response token (EOS = abstain).
+
+   Returned ``logits`` are pre-aligned to the response tokens, so trainers
+   compute plain cross-entropy against the collator's ``decoder_labels``
+   with no shifting.
 
 Output-dict keys and the ``forward(input_ids, attention_mask, spans,
 y_ids)`` call shape match ``NeuroSymbolicLM``, so the stage trainers and
@@ -37,7 +46,7 @@ import torch.nn.functional as F
 from .entity import TokenEntityClassifier, ConceptBank, entity_node_scores
 from .extraction_adapter import ExtractionAdapter
 from .gnn import SimpleGNN
-from .injection import NodePrefixInjector
+from .injection import NodeCrossAttention, NodePrefixInjector
 from .logic import SoftLogicConstraints
 from .pooling import MultiQueryPool
 
@@ -92,6 +101,10 @@ class NeuroSymbolicCausalLM(nn.Module):
         max_nodes: int = 16,
         dropout: float = 0.1,
         injection_gate_init: float = 0.1,
+        injection: str = "prefix",
+        xattn_every: int = 2,
+        xattn_heads: int = 8,
+        node_dropout: float = 0.0,
         gradient_checkpointing: bool = False,
         max_input_length: int = 2048,
         max_output_length: int = 512,
@@ -164,9 +177,72 @@ class NeuroSymbolicCausalLM(nn.Module):
         self.softlogic = SoftLogicConstraints(n_entity_types, n_relations)
 
         # --- broadcasting -------------------------------------------------
-        self.injector = NodePrefixInjector(
-            node_dim, self.hidden_size, gate_init=injection_gate_init
-        )
+        self.injection = injection
+        # Training only, xattn only: the share of samples that get no graph,
+        # so the backbone keeps working without it
+        self.node_dropout = float(node_dropout)
+        if injection == "prefix":
+            self.injector = NodePrefixInjector(
+                node_dim, self.hidden_size, gate_init=injection_gate_init
+            )
+        elif injection == "xattn":
+            # Layers from the tap on: they do not change the tapped states,
+            # so the read pass needs no graph
+            self.xattn_layer_ids = list(range(self.tap_layer, n_layers, xattn_every))
+            self.xattn = nn.ModuleList(
+                NodeCrossAttention(self.hidden_size, node_dim, xattn_heads)
+                for _ in self.xattn_layer_ids
+            )
+            # Set by _write / _generate, read by the layer hooks. _write
+            # leaves it set: gradient checkpointing runs the layers again
+            # in backward. The next read pass clears it.
+            self._xattn_ctx: Optional[Dict] = None
+            layers = self._decoder().layers
+            for j, i in enumerate(self.xattn_layer_ids):
+                layers[i].register_forward_hook(self._xattn_hook(j))
+        else:
+            raise ValueError(f"injection must be 'prefix' or 'xattn', not {injection!r}")
+
+    # ------------------------------------------------------------------
+    # Graph injection helpers
+    # ------------------------------------------------------------------
+
+    def _decoder(self) -> nn.Module:
+        return (self.backbone.get_decoder()
+                if hasattr(self.backbone, "get_decoder") else self.backbone)
+
+    def _xattn_hook(self, j: int):
+        def hook(module, args, output):
+            ctx = self._xattn_ctx
+            if ctx is None:
+                return None
+            hidden = output[0] if isinstance(output, tuple) else output
+            mask = ctx["pos_mask"]
+            if mask is None:  # generate: only the newest position predicts
+                mask = hidden.new_zeros(hidden.shape[0], hidden.shape[1], 1)
+                mask[:, -1] = 1
+            elif mask.shape[1] != hidden.shape[1]:
+                return None  # not the pass that set the context
+            new = hidden + self.xattn[j](hidden, ctx["nodes"], ctx["valid"], mask)
+            return (new,) + tuple(output[1:]) if isinstance(output, tuple) else new
+        return hook
+
+    def injection_modules(self) -> List[nn.Module]:
+        """The modules that put the graph into the backbone."""
+        return [self.injector] if self.injection == "prefix" else [self.xattn]
+
+    def injection_gates(self) -> List[nn.Parameter]:
+        """The scalar gates. All at 0 = no graph signal."""
+        if self.injection == "prefix":
+            return [self.injector.gate]
+        return [m.gate for m in self.xattn]
+
+    def injection_gate_value(self) -> float:
+        """For logs: the prefix gate, or the mean |tanh(gate)| of the
+        cross-attention layers."""
+        if self.injection == "prefix":
+            return float(self.injector.gate)
+        return float(torch.stack([torch.tanh(g.detach()).abs() for g in self.injection_gates()]).mean())
 
     # ------------------------------------------------------------------
     # Read pass
@@ -177,12 +253,9 @@ class NeuroSymbolicCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Backbone over the prompt; tapped mid-layer through the adapter."""
         _check_right_padded(attention_mask)
-        decoder = (
-            self.backbone.get_decoder()
-            if hasattr(self.backbone, "get_decoder")
-            else self.backbone
-        )
-        out = decoder(
+        if self.injection == "xattn":
+            self._xattn_ctx = None
+        out = self._decoder()(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
@@ -304,9 +377,11 @@ class NeuroSymbolicCausalLM(nn.Module):
         attention_mask: torch.Tensor,
         node_feats: Optional[torch.Tensor],
         y_ids: torch.Tensor,
+        node_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Pack [prompt | nodes | response] per sample and return logits
-        aligned to the response tokens: logits[:, j] predicts y_ids[:, j].
+        """Pack [prompt | nodes | response] (prefix) or [prompt | response]
+        (xattn) per sample and return logits aligned to the response
+        tokens: logits[:, j] predicts y_ids[:, j].
         """
         B, R = y_ids.shape
         device = input_ids.device
@@ -316,7 +391,7 @@ class NeuroSymbolicCausalLM(nn.Module):
         resp_emb = emb_layer(y_ids)
         node_emb = None
         K = 0
-        if node_feats is not None:
+        if node_feats is not None and self.injection == "prefix":
             node_emb = self.injector(node_feats).to(prompt_emb.dtype)
             K = node_emb.shape[1]
 
@@ -350,6 +425,18 @@ class NeuroSymbolicCausalLM(nn.Module):
         starts = torch.tensor(
             [int(p) + K - 1 for p in prompt_lens], device=device
         )
+        if self.injection == "xattn":
+            self._xattn_ctx = None
+            if node_feats is not None:
+                pos = torch.arange(T, device=device)
+                pos_mask = (pos[None, :] >= starts[:, None]).unsqueeze(-1)
+                if self.training and self.node_dropout > 0:
+                    keep = torch.rand(B, device=device) >= self.node_dropout
+                    pos_mask = pos_mask & keep[:, None, None]
+                if node_valid is None:
+                    node_valid = node_feats.new_ones(node_feats.shape[:2], dtype=torch.bool)
+                self._xattn_ctx = {"nodes": node_feats, "valid": node_valid,
+                                   "pos_mask": pos_mask}
         first = int(starts.min())
         out = self.backbone(
             inputs_embeds=packed_emb,
@@ -387,6 +474,8 @@ class NeuroSymbolicCausalLM(nn.Module):
             enc, token_ent_logits, attention_mask, spans
         )
         node_feats_refined = self.gnn(node_feats)
+        # Empty slots are all-zero before the GNN (it can fill them in)
+        node_valid = node_feats.abs().sum(dim=-1) > 0
 
         concept_query = self.concept_proj(token_pool)
         concept_vec, concept_probs = self.concept_bank.soft_assign(concept_query)
@@ -416,6 +505,7 @@ class NeuroSymbolicCausalLM(nn.Module):
                 attention_mask,
                 node_feats_refined if use_soft_nodes else None,
                 y_ids,
+                node_valid,
             )
 
         return outputs
@@ -463,7 +553,15 @@ class NeuroSymbolicCausalLM(nn.Module):
         prompt_emb = emb_layer(input_ids)
         node_emb = None
         K = 0
-        if use_soft_nodes:
+        if use_soft_nodes and self.injection == "xattn":
+            # The hooks let only the newest position read the nodes. That
+            # is right only if each step adds one cached position
+            if kwargs.get("use_cache") is False:
+                raise ValueError("injection='xattn' generation needs use_cache=True")
+            self._xattn_ctx = {"nodes": node_feats_refined,
+                               "valid": node_feats.abs().sum(dim=-1) > 0,
+                               "pos_mask": None}
+        elif use_soft_nodes:
             node_emb = self.injector(node_feats_refined).to(prompt_emb.dtype)
             K = node_emb.shape[1]
 
@@ -485,12 +583,16 @@ class NeuroSymbolicCausalLM(nn.Module):
                 packed_emb[i, start + p:start + p + K] = node_emb[i]
                 packed_mask[i, start + p:start + p + K] = 1
 
-        return self.backbone.generate(
-            inputs_embeds=packed_emb,
-            attention_mask=packed_mask,
-            max_new_tokens=max_length,
-            **kwargs,
-        )
+        try:
+            return self.backbone.generate(
+                inputs_embeds=packed_emb,
+                attention_mask=packed_mask,
+                max_new_tokens=max_length,
+                **kwargs,
+            )
+        finally:
+            if self.injection == "xattn":
+                self._xattn_ctx = None
 
     # -- convenience for staged freezing ---------------------------------
 
