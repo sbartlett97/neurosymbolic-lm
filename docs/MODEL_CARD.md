@@ -124,9 +124,12 @@ Each validation set holds at most 500 rows of the stage's val file.
 
 How to read the table:
 
-- **Gate = 0** removes the graph tokens. The val loss is lower with the graph in
-  every stage after stage 1. The gap grows from 0.011 (decoder epoch 1) to 0.037
-  (joint epoch 2). The model uses the graph signal, but the gain is small.
+- **Gate = 0** sets the 16 graph tokens to zero vectors. The 16 slots stay in
+  the sequence. The val loss is lower with the graph in every stage after
+  stage 1. The gap grows from 0.011 (decoder epoch 1) to 0.037 (joint epoch 2).
+  This measure does not separate the graph content from the slots themselves.
+  For v2, a later test shows that the content adds almost nothing (see
+  [v2](#v2-lora-run-with-unanswerable-questions)).
 - **Joint val loss** is the sum of the extraction, relation, logic and response
   losses. Do not compare it with the decoder-stage val loss.
 - **Abstain acc / respond rate** only examine the first generated token: EOS or not
@@ -187,7 +190,20 @@ How to read the tables:
 - **Graph on vs off.** The graph lowers most general benchmarks by 0.5–9
   points. It raises BoolQ by 1.7 points and SQuAD f1 by 2.3 points. The SQuAD
   gain comes from unanswerable questions: the model abstains on 7.7% of them
-  with the graph and on 2.9% without it.
+  with the graph and on 2.9% without it. "Off" removes the 16 slots, so these
+  differences can come from the slots and not from the graph content.
+- **The cost is the slot position, not the content.** On ARC-Easy (500
+  questions, v2), the scores were:
+
+  | Mode | acc | acc_norm |
+  |---|---|---|
+  | graph off | 64.0 | 62.8 |
+  | graph on | 60.4 | 53.8 |
+  | nodes from another question | 61.8 | 54.0 |
+  | 16 zero slots | 56.8 | 52.6 |
+
+  Nodes from the wrong question score the same as the right nodes. The 16
+  slots between the prompt and the answer cause the loss.
 
 ## v2: LoRA run with unanswerable questions
 
@@ -230,8 +246,19 @@ optimizer steps/s. Wall time about 4.5 h for stages 2 and 3.
 | Joint | 1.4081 | 1.6577 | 1.8495 | abstain acc 1.000, respond rate 1.000 |
 
 - The val loss gap between gate on and gate off is 0.197 (decoder) and 0.192
-  (joint). In v1 it was 0.011–0.037. The graph tokens now carry more of the
-  signal. The final gate value is 0.127.
+  (joint). In v1 it was 0.011–0.037. The final gate value is 0.127.
+- **The gap does not come from the graph content.** A later test of the final
+  model measured the response loss on the 443 val rows in three modes:
+
+  | Rows | real nodes | nodes from another row | no slots |
+  |---|---|---|---|
+  | all (443) | 0.5255 | 0.5263 | 1.2130 |
+  | respond (285) | 0.3565 | 0.3579 | 1.4079 |
+  | general (41) | 3.2000 | 3.1994 | 3.3167 |
+
+  The right nodes are only 0.0008 better than nodes from another row. The
+  model learned the 16 slots as a marker for the start of the answer. It does
+  not use the graph content.
 - Abstain acc now tests unanswerable questions, not documents with no
   question. The val set gives 1.000, but SQuAD v2 gives a NoAns exact score of
   only 7.7%. A possible cause: the val questions come from the same generator
@@ -305,8 +332,9 @@ To read the extracted graph, call `model(input_ids, attention_mask)` without
   0.5837 (epoch 2), while train loss fell from 0.62 to 0.20. `stage_decoder.pt`
   holds the epoch 2 weights. The next run uses 1 decoder epoch or early
   stopping.
-- **Small graph gain.** The graph tokens lower val loss by about 2–3%. This
-  run does not show that the graph improves answer accuracy.
+- **No measured gain from the graph content.** In v2, nodes from another row
+  give the same val loss as the right nodes. The graph tokens help only as a
+  fixed marker before the answer. v1 was not tested this way.
 - **Silver labels.** GLiNER2 made the entity and relation labels automatically,
   without human review. The F1 scores above measure agreement with GLiNER2,
   not with human labels.
