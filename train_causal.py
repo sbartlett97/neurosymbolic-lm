@@ -78,7 +78,7 @@ from training import (
     Stage4_Joint_Trainer,
     TrainingLogger,
 )
-from training.trainers import create_entity_token_labels
+from training.trainers import create_entity_token_labels, graph_kwargs
 
 
 def parse_args(argv=None):
@@ -572,7 +572,8 @@ def symbolic_metrics(model, loader, device) -> Dict[str, float]:
     for batch in loader:
         batch = to_device(batch, device)
         spans = batch["entity_token_spans"]
-        out = model(batch["input_ids"], batch["attention_mask"], spans=spans)
+        out = model(batch["input_ids"], batch["attention_mask"], spans=spans,
+                    **graph_kwargs(batch))
         logits = out["token_ent_logits"]
         B, L, E = logits.shape
         labels = create_entity_token_labels(batch, B, L, E, logits.device)
@@ -628,7 +629,7 @@ def generation_report(model, tokenizer, collator, samples: List[Dict],
         gen = model.generate(batch["input_ids"], batch["attention_mask"],
                              max_length=max_new_tokens, do_sample=False,
                              eos_token_id=eos, pad_token_id=tokenizer.pad_token_id,
-                             use_soft_nodes=use_soft_nodes)
+                             use_soft_nodes=use_soft_nodes, **graph_kwargs(batch))
         first = int(gen[0, 0]) if gen.shape[1] > 0 else eos
         if int(sample.get("should_respond", 0)) == 0:
             abstain_total += 1

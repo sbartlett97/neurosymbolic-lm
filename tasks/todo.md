@@ -332,3 +332,111 @@ built from the whole prompt. The goal there is no loss.
 ## Evaluation additions
 - [ ] Val abstain_acc for each kind (same-doc negatives separately)
 - [ ] Perplexity on wikitext. Check loglikelihood_rolling in eval_harness.py
+
+## Run B results (2026-10-22, pod 2j9grlmwelqch4, deleted)
+Training: 12:47-18:08 UTC, 0.67 steps/s, no errors. Benchmarks in bf16.
+Hub: qwen3-0.6b-v3/ (stage_decoder.pt, stage_joint.pt,
+final_causal_model.pt, 8 benchmark JSONs, logs, TensorBoard).
+base wikitext failed on the pod (fp32 batch 2, CUDA OOM). Run again locally.
+
+Validation:
+| Stage   | val    | val_gate0 | val_shuffled | mean gate |
+| Decoder | 0.9863 | 0.9865    | 0.9867       | ~0.004    |
+| Joint   | 1.8550 | 1.8543    | 1.8549       | ~0.05     |
+(joint val includes the symbolic losses: compare within a row only)
+Generation (joint), graph on = graph off: abstain_acc 0.933, respond_rate
+0.925, unanswerable_cross 1.000, unanswerable_same 0.800 (about 20 rows),
+unanswerable_swap 1.000.
+
+Benchmarks (acc_norm for ARC, HellaSwag, PIQA; acc for the others):
+| Task          | Base  | v2    | v2 off | v3    | v3 off |
+| MMLU 5-shot   | 52.5  | 49.1  | 50.8   | 50.9  | 51.0   |
+| ARC-Easy      | 58.0  | 55.5  | 64.8   | 61.7  | 61.7   |
+| ARC-Challenge | 38.1  | 37.4  | 38.0   | 38.8  | 39.3   |
+| HellaSwag     | 53.8  | 50.8  | 52.3   | 52.5  | 52.4   |
+| PIQA          | 69.8  | 69.1  | 69.6   | 69.3  | 69.6   |
+| WinoGrande    | 58.7  | 57.6  | 59.4   | 59.5  | 59.4   |
+| BoolQ         | 70.0  | 63.1  | 61.4   | 62.4  | 62.6   |
+| SQuAD f1      | 29.21 | 36.55 | 34.28  | 48.73 | 48.54  |
+| SQuAD HasAns_f1 | 58.25 | 65.21 | 65.46 | 60.88 | 60.99 |
+| SQuAD NoAns   | 0.00  | 7.72  | 2.91   | 36.51 | 36.01  |
+| wikitext word ppl | BASE_WIKI | - | - | 20.27 | 20.19 |
+
+Checks:
+- [ ] val < val_gate0 and val < val_shuffled: fails. The graph content
+      adds nothing in both stages (differences of 0.0007 or less)
+- [ ] unanswerable_same, graph on > graph off: fails (0.800 = 0.800)
+- [x] respond_rate > 0.9 (0.925)
+- [x] Graph on within 2 points of base: MMLU, ARC, HellaSwag, PIQA,
+      WinoGrande pass. BoolQ fails (-7.6; v2 had the same loss)
+Conclusion:
+- Cross-attention removes the v2 slot-position cost (ARC-E +6.2,
+  HellaSwag +1.7, MMLU +1.8 against v2 graph on). Graph on = graph off.
+- The new data gives the large SQuAD gain: NoAns 7.7 -> 36.5, f1 36.6 ->
+  48.7. It costs 4.3 points of HasAns_f1 against v2 (more abstention).
+- The graph is not used. The nodes come from the passage that is already
+  in the prompt, so the LoRA learns the task from the text alone. A graph
+  gain needs a task where the graph holds information the prompt lacks.
+
+# Round 7: can the graph path carry an answer? (plan, 2026-10-23)
+
+Run B: the graph adds nothing when the prompt already holds the passage.
+Before a companion knowledge graph, test the channel itself: build the
+graph from the passage, but keep the passage out of the prompt.
+
+## Step 1a: separate graph input (code)
+- [x] Model: forward/generate take graph_input_ids + graph_attention_mask.
+      The read pass (tap, heads, nodes, GNN) runs on the graph input. The
+      write pass runs on input_ids. Default (None): the graph input is the
+      prompt, so the old behaviour stays the same
+- [x] Collator: a row with "graph_text" tokenizes it for the read pass.
+      Entity spans and labels align to graph_text. "text" is the prompt
+- [x] Trainers (symbolic, decoder, joint), symbolic_metrics, val loss and
+      val generation pass the graph input (training.trainers.graph_kwargs).
+      Entity labels use the graph mask. eval_harness: no change (its
+      tasks have no graph text)
+- [x] Tests (tests/test_graph_input.py, 13; suite 208 pass): default = old outputs exactly; graph input changes only the
+      nodes; spans align to graph_text; generate agrees with the training
+      pass; shuffle control works with a graph input
+
+## Step 1b: graph-only data (mix_stage2)
+- [ ] New kind "graph_only": a respond row split into graph_text = the
+      document (the doc is the prefix of "text", so the spans stay valid),
+      text = the question. Drop spans that start past len(doc). Never write
+      "graph_text": null
+- [ ] Val sets for 3 modes on the same rows: closed book (no graph, no
+      passage), graph only, passage in the prompt
+- [ ] Mix: graph_only rows + some normal respond rows + general rows (keep
+      the general LM). Unanswerable rows in graph-only form too (graph from
+      a document without the answer)
+
+## Step 1c: run (A40, about $5)
+- [ ] Init from v3 final model. Stage 2 + joint on the Step 1b mix
+- [ ] Measures on val (respond rows, answer tokens only):
+      closed book loss vs graph-only loss vs passage loss; exact match /
+      token F1 of generated answers in the 3 modes; val_shuffled in
+      graph-only mode
+- Decision:
+  - graph only clearly better than closed book (and better than
+    val_shuffled): the channel works. Go to Step 2 (companion KG, with a
+    text-retrieval baseline)
+  - graph only = closed book: the channel is the bottleneck. Fix the node
+    encoder first (span pooling at inference, more nodes, value nodes),
+    then test again
+
+- Report graph-only loss and EM/F1 twice: with gold-span nodes (channel
+  capacity; the joint val loss uses gold spans) and with top-K nodes (the
+  real pipeline; generate uses top-K). The split shows which part fails:
+  the channel or the node selection
+- Before Step 1b: local coverage check on the v3 model. With val passages
+  as the graph input, how often is an answer token among the 16 top-K
+  node positions (entity answers vs value answers)? Low coverage: fix the
+  node selection before the run
+- Later, only if Step 1c is null with good coverage: let the question
+  tokens read the graph too (no leak with a separate graph input)
+
+## Risks
+- The closed-book model can learn some answers from the question alone
+  (memorised facts). The closed-book baseline measures that
+- 16 single-token nodes may hold the entity but not a date or number
+  answer. Report the gain per answer type (entity vs value)

@@ -26,6 +26,13 @@ from contextlib import nullcontext
 # Shared label and loss helpers
 # ----------------------------------------------------------------------
 
+def graph_kwargs(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """The separate read-pass input of a batch (rows with "graph_text"),
+    as model keyword arguments. Empty for other batches."""
+    return {k: batch[k] for k in ("graph_input_ids", "graph_attention_mask")
+            if k in batch}
+
+
 def create_entity_token_labels(
     batch: Dict[str, Any],
     B: int,
@@ -33,8 +40,9 @@ def create_entity_token_labels(
     E: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Per-token entity labels aligned to the model's input positions."""
-    attention_mask = batch.get("attention_mask")
+    """Per-token entity labels aligned to the read-pass input positions
+    (the graph input when the batch has one)."""
+    attention_mask = batch.get("graph_attention_mask", batch.get("attention_mask"))
     if attention_mask is not None:
         mask = attention_mask[:, :L].to(device)
         labels = torch.where(
@@ -393,6 +401,7 @@ class Stage2_Symbolic_Trainer(BaseTrainer):
             batch["attention_mask"],
             spans=spans,
             y_ids=None,
+            **graph_kwargs(batch),
         )
 
         ent_logits = out["token_ent_logits"]
@@ -454,6 +463,7 @@ class Stage3_Decoder_Trainer(BaseTrainer):
             batch["attention_mask"],
             spans=None,
             y_ids=batch["decoder_input_ids"],
+            **graph_kwargs(batch),
         )
         logits = out["logits"]
         # Collator and model align logits with labels; no shift needed
@@ -516,6 +526,7 @@ class Stage4_Joint_Trainer(BaseTrainer):
             batch["attention_mask"],
             spans=spans,
             y_ids=decoder_input_ids,
+            **graph_kwargs(batch),
         )
 
         ent_logits = out["entity_logits"]

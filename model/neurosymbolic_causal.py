@@ -32,6 +32,11 @@ Two passes per training step:
    compute plain cross-entropy against the collator's ``decoder_labels``
    with no shifting.
 
+A separate graph input (``graph_input_ids``, ``graph_attention_mask``) moves
+the read pass to other text, for example a passage that is not in the
+prompt. The heads, spans and nodes then refer to the graph input. Without it,
+the read pass runs on the prompt.
+
 Output-dict keys and the ``forward(input_ids, attention_mask, spans,
 y_ids)`` call shape match ``NeuroSymbolicLM``, so the stage trainers and
 the continual-learning stack work with either model.
@@ -270,6 +275,20 @@ class NeuroSymbolicCausalLM(nn.Module):
         tapped = out.hidden_states[self.tap_layer].to(self.token_ent.fc.weight.dtype)
         return self.adapter(tapped, attention_mask)
 
+    @staticmethod
+    def _graph_input(input_ids, attention_mask, graph_input_ids, graph_attention_mask):
+        """The read-pass input: the graph input if given, else the prompt."""
+        if graph_input_ids is None:
+            return input_ids, attention_mask
+        if graph_attention_mask is None:
+            raise ValueError("graph_input_ids needs graph_attention_mask")
+        if graph_input_ids.shape[0] != input_ids.shape[0]:
+            raise ValueError("graph input and prompt need the same batch size")
+        # _read checks the graph mask; the write pass packs the prompt by
+        # its length, so the prompt must be right-padded too
+        _check_right_padded(attention_mask)
+        return graph_input_ids, graph_attention_mask
+
     def _extract_node_features(
         self,
         enc: torch.Tensor,
@@ -468,14 +487,21 @@ class NeuroSymbolicCausalLM(nn.Module):
         y_ids: Optional[torch.Tensor] = None,
         use_soft_nodes: bool = True,
         pixel_values: Optional[torch.Tensor] = None,  # API parity; unused
+        graph_input_ids: Optional[torch.Tensor] = None,
+        graph_attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        enc = self._read(input_ids, attention_mask)
+        # The read pass (heads, nodes, GNN) runs on the graph input; the
+        # write pass runs on the prompt. Without a graph input both are the
+        # prompt. Spans and entity outputs refer to the graph input.
+        g_ids, g_mask = self._graph_input(
+            input_ids, attention_mask, graph_input_ids, graph_attention_mask)
+        enc = self._read(g_ids, g_mask)
 
         token_ent_logits = self.token_ent(enc)
-        token_pool, _ = self.token_pool(enc, attention_mask)
+        token_pool, _ = self.token_pool(enc, g_mask)
 
         node_feats = self._extract_node_features(
-            enc, token_ent_logits, attention_mask, spans
+            enc, token_ent_logits, g_mask, spans
         )
         node_feats_refined = self.gnn(node_feats)
         # Empty slots are all-zero before the GNN (it can fill them in)
@@ -488,7 +514,7 @@ class NeuroSymbolicCausalLM(nn.Module):
             node_feats_refined
         )
         node_entity_type_probs = self._compute_node_entity_probs(
-            token_ent_logits, attention_mask, spans
+            token_ent_logits, g_mask, spans
         )
 
         outputs: Dict[str, torch.Tensor] = {
@@ -528,6 +554,9 @@ class NeuroSymbolicCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Generate from [prompt | nodes] soft-token-augmented context.
 
+        ``graph_input_ids`` and ``graph_attention_mask`` (keyword arguments)
+        give a separate read-pass input, as in ``forward``.
+
         Prompts are left-packed so generation continues from the last real
         position for every sample. Returns only the generated tokens
         (HF behavior for ``inputs_embeds`` input).
@@ -547,12 +576,16 @@ class NeuroSymbolicCausalLM(nn.Module):
         attention_mask: torch.Tensor,
         max_length: int,
         use_soft_nodes: bool,
+        graph_input_ids: Optional[torch.Tensor] = None,
+        graph_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        enc = self._read(input_ids, attention_mask)
+        g_ids, g_mask = self._graph_input(
+            input_ids, attention_mask, graph_input_ids, graph_attention_mask)
+        enc = self._read(g_ids, g_mask)
         token_ent_logits = self.token_ent(enc)
         node_feats = self._extract_node_features(
-            enc, token_ent_logits, attention_mask
+            enc, token_ent_logits, g_mask
         )
         node_feats_refined = self.gnn(node_feats)
 

@@ -155,6 +155,17 @@ class CognitiveCollator:
 
         tok, offsets = self._tokenize_inputs(texts)
 
+        # A row with "graph_text" gives the read pass other text than the
+        # prompt (graph_input_ids). Its entity spans refer to graph_text.
+        # Rows without it use their prompt, as before.
+        graph_texts = [s.get("graph_text") for s in batch]
+        has_graph = any(g is not None for g in graph_texts)
+        if has_graph:
+            span_texts = [g if g is not None else t for g, t in zip(graph_texts, texts)]
+            span_tok, span_offsets = self._tokenize_inputs(span_texts)
+        else:
+            span_texts, span_tok, span_offsets = texts, tok, offsets
+
         max_entities = max((len(x.get("entities", [])) for x in batch), default=0) or 1
         entity_ids = torch.zeros(len(batch), max_entities, dtype=torch.long)
         entity_type_labels = torch.zeros(len(batch), max_entities, dtype=torch.long)
@@ -187,8 +198,8 @@ class CognitiveCollator:
 
             # Compute token-level spans for entity alignment
             token_spans = self._compute_entity_token_spans(
-                sample, texts[i], tok["input_ids"][i],
-                offsets[i].tolist() if offsets is not None else None,
+                sample, span_texts[i], span_tok["input_ids"][i],
+                span_offsets[i].tolist() if span_offsets is not None else None,
             )
             entity_token_spans.append(token_spans)
 
@@ -202,6 +213,10 @@ class CognitiveCollator:
             "should_respond": should_respond,
             "entity_token_spans": entity_token_spans,
         }
+
+        if has_graph:
+            result["graph_input_ids"] = span_tok["input_ids"]
+            result["graph_attention_mask"] = span_tok["attention_mask"]
 
         if decoder_input_ids is not None:
             result["decoder_input_ids"] = decoder_input_ids
@@ -510,12 +525,14 @@ class CognitiveCollator:
         data provides exact offsets, exclusive end); otherwise falls back to
         finding the first occurrence of each entity string. Gold spans are
         only trusted when the tokenized text is the sample's own text (chat
-        templating rewrites the input, invalidating offsets).
+        templating rewrites the input, invalidating offsets). For a row with
+        "graph_text", the gold spans refer to graph_text.
         """
         entities = sample.get("entities", [])
         gold_spans = sample.get("entity_spans") or []
         gold_spans_valid = (
-            len(gold_spans) == len(entities) and text == sample.get("text")
+            len(gold_spans) == len(entities)
+            and text == sample.get("graph_text", sample.get("text"))
         )
         token_spans = []
 
