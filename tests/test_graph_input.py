@@ -183,3 +183,45 @@ def test_trainer_losses_use_the_graph_input(injection):
     with torch.no_grad():
         assert not torch.allclose(dec.compute_loss(common), dec.compute_loss(with_graph))
         joint.compute_loss(with_graph)  # spans past the prompt length work
+
+
+def test_eval_modes_and_token_f1():
+    from eval_graph_only import mode_row, token_f1
+    row = {"text": "Who won?", "graph_text": "Ada won the prize.", "kind": "graph_only_respond",
+           "entity_spans": [[0, 3]], "entities": ["Ada"]}
+    assert mode_row(row, "graph") == row
+    assert "graph_text" not in mode_row(row, "closed_book")
+    assert mode_row(row, "closed_book")["text"] == "Who won?"
+    passage = mode_row(row, "passage")
+    assert passage["text"] == "Ada won the prize.\n\nWho won?" and "graph_text" not in passage
+    # The document is the prefix, so the gold spans stay valid in passage mode
+    s, e = passage["entity_spans"][0]
+    assert passage["text"][s:e] == "Ada"
+    assert "graph_text" in row  # the input row stays the same
+    assert token_f1("Ada won", "Ada won the prize") == pytest.approx(2 * 1 * 0.5 / 1.5)
+    assert token_f1("", "Ada") == 0.0 and token_f1("Bob", "Ada") == 0.0
+
+
+def test_eval_summary_and_paired_contrasts():
+    from eval_graph_only import contrasts, summarize
+    records = []
+    for i in range(20):
+        records.append({"row": i, "kind": "graph_only_respond",
+                        "answer_type": "value" if i % 2 else "other",
+                        "closed_book": {"key_recall": 0.0, "f1": 0.1, "respond": 1},
+                        "graph": {"key_recall": 0.5, "f1": 0.6, "respond": 1},
+                        "graph_shuffled": {"key_recall": 0.5, "f1": 0.6, "respond": 1},
+                        "passage": {"key_recall": 1.0, "f1": 0.9, "respond": 1}})
+    records.append({"row": 20, "kind": "graph_only_unanswerable_same", "answer_type": "other",
+                    "graph": {"abstain": 1}, "closed_book": {"abstain": 0}})
+    s = summarize(records)
+    assert s["graph"]["key_recall"] == 0.5 and s["graph"]["n_respond"] == 20
+    assert s["graph"]["f1_value"] == 0.6
+    assert s["graph"]["abstain_unanswerable_same"] == 1.0
+    assert s["closed_book"]["abstain_unanswerable_same"] == 0.0
+    c = contrasts(records)
+    book = c["key_recall:graph-closed_book"]
+    assert book["n"] == 20 and book["mean"] == 0.5 and book["lo"] == 0.5
+    shuf = c["key_recall:graph-graph_shuffled"]
+    assert shuf["mean"] == 0.0 and shuf["lo"] <= 0.0  # no evidence of content
+    assert c["f1_value:graph-closed_book"]["n"] == 10

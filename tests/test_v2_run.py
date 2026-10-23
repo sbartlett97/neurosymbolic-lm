@@ -318,3 +318,72 @@ def test_generation_report_scores_each_negative_kind():
                                          max_new_tokens=4, n_show=0,
                                          use_soft_nodes=False)
     assert off["abstain_acc_unanswerable_cross"] == 0.0
+
+
+# --- Round 7: graph-only rows ---------------------------------------------------
+
+def test_graph_only_moves_the_document_to_graph_text():
+    row = qa_row()
+    # An entity that only the question holds: its span is past the document
+    q_start = len(DOC) + 2 + row["text"][len(DOC) + 2:].index("Nobel Prize")
+    row["entities"].append("Nobel Prize")
+    row["entity_spans"].append([q_start, q_start + len("Nobel Prize")])
+    row["entity_types"].append("other")
+    row["concepts"].append(["other"])
+    row["relations"].append([0, 5, "won"])
+    g = mix_stage2.make_graph_only(row)
+    assert g["graph_text"] == DOC
+    assert g["text"] == "When did she win the Nobel Prize?"
+    assert g["kind"] == "graph_only_respond"
+    assert g["should_respond"] == 1 and g["response"] == "In 1903."
+    assert g["entities"] == ["Marie Curie", "Warsaw", "University of Paris", "1903", "1934"]
+    for (s, e), name in zip(g["entity_spans"], g["entities"]):
+        assert DOC[s:e] == name
+    assert [0, 5, "won"] not in g["relations"] and len(g["relations"]) == 3
+    assert "graph_text" not in row  # the input row stays the same
+
+
+def test_graph_only_negative_keeps_its_target():
+    neg = mix_stage2.make_graph_only(mix_stage2.make_same_doc(qa_row()))
+    assert neg["kind"] == "graph_only_unanswerable_same"
+    assert neg["should_respond"] == 0 and neg["response"] == ""
+    assert "1903" not in neg["graph_text"]
+    assert neg["text"] == "When did she win the Nobel Prize?"
+
+
+def test_build_split_converts_a_share_of_question_rows():
+    respond = [qa_row(question=f"Question {i} about Marie Curie?", answer=f"Answer {i}.")
+               for i in range(20)]
+    abstain = [dict(base_row(), should_respond=0, response="") for _ in range(10)]
+    corpus = [{"text": long_doc(i), "entities": [], "entity_spans": [],
+               "entity_types": [], "concepts": [], "relations": []} for i in range(8)]
+    rows, stats = mix_stage2.build_split(
+        corpus, respond + abstain, 4, random.Random(0), 275, 550,
+        graph_only_frac=0.5)
+    graph = [r for r in rows if "graph_text" in r]
+    questions = [r for r in rows if r["kind"] != "general"]
+    assert stats["graph_only"] == len(graph) == round(0.5 * len(questions))
+    assert all(r["kind"].startswith("graph_only_") and r["graph_text"] for r in graph)
+    assert not any(r["kind"] == "general" and "graph_text" in r for r in rows)
+    # Default: no graph-only rows and no extra random draw (same output)
+    a, _ = mix_stage2.build_split(corpus, respond + abstain, 4, random.Random(0), 275, 550)
+    b, _ = mix_stage2.build_split(corpus, respond + abstain, 4, random.Random(0), 275, 550,
+                                  graph_only_frac=0.0)
+    assert a == b and not any("graph_text" in r for r in a)
+
+
+def test_graph_only_row_through_the_collator():
+    from data.collator_causal import CausalCognitiveCollator
+    from data.curate.taxonomy import get_default_taxonomy
+    from tests.test_collator import FakeTokenizer
+    vocab = get_default_taxonomy().vocab()
+    collator = CausalCognitiveCollator(
+        tokenizer=FakeTokenizer(), concept_map=vocab["concepts"],
+        relation_map=vocab["relations"], include_responses=True)
+    g = mix_stage2.make_graph_only(qa_row())
+    batch = collator([g])
+    words = DOC.split()
+    assert batch["graph_input_ids"].shape[1] == len(words)
+    assert batch["input_ids"].shape[1] == len(g["text"].split())
+    spans = batch["entity_token_spans"][0]
+    assert [" ".join(words[s:e + 1]).rstrip(".") for s, e in spans] == g["entities"]

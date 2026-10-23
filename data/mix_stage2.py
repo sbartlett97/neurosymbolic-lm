@@ -24,6 +24,12 @@ Row kinds (the "kind" field):
 
 A respond row gives at most one same-document or swap negative.
 
+Graph-only form (--graph-only-frac, Round 7): a share of the question rows
+(respond and the unanswerable kinds) move the document out of the prompt
+into "graph_text". The model reads the graph from graph_text, and the prompt
+holds only the question. The kind gets the prefix "graph_only_". Such a row
+can only be answered, or recognised as unanswerable, through the graph.
+
 Each row keeps the train/val split of its source document. The output vocab
 is the QA vocab: general rows only hold a subset of the corpus labels.
 
@@ -244,6 +250,20 @@ def make_swap(row: dict, by_type: Dict[str, List[str]],
     return None
 
 
+def make_graph_only(row: dict) -> dict:
+    """Move the document to "graph_text"; the prompt keeps the question.
+    The document is the start of "text", so its spans stay valid. Spans in
+    the question are dropped with their relations."""
+    doc, question = split_question(row["text"])
+    new_spans = {i: (int(s), int(e))
+                 for i, (s, e) in enumerate(row.get("entity_spans", []))
+                 if int(s) >= 0 and int(e) <= len(doc)}
+    new = dict(row)
+    new.update(remap_labels(row, new_spans))
+    new.update(text=question, graph_text=doc, kind="graph_only_" + row["kind"])
+    return new
+
+
 def cut_at_boundary(text: str, pos: int) -> int:
     """Move pos back to just after the nearest sentence end or space."""
     head = text[:pos]
@@ -284,7 +304,8 @@ def make_general(row: dict, rng: random.Random, min_chars: int,
 
 def build_split(corpus: List[dict], qa: List[dict], n_general: int,
                 rng: random.Random, min_chars: int, max_chars: int,
-                n_cross: int = -1, n_same: int = 0, n_swap: int = 0):
+                n_cross: int = -1, n_same: int = 0, n_swap: int = 0,
+                graph_only_frac: float = 0.0):
     respond = [dict(r, kind="respond") for r in qa
                if int(r.get("should_respond", 0)) == 1]
     abstain = [r for r in qa if int(r.get("should_respond", 0)) == 0]
@@ -332,7 +353,14 @@ def build_split(corpus: List[dict], qa: List[dict], n_general: int,
         if g is not None:
             general.append(g)
 
-    rows = respond + unanswerable + same + swap + general
+    questions = respond + unanswerable + same + swap
+    n_graph = 0
+    if graph_only_frac > 0:  # no extra draw: the default output stays the same
+        n_graph = round(graph_only_frac * len(questions))
+        picked = set(rng.sample(range(len(questions)), n_graph))
+        questions = [make_graph_only(r) if i in picked else r
+                     for i, r in enumerate(questions)]
+    rows = questions + general
     rng.shuffle(rows)
     stats = {
         "respond": len(respond),
@@ -341,6 +369,7 @@ def build_split(corpus: List[dict], qa: List[dict], n_general: int,
         "unanswerable_swap": len(swap),
         "abstain_without_question": len(abstain) - len(unanswerable),
         "general": len(general),
+        "graph_only": n_graph,
         "corpus_docs_not_in_qa": len(free),
         "response_chars_qa": sum(len(r.get("response", "")) for r in respond),
         "response_chars_general": sum(len(r["response"]) for r in general),
@@ -370,6 +399,9 @@ def main(argv=None):
                    help="Same-document unanswerable rows in train")
     p.add_argument("--swap-rows", type=int, default=0,
                    help="Entity-swap unanswerable rows in train")
+    p.add_argument("--graph-only-frac", type=float, default=0.0,
+                   help="Share of question rows in graph-only form (document "
+                        "in graph_text, question in text)")
     p.add_argument("--min-chars", type=int, default=275,
                    help="Shortest continuation (about 64 Qwen tokens)")
     p.add_argument("--max-chars", type=int, default=550,
@@ -393,7 +425,8 @@ def main(argv=None):
     ]:
         rows, stats = build_split(read_jsonl(corpus_file), qa, n_gen, rng,
                                   args.min_chars, args.max_chars,
-                                  n_cross=n_cross, n_same=n_same, n_swap=n_swap)
+                                  n_cross=n_cross, n_same=n_same, n_swap=n_swap,
+                                  graph_only_frac=args.graph_only_frac)
         write_jsonl(out, rows)
         share = stats["response_chars_general"] / max(
             stats["response_chars_general"] + stats["response_chars_qa"], 1)

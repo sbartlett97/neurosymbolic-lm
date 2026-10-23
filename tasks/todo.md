@@ -400,23 +400,56 @@ graph from the passage, but keep the passage out of the prompt.
       pass; shuffle control works with a graph input
 
 ## Step 1b: graph-only data (mix_stage2)
-- [ ] New kind "graph_only": a respond row split into graph_text = the
-      document (the doc is the prefix of "text", so the spans stay valid),
-      text = the question. Drop spans that start past len(doc). Never write
-      "graph_text": null
-- [ ] Val sets for 3 modes on the same rows: closed book (no graph, no
-      passage), graph only, passage in the prompt
-- [ ] Mix: graph_only rows + some normal respond rows + general rows (keep
-      the general LM). Unanswerable rows in graph-only form too (graph from
-      a document without the answer)
+- [x] make_graph_only: graph_text = the document, text = the question,
+      kind "graph_only_<kind>". Spans that start past the document are
+      dropped with their relations (none in the v3 val set: 0 of 9,375).
+      Real v3 val: 440 question rows, 0 span mismatches
+- [x] --graph-only-frac: that share of the question rows (respond and all
+      unanswerable kinds) in graph-only form, in train and val. 0 (default)
+      keeps the old output exactly. A graph-only negative can only be
+      recognised through the graph (the prompt is the bare question)
+- [x] eval_graph_only.py: 4 modes on the graph-only val rows (closed_book,
+      graph, graph_shuffled, passage). Respond rows: answer loss with top-K
+      and gold-span nodes, greedy token F1 (value / other answers), key-word
+      recall. Unanswerable rows: abstain rate per kind
+- [x] Tests: 4 in tests/test_v2_run.py, 2 in tests/test_graph_input.py.
+      The JSON holds one record per row (metrics per mode) and the paired
+      bootstrap contrasts
+- Baseline, v3 final model, 8 rows (local smoke run): on a bare question
+  v3 abstains every time, with or without the graph (loss 2.65 in
+  closed_book, graph and graph_shuffled). Passage mode: F1 0.75
 
 ## Step 1c: run (A40, about $5)
-- [ ] Init from v3 final model. Stage 2 + joint on the Step 1b mix
+- [ ] Init from v1 stage_symbolic.pt (as Run B), not from v3: v3 trained
+      on these train questions with their answers, so it can answer a bare
+      train question from memory. That lowers the train loss without the
+      graph and gives the gate less reason to open. With the same init and
+      schedule as Run B, the only change is --graph-only-frac, and Run B is
+      the control
+- [ ] Data: the v3 mix with --graph-only-frac 0.5 (about 10k graph-only
+      rows in train, about 220 in val). node_dropout 0.1 also trains the
+      closed-book case a little, so closed_book is a fair baseline
+- [ ] Pod tooling: /private/tmp/claude-501/v3/ is gone. Rebuild the run
+      script from qwen3-0.6b-v3/logs/run_v3.sh (Hub). The run script runs
+      eval_graph_only.py and pushes its JSON (with per-row records) before
+      the exit marker. The watcher deletes the pod only after that push
+- [ ] After training: eval_graph_only.py on the val set (bf16, all rows)
 - [ ] Measures on val (respond rows, answer tokens only):
       closed book loss vs graph-only loss vs passage loss; exact match /
       token F1 of generated answers in the 3 modes; val_shuffled in
       graph-only mode
-- Decision:
+- Decision (eval_graph_only.py contrasts, paired bootstrap 95% CI over
+  the graph-only respond val rows):
+  - Main metrics: key_recall (answer words not in the question) and
+    f1 on value answers. loss_topk is secondary: it averages over answer
+    tokens that repeat the question
+  - The channel works if the lower bound of BOTH
+    key_recall(graph) - key_recall(closed_book) and
+    key_recall(graph) - key_recall(graph_shuffled) is above 0
+  - Abstention: report abstain_unanswerable_same in graph mode together
+    with respond_rate (always answering gets about 64% of the rows right)
+  - In-training val_shuffled mixes graph-only and passage rows: use it as a
+    weak signal only
   - graph only clearly better than closed book (and better than
     val_shuffled): the channel works. Go to Step 2 (companion KG, with a
     text-retrieval baseline)
@@ -428,10 +461,23 @@ graph from the passage, but keep the passage out of the prompt.
   capacity; the joint val loss uses gold spans) and with top-K nodes (the
   real pipeline; generate uses top-K). The split shows which part fails:
   the channel or the node selection
-- Before Step 1b: local coverage check on the v3 model. With val passages
+- [x] Before Step 1b: local coverage check on the v3 model. With val passages
   as the graph input, how often is an answer token among the 16 top-K
   node positions (entity answers vs value answers)? Low coverage: fix the
   node selection before the run
+  Result (2026-10-23, v3 final, 279 val respond rows with the answer key
+  in the passage, mean passage 425 tokens; key = answer words not in the
+  question; a word counts if a token of any of its occurrences is a node):
+  | Nodes          | rows with a key word | key words | value rows (119) | other rows (160) |
+  | top-K (16)     | 69.5%                | 36.8%     | 69.7%            | 64.4%            |
+  | gold spans     | 78.1%                | 50.0%     | 73.1%            | 77.5%            |
+  | 16 random      | 38.4%                | 15.1%     | 22.7%            | 42.5%            |
+  The question as part of the graph input changes nothing (69.5%).
+  Conclusion: the node selection is good enough to run Step 1b/1c. The
+  graph-only gain has a ceiling: about 30% of rows have no answer word
+  among the nodes, and a node is one token (Qwen splits numbers into
+  digits), so the run must show that a node carries the whole value.
+  Script: scratchpad r7/coverage.py (not in the repo)
 - Later, only if Step 1c is null with good coverage: let the question
   tokens read the graph too (no leak with a separate graph input)
 
