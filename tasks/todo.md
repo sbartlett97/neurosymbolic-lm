@@ -429,7 +429,14 @@ graph from the passage, but keep the passage out of the prompt.
 - [ ] Data: the v3 mix with --graph-only-frac 0.5 (about 10k graph-only
       rows in train, about 220 in val). node_dropout 0.1 also trains the
       closed-book case a little, so closed_book is a fair baseline
-- [ ] Pod tooling: /private/tmp/claude-501/v3/ is gone. Rebuild the run
+- [x] Pod scripts rebuilt (scratchpad r7/pod/): setup_r7.sh (branch
+      checkout, curated_r7 data with the Run B counts + --graph-only-frac
+      0.5, data push), memtest_r7.sh (24 longest rows, both stages, then
+      eval_graph_only.py on 8 rows), run_r7.sh (training, eval on the r7
+      and v3 models, push, R7_EXIT), pod_reaper_r7.sh (watcher)
+- [ ] Before launch: push claude/r7-graph-input to GitHub (the pod fetches
+      it). Then the memory test, then run_r7.sh
+- [x] (was) Pod tooling: /private/tmp/claude-501/v3/ is gone. Rebuild the run
       script from qwen3-0.6b-v3/logs/run_v3.sh (Hub). The run script runs
       eval_graph_only.py and pushes its JSON (with per-row records) before
       the exit marker. The watcher deletes the pod only after that push
@@ -486,3 +493,52 @@ graph from the passage, but keep the passage out of the prompt.
   (memorised facts). The closed-book baseline measures that
 - 16 single-token nodes may hold the entity but not a date or number
   answer. Report the gain per answer type (entity vs value)
+
+## Step 1c results (2026-10-24, pod s9samuiea6x6ik, deleted)
+Training 19:14-01:42 UTC (gradient checkpointing on, 0.56 steps/s), eval
+11 min. Hub: qwen3-0.6b-r7/ (stage_decoder.pt, stage_joint.pt,
+final_causal_model.pt, eval/graph_only_{r7,v3}.json, logs, TensorBoard).
+Gate (mean |tanh|): 0.010 after the decoder stage, 0.124 after the joint
+stage (Run B: 0.05).
+
+In-training val (mixed rows):
+| Stage   | val    | val_gate0 | val_shuffled |
+| Decoder | 1.5362 | 1.5366    | 1.5359       |
+| Joint   | 2.4151 | 2.4125    | 2.4163       |
+Joint generation, graph on = graph off: respond_rate 0.617 (0.633 off),
+all graph_only_unanswerable kinds 1.000.
+
+eval_graph_only.py, 220 graph-only val rows (139 answerable):
+| Model | Mode           | key_recall | f1    | loss_topk | loss_gold | respond |
+| r7    | closed_book    | 0.004      | 0.008 | 1.977     | -         | 0.022   |
+| r7    | graph          | 0.004      | 0.008 | 1.979     | 1.984     | 0.022   |
+| r7    | graph_shuffled | 0.004      | 0.008 | 1.985     | 1.984     | 0.022   |
+| r7    | passage        | 0.739      | 0.710 | 0.449     | -         | 0.928   |
+| v3    | graph          | 0.003      | 0.013 | 2.941     | 2.941     | 0.043   |
+| v3    | passage        | 0.767      | 0.714 | 0.398     | -         | 0.935   |
+Abstain on graph-only unanswerable rows: 1.000 in every no-passage mode
+(the model abstains on almost every bare question, so this is no skill).
+Paired 95% CIs (r7):
+- key_recall graph - closed_book: 0.000 [0.000, 0.000] -> FAIL
+- key_recall graph - graph_shuffled: 0.000 [0.000, 0.000] -> FAIL
+- loss_topk graph - closed_book: +0.002 [-0.003, +0.007]
+- loss_topk graph - graph_shuffled: -0.005 [-0.011, +0.000]
+- loss_gold graph - graph_shuffled: +0.000 [-0.005, +0.005]
+- loss_topk passage - graph: -1.53 [-1.71, -1.35]
+
+Decision: the graph path does not carry answers, also with gold-span nodes
+and an open gate. The channel is the bottleneck.
+Note on the metrics: greedy decoding abstains on 97.8% of the graph-only
+answerable rows (a bare question is unanswerable 36% of the time in train,
+and EOS wins the first-token argmax), so key_recall cannot show a partial
+gain. The answer loss can, and it shows none either.
+
+Next (recommendation, not started): find which half fails.
+1. Encoder probe (local, no pod): train a linear probe from the r7 node
+   features (the cross-attention keys/values) to the answer key tokens.
+   No answer information in the nodes: the encoder (16 single-token
+   states -> node_proj -> GNN) loses it.
+2. Reader control (pod run): cross-attention to all layer-14 passage token
+   states (no top-K, no node_proj). If that answers graph-only questions,
+   the 16-node compression is the bottleneck; if not, the reader cannot
+   learn retrieval from 6.7k rows.
