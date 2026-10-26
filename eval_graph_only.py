@@ -11,6 +11,15 @@ Rows: the val rows of kind graph_only_* (data/mix_stage2.py
   passage         passage + question in the prompt, the graph from the prompt
                   (the v3 setting: the upper bound)
 
+With --modes, also the text modes (Step 2: the node-text test). Each puts
+words of the passage as text in front of the question, with no graph
+input and the nodes off, so only the text interface carries them:
+
+  node_text           the words at the model's top-K node positions
+  node_text_shuffled  the node words of the partner row (control)
+  random_text         the words at K random passage positions (control)
+  gold_text           the text of the first K gold entity spans (ceiling)
+
 Respond rows: answer loss (mean token cross-entropy per row, teacher
 forcing), with top-K nodes and, in the graph modes, with gold-span nodes
 (the channel capacity); greedy generation scored by token F1 against the
@@ -25,6 +34,7 @@ Usage:
 import argparse
 import json
 import random
+import re
 import sys
 from collections import Counter
 from typing import Dict, List, Optional
@@ -36,9 +46,15 @@ from data.chat_template import ChatTemplate
 from data.collator_causal import CausalCognitiveCollator
 from data.mix_stage2 import answer_key, words
 from train_causal import load_causal_checkpoint, to_device
+from model.entity import entity_node_scores
 from training.trainers import graph_kwargs
 
 MODES = ("closed_book", "graph", "graph_shuffled", "passage")
+TEXT_MODES = ("node_text", "node_text_shuffled", "random_text", "gold_text")
+ALL_MODES = MODES + TEXT_MODES
+# The row field that holds the text of each text mode (add_text_fields)
+TEXT_FIELDS = {"node_text": "node_text", "node_text_shuffled": "partner_node_text",
+               "random_text": "random_text", "gold_text": "gold_text"}
 
 
 def mode_row(row: dict, mode: str) -> dict:
@@ -49,7 +65,79 @@ def mode_row(row: dict, mode: str) -> dict:
         return new
     if mode == "closed_book":
         return {k: v for k, v in row.items() if k != "graph_text"}
+    if mode in TEXT_MODES:
+        new = {k: v for k, v in row.items()
+               if k not in ("graph_text", "entity_spans") and k not in TEXT_FIELDS.values()}
+        new["text"] = row[TEXT_FIELDS[mode]] + "\n\n" + row["text"]
+        return new
     return dict(row)
+
+
+def word_spans(text: str, char_ranges) -> str:
+    """The whole words that hold the given character ranges, in text order.
+    Adjacent words join into one phrase. Phrases are separated by "; ",
+    and a phrase that repeats shows once."""
+    spans = set()
+    for a, b in char_ranges:
+        if b <= a:
+            continue
+        # Grow a word piece to its word; a punctuation token stays as it is
+        while a > 0 and text[a].isalnum() and text[a - 1].isalnum():
+            a -= 1
+        while b < len(text) and text[b - 1].isalnum() and text[b].isalnum():
+            b += 1
+        if any(c.isalnum() for c in text[a:b]):
+            spans.add((a, b))
+    phrases: List[List[int]] = []
+    for a, b in sorted(spans):
+        if phrases and (a <= phrases[-1][1] or not text[phrases[-1][1]:a].strip()):
+            phrases[-1][1] = max(phrases[-1][1], b)
+        else:
+            phrases.append([a, b])
+    out: List[str] = []
+    for a, b in phrases:  # a phrase that repeats shows once
+        if text[a:b].strip().lower() not in {o.lower() for o in out}:
+            out.append(text[a:b].strip())
+    return "; ".join(out)
+
+
+@torch.no_grad()
+def add_text_fields(model, collator, rows: List[dict], device: str,
+                    seed: int = 0) -> None:
+    """Adds the text of each text mode to each row (in place). The node
+    positions come from the read pass over graph_text, tokenized as the
+    collator tokenizes it. Partners are the pairs of evaluate()."""
+    rng = random.Random(seed)
+    k = model.max_nodes
+    for r in rows:
+        tok, offsets = collator._tokenize_inputs([r["graph_text"]])
+        ids = tok["input_ids"].to(device)
+        mask = tok["attention_mask"].to(device)
+        enc = model._read(ids, mask)
+        scores = entity_node_scores(model.token_ent(enc), mask)[0]
+        top = torch.topk(scores, k=min(k, ids.shape[1])).indices.tolist()
+        if offsets is None:  # a slow tokenizer: offsets without tensors
+            offsets = [collator.tokenizer(
+                r["graph_text"], truncation=True, max_length=collator.max_length,
+                return_offsets_mapping=True)["offset_mapping"]]
+        offs = [tuple(o) for o in (offsets[0].tolist() if torch.is_tensor(offsets)
+                                   else offsets[0])]
+        if len(offs) != ids.shape[1]:
+            raise ValueError("offsets do not match the graph input ids")
+        real = [i for i, (a, b) in enumerate(offs) if b > a]
+        r["node_text"] = word_spans(r["graph_text"], [offs[i] for i in top])
+        r["random_text"] = word_spans(r["graph_text"],
+                                      [offs[i] for i in rng.sample(real, min(k, len(real)))])
+        # The first K gold spans, as the gold nodes; a span must point at
+        # its entity (as in the collator)
+        g = r["graph_text"]
+        gold = [(s, e) for (s, e), ent in zip((r.get("entity_spans") or [])[:k],
+                                               r.get("entities", []))
+                if 0 <= s < e <= len(g) and g[s:e].strip().lower() == ent.strip().lower()]
+        r["gold_text"] = word_spans(r["graph_text"], gold)
+    for i in range(0, len(rows) - 1, 2):
+        rows[i]["partner_node_text"] = rows[i + 1]["node_text"]
+        rows[i + 1]["partner_node_text"] = rows[i]["node_text"]
 
 
 def token_f1(pred: str, ref: str) -> float:
@@ -78,13 +166,50 @@ def answer_loss(model, batch, use_soft_nodes: bool, spans) -> List[float]:
     return (ce.sum(1) / n).tolist()
 
 
+@torch.no_grad()
+def score_pair(model, batch, pair: List[dict], mode: str, gen_kw: Dict,
+               force_answer: bool):
+    """Losses and greedy generations of one pair of rows in one mode.
+    Returns (topk losses, gold-span losses, generations, forced generations)."""
+    eos = gen_kw["eos_token_id"]
+    use_nodes = mode not in ("closed_book",) + TEXT_MODES
+    model.shuffle_nodes = mode == "graph_shuffled"
+    try:
+        topk = answer_loss(model, batch, use_nodes, None)
+        gold = (answer_loss(model, batch, use_nodes, batch["entity_token_spans"])
+                if mode in ("graph", "graph_shuffled") else [None, None])
+        gens, forced = [], []
+        for j in range(len(pair)):
+            one = {k: (v[j:j + 1] if torch.is_tensor(v) else v) for k, v in batch.items()}
+            gk = graph_kwargs(one)
+            if mode == "graph_shuffled":  # the partner's graph text
+                gk = graph_kwargs({k: (v[1 - j:2 - j] if torch.is_tensor(v) else v)
+                                   for k, v in batch.items()})
+            kw = dict(gen_kw, use_soft_nodes=use_nodes, **gk)
+            ids = model.generate(one["input_ids"], one["attention_mask"], **kw)[0].tolist()
+            gens.append(ids[:ids.index(eos)] if eos in ids else ids)
+            if force_answer and not gens[-1] and int(pair[j].get("should_respond", 0)) == 1:
+                ids = model.generate(one["input_ids"], one["attention_mask"],
+                                     min_new_tokens=1, **kw)[0].tolist()
+                forced.append(ids[:ids.index(eos)] if eos in ids else ids)
+            else:
+                forced.append(gens[-1])
+    finally:
+        model.shuffle_nodes = False
+    return topk, gold, gens, forced
+
+
 def evaluate(model, tokenizer, collator, rows: List[dict], device: str,
-             max_new_tokens: int = 64, n_show: int = 3) -> Dict:
+             max_new_tokens: int = 64, n_show: int = 3,
+             modes=MODES, force_answer: bool = False) -> Dict:
     """Returns (summary, records). records holds one dict per row with its
-    metrics in each mode, so modes can be compared row by row later."""
-    eos, pad = tokenizer.eos_token_id, tokenizer.pad_token_id
+    metrics in each mode, so modes can be compared row by row later.
+    force_answer: a respond row that abstains generates again with EOS
+    blocked at the first step (f1_forced, key_recall_forced)."""
+    gen_kw = dict(max_length=max_new_tokens, do_sample=False,
+                  eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id)
     records: List[Dict] = []
-    shown = 0
+    shown = cpu_pairs = 0
     # Pairs: graph_shuffled gives each row its partner's nodes
     for i in range(0, len(rows) - 1, 2):
         pair = rows[i:i + 2]
@@ -94,32 +219,25 @@ def evaluate(model, tokenizer, collator, rows: List[dict], device: str,
             recs.append({"row": len(records) + len(recs), "kind": r["kind"],
                          "answer_type": "value" if is_value(key) else "other"})
         records.extend(recs)
-        for mode in MODES:
-            batch = to_device(collator([mode_row(r, mode) for r in pair]), device)
-            use_nodes = mode != "closed_book"
-            model.shuffle_nodes = mode == "graph_shuffled"
+        for mode in modes:
+            batch = collator([mode_row(r, mode) for r in pair])
             try:
-                topk = answer_loss(model, batch, use_nodes, None)
-                gold = (answer_loss(model, batch, use_nodes, batch["entity_token_spans"])
-                        if mode in ("graph", "graph_shuffled") else [None, None])
-                gens = []
-                for j in range(len(pair)):
-                    one = {k: (v[j:j + 1] if torch.is_tensor(v) else v)
-                           for k, v in batch.items()}
-                    gk = graph_kwargs(one)
-                    if mode == "graph_shuffled":  # the partner's graph text
-                        gk = graph_kwargs({k: (v[1 - j:2 - j] if torch.is_tensor(v) else v)
-                                           for k, v in batch.items()})
-                    gen = model.generate(one["input_ids"], one["attention_mask"],
-                                         max_length=max_new_tokens, do_sample=False,
-                                         eos_token_id=eos, pad_token_id=pad,
-                                         use_soft_nodes=use_nodes, **gk)
-                    ids = gen[0].tolist()
-                    gens.append(ids[:ids.index(eos)] if eos in ids else ids)
-            finally:
-                model.shuffle_nodes = False
+                topk, gold, gens, forced = score_pair(
+                    model, to_device(batch, device), pair, mode, gen_kw, force_answer)
+            except RuntimeError as e:
+                # MPS out of memory on a long passage: run this pair on the CPU
+                if device != "mps" or "out of memory" not in str(e):
+                    raise
+                torch.mps.empty_cache()
+                model.to("cpu")
+                try:
+                    topk, gold, gens, forced = score_pair(
+                        model, to_device(batch, "cpu"), pair, mode, gen_kw, force_answer)
+                finally:
+                    model.to(device)
+                cpu_pairs += 1
 
-            for r, rec, lt, lg, g in zip(pair, recs, topk, gold, gens):
+            for r, rec, lt, lg, g, gf in zip(pair, recs, topk, gold, gens, forced):
                 abstained = len(g) == 0
                 if int(r.get("should_respond", 0)) == 0:
                     rec[mode] = {"abstain": int(abstained)}
@@ -132,12 +250,20 @@ def evaluate(model, tokenizer, collator, rows: List[dict], device: str,
                     m["loss_gold"] = lg
                 if key:
                     m["key_recall"] = len(key & set(words(text))) / len(key)
+                if force_answer:
+                    ftext = tokenizer.decode(gf, skip_special_tokens=True)
+                    m["f1_forced"] = token_f1(ftext, r["response"])
+                    m["gen_forced"] = ftext[:200]
+                    if key:
+                        m["key_recall_forced"] = len(key & set(words(ftext))) / len(key)
                 rec[mode] = m
                 if mode == "graph" and shown < n_show:
                     shown += 1
                     print(f"  Q: {r['text'][:120]}\n  ref: {r['response'][:120]}\n"
                           f"  gen: {text[:120]!r}")
 
+    if cpu_pairs:
+        print(f"  {cpu_pairs} pair-modes ran on the CPU (MPS out of memory)")
     return summarize(records), records
 
 
@@ -145,7 +271,7 @@ def summarize(records: List[Dict]) -> Dict:
     """Mean of each metric per mode; f1 and key_recall also per answer type;
     abstain rate per unanswerable kind."""
     summary = {}
-    for mode in MODES:
+    for mode in [m for m in ALL_MODES if any(m in rec for rec in records)]:
         vals: Dict[str, list] = {}
         for rec in records:
             m = rec.get(mode)
@@ -156,7 +282,7 @@ def summarize(records: List[Dict]) -> Dict:
                 vals.setdefault(f"abstain_{kind}", []).append(m["abstain"])
                 continue
             for k, v in m.items():
-                if k == "gen":
+                if k in ("gen", "gen_forced"):
                     continue
                 vals.setdefault(k, []).append(v)
                 if k in ("f1", "key_recall"):
@@ -191,11 +317,31 @@ CONTRASTS = [("key_recall", "graph", "closed_book", None),
              ("f1", "graph", "closed_book", "value"),
              ("f1", "graph", "graph_shuffled", "value"),
              ("key_recall", "passage", "graph", None)]
+# Step 2: node_text passes if its lower bound against node_text_shuffled is
+# above 0. loss_topk is the main metric (it does not depend on abstaining)
+TEXT_CONTRASTS = [(m, a, b, None) for m in ("loss_topk", "key_recall", "key_recall_forced")
+                  for a, b in (("node_text", "closed_book"),
+                               ("node_text", "node_text_shuffled"),
+                               ("node_text", "random_text"),
+                               ("gold_text", "node_text"),
+                               ("passage", "node_text"))]
 
 
 def contrasts(records: List[Dict]) -> Dict:
-    return {f"{m}{'_' + t if t else ''}:{a}-{b}": paired_ci(records, m, a, b, t)
-            for m, a, b, t in CONTRASTS}
+    out = {f"{m}{'_' + t if t else ''}:{a}-{b}": paired_ci(records, m, a, b, t)
+           for m, a, b, t in CONTRASTS + TEXT_CONTRASTS}
+    return {k: v for k, v in out.items() if v["n"]}
+
+
+def gap_closed(summary: Dict, metric: str = "loss_topk") -> Dict:
+    """(closed_book - mode) / (closed_book - passage) for each other mode."""
+    if "closed_book" not in summary or "passage" not in summary:
+        return {}
+    book, top = summary["closed_book"].get(metric), summary["passage"].get(metric)
+    if book is None or top is None or book == top:
+        return {}
+    return {m: round((book - v[metric]) / (book - top), 4)
+            for m, v in summary.items() if metric in v and m != "closed_book"}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -209,7 +355,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else
                    ("mps" if torch.backends.mps.is_available() else "cpu"))
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
+    p.add_argument("--force-answer", action="store_true",
+                   help="Generate again with EOS blocked at the first step when a "
+                        "respond row abstains (f1_forced, key_recall_forced)")
+    p.add_argument("--modes", default=",".join(MODES),
+                   help=f"Comma-separated, from {','.join(ALL_MODES)}")
     args = p.parse_args(argv)
+    modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
+    unknown = set(modes) - set(ALL_MODES)
+    if unknown:
+        p.error(f"unknown modes: {sorted(unknown)}")
 
     model, tokenizer, ck = load_causal_checkpoint(args.checkpoint, args.device)
     model.to(getattr(torch, args.dtype)).eval()
@@ -232,14 +387,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         rows = rows[:args.limit]
     print(f"{len(rows)} graph-only rows: "
           f"{dict(Counter(r['kind'] for r in rows))}")
+    if set(modes) & set(TEXT_MODES):
+        add_text_fields(model, collator, rows, args.device)
+        print(f"  node text: {rows[0]['node_text'][:200]!r}")
     summary, records = evaluate(model, tokenizer, collator, rows, args.device,
-                                max_new_tokens=args.max_new_tokens)
+                                max_new_tokens=args.max_new_tokens, modes=modes,
+                                force_answer=args.force_answer)
     paired = contrasts(records)
-    print(json.dumps({"summary": summary, "contrasts": paired}, indent=1))
+    gaps = gap_closed(summary)
+    print(json.dumps({"summary": summary, "contrasts": paired, "gap_closed": gaps},
+                     indent=1))
+    for rec in records:  # the text each text mode showed the model
+        if set(modes) & set(TEXT_MODES):
+            rec["texts"] = {m: rows[rec["row"]][TEXT_FIELDS[m]]
+                            for m in modes if m in TEXT_MODES}
     with open(args.out, "w") as f:
-        json.dump({"checkpoint": args.checkpoint, "val": args.val,
+        json.dump({"checkpoint": args.checkpoint, "val": args.val, "modes": modes,
                    "rows": len(rows), "summary": summary, "contrasts": paired,
-                   "records": records},
+                   "gap_closed": gaps, "records": records},
                   f, indent=1, ensure_ascii=False)
     return 0
 

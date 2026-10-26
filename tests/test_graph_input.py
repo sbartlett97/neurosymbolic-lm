@@ -225,3 +225,70 @@ def test_eval_summary_and_paired_contrasts():
     shuf = c["key_recall:graph-graph_shuffled"]
     assert shuf["mean"] == 0.0 and shuf["lo"] <= 0.0  # no evidence of content
     assert c["f1_value:graph-closed_book"]["n"] == 10
+
+
+def test_word_spans_gives_whole_words_in_text_order():
+    from eval_graph_only import word_spans
+    text = "Ed Fendell of Mission Control, in 1969."
+    # Subword ranges inside "Fendell" and "Control"; "Ed" next to "Fendell"
+    assert word_spans(text, [(5, 8), (0, 2), (24, 27)]) == "Ed Fendell; Control"
+    assert word_spans(text, [(29, 30), (34, 36)]) == "1969"  # "," alone is no word
+    assert word_spans(text, []) == ""
+    assert word_spans("BRAT and BRAT", [(0, 4), (9, 13)]) == "BRAT"
+
+
+def test_text_modes_put_the_text_before_the_question():
+    from eval_graph_only import TEXT_FIELDS, TEXT_MODES, mode_row
+    row = {"text": "Who won?", "graph_text": "Ada won the prize.", "kind": "graph_only_respond",
+           "entity_spans": [[0, 3]], "entities": ["Ada"], "node_text": "Ada; prize",
+           "partner_node_text": "Bob", "random_text": "the", "gold_text": "Ada"}
+    for mode in TEXT_MODES:
+        new = mode_row(row, mode)
+        assert new["text"] == row[TEXT_FIELDS[mode]] + "\n\nWho won?"
+        assert "graph_text" not in new and "entity_spans" not in new
+        assert not set(TEXT_FIELDS.values()) & set(new)
+        assert new["entities"] == ["Ada"]
+
+
+def test_add_text_fields_uses_the_top_k_node_words():
+    from eval_graph_only import add_text_fields
+    from model.entity import entity_node_scores
+    model = make_model("xattn")
+    collator, tok = make_collator()
+    docs = ["Ada Lovelace was born in London in 1815 and died in 1852 .",
+            "Paris is the capital of France and has many old bridges ."]
+    rows = [{"text": "Q?", "graph_text": d, "entity_spans": [[0, 12]],
+             "entities": ["Ada Lovelace"]} for d in docs]
+    add_text_fields(model, collator, rows, "cpu")
+    for r, d in zip(rows, docs):
+        ids = torch.tensor([tok(d)["input_ids"]])
+        with torch.no_grad():
+            scores = entity_node_scores(model.token_ent(model._read(ids, torch.ones_like(ids))))
+        top = sorted(torch.topk(scores[0], k=model.max_nodes).indices.tolist())
+        words = d.split()
+        # Each node word is in the node text; the text has no other words.
+        # A punctuation node ("." here) gives no word
+        node_words = set(r["node_text"].replace(";", " ").split())
+        assert node_words == {words[i] for i in top if words[i].isalnum()}
+        assert len(r["random_text"].replace(";", " ").split()) <= model.max_nodes
+    assert rows[0]["gold_text"] == "Ada Lovelace"
+    assert rows[1]["gold_text"] == ""  # the span does not point at the entity there
+    assert rows[0]["partner_node_text"] == rows[1]["node_text"]
+    assert rows[1]["partner_node_text"] == rows[0]["node_text"]
+
+
+def test_gap_closed_and_text_contrasts():
+    from eval_graph_only import contrasts, gap_closed, summarize
+    records = [{"row": i, "kind": "graph_only_respond", "answer_type": "other",
+                "closed_book": {"loss_topk": 2.0, "f1": 0.0},
+                "node_text": {"loss_topk": 1.5 - 0.01 * (i % 3), "f1": 0.3},
+                "node_text_shuffled": {"loss_topk": 1.9, "f1": 0.1},
+                "passage": {"loss_topk": 0.5, "f1": 0.8}} for i in range(12)]
+    s = summarize(records)
+    assert set(s) == {"closed_book", "node_text", "node_text_shuffled", "passage"}
+    g = gap_closed(s)
+    assert g["passage"] == 1.0 and g["node_text_shuffled"] == pytest.approx(0.0667, abs=1e-3)
+    c = contrasts(records)
+    assert c["loss_topk:node_text-node_text_shuffled"]["hi"] < 0
+    assert "loss_topk:node_text-random_text" not in c  # no random_text: left out
+    assert gap_closed({"node_text": {"loss_topk": 1.0}}) == {}

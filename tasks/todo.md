@@ -662,3 +662,72 @@ Conclusion: this cross-attention reader cannot learn retrieval from the
 node states with this budget (6,726 rows x 2 epochs, lr 2e-4), even with
 1,024-d states and no shortcut. The 256-d node path is not the cause. A
 companion KG through this reader is not useful.
+
+## Step 2: node-text test (plan, 2026-10-26)
+Question: can the words that the symbolic branch selects help the LM when
+they reach it as text? The probe says the content is there; Step 1e says
+the vector reader cannot use it. The LM reads text well (passage mode).
+Model: r7 final (local, MPS fp32; bf16 on MPS breaks generation). Rows:
+the 220 graph-only val rows. All modes in one run, so contrasts are paired.
+Text modes (eval_graph_only.py --modes, no graph input, nodes off):
+- node_text: the whole words at the top-K (16) node positions of the
+  passage, in passage order, adjacent words joined, repeats once
+- node_text_shuffled: the partner row's node text (control)
+- random_text: words at 16 random passage tokens (control)
+- gold_text: the first 16 gold entity spans (ceiling for the extractor)
+Plus closed_book and passage. --force-answer: a respond row that abstains
+generates again with EOS blocked at the first step (the r7 LoRA abstains
+on prompts that do not look like a passage).
+Read-out (set before the run):
+- Main metric: loss_topk (it does not depend on abstaining)
+- node_text passes if the 95% upper bound of loss_topk node_text -
+  node_text_shuffled is below 0 (lower loss); key_recall_forced as support
+- Gap closed = (closed_book - X) / (closed_book - passage), on loss
+- node_text vs random_text: does the extractor select better than chance?
+- gold_text vs node_text: room for a better extractor
+Build:
+- [x] eval_graph_only.py: TEXT_MODES, word_spans, add_text_fields,
+      --modes, --force-answer, gap_closed, TEXT_CONTRASTS. Tests: 4 new in
+      tests/test_graph_input.py; suite 224 pass
+- [x] Smoke runs (4 rows): node text looks right; fp32 needed on MPS
+- [x] Full run on pod sci1vqnfg7tvtd (RTX PRO 4000, cuda fp32), 17:19-17:34
+      GMT. Pod deleted 17:34. Hub: qwen3-0.6b-r7/eval/node_text_r7.json,
+      qwen3-0.6b-r7/logs/s2.log
+
+### Step 2 results (220 rows; 139 respond rows for loss, 138 for recall)
+| mode | loss_topk | key_recall | key_recall_forced | f1_forced | respond | gap closed |
+|---|---|---|---|---|---|---|
+| closed_book | 1.978 | 0.004 | 0.116 | 0.305 | 0.022 | 0 |
+| passage | 0.452 | 0.745 | 0.787 | 0.747 | 0.928 | 1.00 |
+| node_text | 2.174 | 0.066 | 0.268 | 0.377 | 0.094 | -0.13 |
+| node_text_shuffled | 3.152 | 0.000 | 0.051 | 0.165 | 0.000 | -0.77 |
+| random_text | 2.693 | 0.014 | 0.131 | 0.247 | 0.029 | -0.47 |
+| gold_text | 1.791 | 0.136 | 0.398 | 0.420 | 0.180 | 0.12 |
+
+Paired contrasts (mean [95% CI]):
+- loss_topk node_text - node_text_shuffled: -0.978 [-1.177, -0.780]
+- loss_topk node_text - closed_book: +0.196 [-0.002, +0.406]
+- loss_topk node_text - random_text: -0.519 [-0.711, -0.327]
+- loss_topk gold_text - node_text: -0.383 [-0.560, -0.222]
+- loss_topk random_text - closed_book: +0.715 [+0.566, +0.865]
+- loss_topk node_text_shuffled - closed_book: +1.174 [+1.040, +1.316]
+- key_recall_forced node_text - closed_book: +0.152 [+0.085, +0.216]
+- key_recall_forced node_text - node_text_shuffled: +0.217 [+0.154, +0.279]
+- key_recall_forced node_text - random_text: +0.136 [+0.079, +0.196]
+- key_recall_forced gold_text - node_text: +0.130 [+0.062, +0.199]
+
+Read-out:
+- The pre-registered test passes: node_text has lower loss than
+  node_text_shuffled, and key_recall_forced supports it.
+- The control is weak. Any extra text that does not match the passage
+  raises the loss above closed_book (shuffled +1.17, random +0.72).
+  node_text is also no better than closed_book on loss (gap closed -13%).
+- The selection is better than chance: node_text beats random_text on
+  loss and on key_recall_forced. The node words carry answer content
+  (forced key recall 0.27 against 0.12 closed book).
+- A bag of words is the limit, not the extractor. Even gold entities
+  close only 12% of the gap. The passage closes 100%. The answer needs
+  the relations and context between the entities.
+- Conclusion: the symbolic branch selects useful words. A list of entities
+  without relations does not give the LM the answer.
+
