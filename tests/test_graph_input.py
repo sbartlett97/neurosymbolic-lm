@@ -1,6 +1,7 @@
 """A separate read-pass input (graph_input_ids): the graph comes from other
 text than the prompt. Both injection modes, on a tiny offline backbone."""
 
+import re
 import sys
 from pathlib import Path
 
@@ -235,6 +236,34 @@ def test_word_spans_gives_whole_words_in_text_order():
     assert word_spans(text, [(29, 30), (34, 36)]) == "1969"  # "," alone is no word
     assert word_spans(text, []) == ""
     assert word_spans("BRAT and BRAT", [(0, 4), (9, 13)]) == "BRAT"
+
+
+def test_widen_grows_each_range_by_whole_words():
+    from eval_graph_only import widen, word_spans
+    text = "Ed Fendell of Mission Control, in 1969."
+    assert widen(text, [(5, 8)], 0) == [(5, 8)]
+    # "Fendell" with one word on each side; the window stops at the text ends
+    assert word_spans(text, widen(text, [(5, 8)], 1)) == "Ed Fendell of"
+    assert word_spans(text, widen(text, [(0, 2)], 2)) == "Ed Fendell of"
+    # The window crosses punctuation; overlapping windows join into one phrase
+    assert word_spans(text, widen(text, [(24, 27), (34, 36)], 1)) == \
+        "Mission Control, in 1969"
+    assert widen(text, [(29, 30)], 1) == []  # "," holds no word
+
+
+def test_budget_text_stops_at_the_token_budget():
+    from eval_graph_only import budget_text
+
+    class WordTokenizer:  # one token per word or separator
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": re.findall(r"\w+|[^\w\s]", text)}
+
+    text = "one two three four five six seven eight nine ten"
+    ranges = [(0, 3), (19, 23), (34, 39)]  # one, five, eight
+    assert budget_text(text, ranges, 0, 1, WordTokenizer()) == "one"
+    assert budget_text(text, ranges, 0, 2, WordTokenizer()) == "one; five"
+    assert budget_text(text, ranges, 1, 4, WordTokenizer()) == "one two; four five six"
+    assert budget_text(text, ranges, 0, 99, WordTokenizer()) == "one; five; eight"
 
 
 def test_text_modes_put_the_text_before_the_question():

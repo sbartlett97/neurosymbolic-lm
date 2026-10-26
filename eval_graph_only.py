@@ -20,6 +20,11 @@ input and the nodes off, so only the text interface carries them:
   random_text         the words at K random passage positions (control)
   gold_text           the text of the first K gold entity spans (ceiling)
 
+With --window W (Step 3: the context-window test), each selected range
+grows by W words on each side, so a mode shows the words in context.
+Node windows overlap more than random ones. So random_text then takes
+random positions until it has as many tokens as node_text (same budget).
+
 Respond rows: answer loss (mean token cross-entropy per row, teacher
 forcing), with top-K nodes and, in the graph modes, with gold-span nodes
 (the channel capacity); greedy generation scored by token F1 against the
@@ -73,6 +78,40 @@ def mode_row(row: dict, mode: str) -> dict:
     return dict(row)
 
 
+def widen(text: str, char_ranges, window: int):
+    """Each character range, grown by `window` words on each side."""
+    if window <= 0:
+        return list(char_ranges)
+    bounds = [m.span() for m in re.finditer(r"\w+", text)]
+    out = []
+    for a, b in char_ranges:
+        inside = [i for i, (s, e) in enumerate(bounds) if e > a and s < b]
+        if not inside:
+            continue
+        i = max(0, inside[0] - window)
+        j = min(len(bounds) - 1, inside[-1] + window)
+        out.append((bounds[i][0], bounds[j][1]))
+    return out
+
+
+def n_tokens(tokenizer, text: str) -> int:
+    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def budget_text(text: str, char_ranges, window: int, budget: int, tokenizer) -> str:
+    """word_spans of the first ranges (each widened) that reach `budget`
+    tokens. Ranges past the budget are not used."""
+    ranges = widen(text, char_ranges, window)
+    lo, hi = 1, len(ranges)
+    while lo < hi:  # the fewest ranges that reach the budget
+        mid = (lo + hi) // 2
+        if n_tokens(tokenizer, word_spans(text, ranges[:mid])) >= budget:
+            hi = mid
+        else:
+            lo = mid + 1
+    return word_spans(text, ranges[:lo])
+
+
 def word_spans(text: str, char_ranges) -> str:
     """The whole words that hold the given character ranges, in text order.
     Adjacent words join into one phrase. Phrases are separated by "; ",
@@ -103,10 +142,12 @@ def word_spans(text: str, char_ranges) -> str:
 
 @torch.no_grad()
 def add_text_fields(model, collator, rows: List[dict], device: str,
-                    seed: int = 0) -> None:
+                    seed: int = 0, window: int = 0) -> None:
     """Adds the text of each text mode to each row (in place). The node
     positions come from the read pass over graph_text, tokenized as the
-    collator tokenizes it. Partners are the pairs of evaluate()."""
+    collator tokenizes it. Each range grows by `window` words on each side;
+    with a window, random_text gets the token budget of node_text.
+    Partners are the pairs of evaluate()."""
     rng = random.Random(seed)
     k = model.max_nodes
     for r in rows:
@@ -125,16 +166,21 @@ def add_text_fields(model, collator, rows: List[dict], device: str,
         if len(offs) != ids.shape[1]:
             raise ValueError("offsets do not match the graph input ids")
         real = [i for i, (a, b) in enumerate(offs) if b > a]
-        r["node_text"] = word_spans(r["graph_text"], [offs[i] for i in top])
-        r["random_text"] = word_spans(r["graph_text"],
-                                      [offs[i] for i in rng.sample(real, min(k, len(real)))])
+        g = r["graph_text"]
+        r["node_text"] = word_spans(g, widen(g, [offs[i] for i in top], window))
+        if window:
+            r["random_text"] = budget_text(g, [offs[i] for i in rng.sample(real, len(real))],
+                                           window, n_tokens(collator.tokenizer, r["node_text"]),
+                                           collator.tokenizer)
+        else:
+            r["random_text"] = word_spans(g, widen(
+                g, [offs[i] for i in rng.sample(real, min(k, len(real)))], window))
         # The first K gold spans, as the gold nodes; a span must point at
         # its entity (as in the collator)
-        g = r["graph_text"]
         gold = [(s, e) for (s, e), ent in zip((r.get("entity_spans") or [])[:k],
                                                r.get("entities", []))
                 if 0 <= s < e <= len(g) and g[s:e].strip().lower() == ent.strip().lower()]
-        r["gold_text"] = word_spans(r["graph_text"], gold)
+        r["gold_text"] = word_spans(g, widen(g, gold, window))
     for i in range(0, len(rows) - 1, 2):
         rows[i]["partner_node_text"] = rows[i + 1]["node_text"]
         rows[i + 1]["partner_node_text"] = rows[i]["node_text"]
@@ -358,6 +404,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--force-answer", action="store_true",
                    help="Generate again with EOS blocked at the first step when a "
                         "respond row abstains (f1_forced, key_recall_forced)")
+    p.add_argument("--window", type=int, default=0,
+                   help="Text modes: grow each selected range by this many words "
+                        "on each side")
     p.add_argument("--modes", default=",".join(MODES),
                    help=f"Comma-separated, from {','.join(ALL_MODES)}")
     args = p.parse_args(argv)
@@ -388,8 +437,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"{len(rows)} graph-only rows: "
           f"{dict(Counter(r['kind'] for r in rows))}")
     if set(modes) & set(TEXT_MODES):
-        add_text_fields(model, collator, rows, args.device)
+        add_text_fields(model, collator, rows, args.device, window=args.window)
         print(f"  node text: {rows[0]['node_text'][:200]!r}")
+    # The mean length in tokens of each text, for the gap per token
+    lengths = {m: round(sum(n_tokens(tokenizer, r[f]) for r in rows) / len(rows), 1)
+               for m, f in [("passage", "graph_text")] + list(TEXT_FIELDS.items())
+               if m in modes and rows and f in rows[0]}
+    print(f"  mean text tokens: {lengths}")
     summary, records = evaluate(model, tokenizer, collator, rows, args.device,
                                 max_new_tokens=args.max_new_tokens, modes=modes,
                                 force_answer=args.force_answer)
@@ -403,8 +457,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                             for m in modes if m in TEXT_MODES}
     with open(args.out, "w") as f:
         json.dump({"checkpoint": args.checkpoint, "val": args.val, "modes": modes,
-                   "rows": len(rows), "summary": summary, "contrasts": paired,
-                   "gap_closed": gaps, "records": records},
+                   "window": args.window, "text_tokens": lengths, "rows": len(rows),
+                   "summary": summary, "contrasts": paired, "gap_closed": gaps,
+                   "records": records},
                   f, indent=1, ensure_ascii=False)
     return 0
 

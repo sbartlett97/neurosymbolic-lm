@@ -731,3 +731,30 @@ Read-out:
 - Conclusion: the symbolic branch selects useful words. A list of entities
   without relations does not give the LM the answer.
 
+
+## Step 3: context-window test (plan, 2026-10-26)
+Question: do the node positions plus their local context carry the answer
+at a fraction of the passage length? Step 2 shows that the bare node words
+carry answer content, but a list of words closes no gap.
+Model, rows and modes: as Step 2 (r7 final, 220 graph-only val rows, cuda
+fp32, --force-answer, the same six modes). New: --window W grows each
+selected range by W words on each side. Windows that overlap join.
+- random_text takes random positions until it has the tokens of node_text
+  (the same budget; node windows overlap more than random ones)
+- gold_text is not budget matched (it stays the ceiling of the extractor)
+- One run per window: W = 2, 4, 8. Mean tokens (local, 20 rows): node 56 /
+  76 / 110, random 59 / 81 / 114, gold 80 / 107 / 144, passage 356
+Read-out (set before the run), per window:
+- Main metric: loss_topk
+- Context helps: the 95% upper bound of node_text - closed_book is below 0
+- Selection matters: the 95% upper bound of node_text - random_text (same
+  budget) is below 0
+- The interface works if node_text closes at least 50% of the gap at no
+  more than 1/3 of the passage tokens (W = 8 or less)
+- gold_text against node_text: room for a better extractor
+Build:
+- [x] eval_graph_only.py: widen, budget_text, --window, text_tokens in the
+      output. Tests: 2 new; suite 226 pass. Window 0 gives the Step 2 texts
+      (20 rows, 0 differences)
+- [x] Smoke run (4 rows, W = 4, MPS fp32): all six modes run
+- [ ] Full run on a pod (scratchpad r7/step3/context_w{2,4,8}_r7.json)
