@@ -623,3 +623,42 @@ Step 1e build (2026-10-26):
       arms 2 epochs, lr 2e-4, batch 2 x accum 2, gradient checkpointing,
       then eval_graph_only.py per arm; R7E_EXIT. No separate memory test:
       the backbone is frozen and r7 used about 7 GB with checkpointing
+
+## Step 1e results (2026-10-26, pod gqv2kerslecwg4, A40 EU-SE-1)
+Both arms: 2 epochs, 3,364 steps, rc 0. Pod deleted 15:43 GMT. Hub:
+qwen3-0.6b-r7e-{node,adapter}/ (models), qwen3-0.6b-r7e/{eval,logs,tensorboard}/.
+Training (val loss, 139 graph-only val rows):
+| Arm     | epoch | val    | val_gate0 | val_shuffled | final gate |
+| node    | 1     | 1.8141 | 1.9110    | 1.8179       |            |
+| node    | 2     | 1.8234 | 1.9110    | 1.8380       | 0.133      |
+| adapter | 1     | 1.8106 | 1.9110    | 1.8143       |            |
+| adapter | 2     | 1.8365 | 1.9110    | 1.8497       | 0.041      |
+Eval (eval_graph_only.py, 139 respond rows of 220):
+| Arm     | Mode           | key_recall | f1    | f1_value | loss_topk | loss_gold | respond |
+| both    | closed_book    | 0.004      | 0.008 | 0.023    | 1.977     | -         | 0.02    |
+| node    | graph          | 0.130      | 0.317 | 0.377    | 1.881     | 1.884     | 1.00    |
+| node    | graph_shuffled | 0.116      | 0.305 | 0.378    | 1.888     | 1.882     | 1.00    |
+| node    | passage        | 0.780      | 0.731 | 0.744    | 0.433     | -         | 0.99    |
+| adapter | graph          | 0.108      | 0.309 | 0.359    | 1.891     | 1.900     | 1.00    |
+| adapter | graph_shuffled | 0.108      | 0.301 | 0.367    | 1.912     | 1.913     | 1.00    |
+| adapter | passage        | 0.786      | 0.745 | 0.771    | 0.442     | -         | 0.99    |
+Contrasts (mean [95% paired bootstrap CI]):
+| Contrast                           | node                     | adapter                  |
+| key_recall graph - closed_book     | +0.126 [0.089, 0.168]    | +0.105 [0.071, 0.141]    |
+| key_recall graph - graph_shuffled  | +0.014 [-0.002, 0.031]   | +0.000 [-0.007, 0.008]   |
+| f1_value graph - graph_shuffled    | -0.001 [-0.008, 0.006]   | -0.008 [-0.022, 0.002]   |
+| loss_topk graph - closed_book      | -0.096 [-0.116, -0.075]  | -0.086 [-0.108, -0.064]  |
+| loss_topk graph - graph_shuffled   | -0.006 [-0.016, 0.004]   | -0.020 [-0.037, -0.004]  |
+| loss_gold graph - graph_shuffled   | +0.002 [-0.007, 0.012]   | -0.013 [-0.025, -0.001]  |
+| loss_topk passage - graph          | -1.448 [-1.62, -1.28]    | -1.449 [-1.63, -1.27]    |
+Outcome: BOTH NULL. In both arms the key_recall lower bound for
+graph - graph_shuffled is below 0. The gain over closed_book is the answer
+form only: the reader makes the model respond (closed_book abstains on
+98%), and shuffled nodes give the same gain. The adapter arm has a content
+effect on the loss (-0.020 nats), but it is about 1.4% of the passage gap.
+Side effect: in the graph modes the model never abstains on unanswerable
+rows (the training used respond rows only).
+Conclusion: this cross-attention reader cannot learn retrieval from the
+node states with this budget (6,726 rows x 2 epochs, lr 2e-4), even with
+1,024-d states and no shortcut. The 256-d node path is not the cause. A
+companion KG through this reader is not useful.
