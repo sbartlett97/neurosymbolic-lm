@@ -542,3 +542,84 @@ Next (recommendation, not started): find which half fails.
    states (no top-K, no node_proj). If that answers graph-only questions,
    the 16-node compression is the bottleneck; if not, the reader cannot
    learn retrieval from 6.7k rows.
+
+## Step 1d: locate the failure (local, r7 model; plan 2026-10-24)
+Encoder probe (token identity per node; the answer-word ceiling is
+coverage x identity accuracy, and the coverage is known: 69.5%):
+- Features at the 16 top-K node positions of graph-only respond rows
+  (train subset for fitting, the 139 val rows for scoring): raw tap state
+  (1024), adapter output (1024), node features after node_proj + GNN (256,
+  what the cross-attention reads)
+- Linear probe per level into the frozen LM head; target = the token id at
+  the node position; top-1 / top-5 accuracy on val
+- Chance: the same probe trained on mismatched rows (targets of another row)
+Reader checks (teacher forcing, graph-only respond val rows):
+- Content sensitivity per xattn layer at the answer-reading positions:
+  |out(own graph) - out(other row's graph)| / |out(own graph)|, and the
+  size of the xattn term relative to the hidden state
+- Attention at the last prompt token (it predicts the first answer token):
+  share of rows whose top node holds an answer word, against chance
+  (answer nodes / valid nodes); attention entropy over the nodes
+Decision map:
+- Identity kept at tap and adapter, lost at node features: node_proj / GNN
+  is the bottleneck. Feed 1024-d states to the xattn, or widen node_dim
+- Identity kept, reader content-insensitive or attention at chance: the
+  reader did not learn retrieval. Look at its training budget first (new
+  module, joint stage lr 2e-5, 1 epoch) before a run that also changes the
+  encoder
+- Identity kept and attention finds the answer node, but no loss change:
+  compare the xattn term with the residual norm at those positions
+
+## Step 1d results (2026-10-26, local, r7 final model)
+Encoder probe (linear map into the frozen LM head; target = token id at
+each of the 16 top-K node positions; 1,500 graph-only train rows = 24,000
+nodes; scored on the 139 val rows = 2,224 nodes; CPU fp32):
+| Level                          | top-1 | top-5 | chance top-1 |
+| raw tap state (1024)           | 90.5% | 96.3% | 2.1%         |
+| adapter output (1024)          | 90.1% | 96.2% | 2.6%         |
+| node features (256, xattn reads)| 49.4% | 67.1% | 4.6%         |
+Val rows with an answer word among the nodes: 71.2%.
+Reader checks (teacher forcing, 139 graph-only respond val rows, MPS):
+| Layer | content sensitivity | xattn / hidden | top node = answer | chance | entropy |
+| 18    | 1.02                | 2.9%           | 15%               | 19%    | 0.88    |
+| 20    | 0.77                | 0.7%           | 20%               | 19%    | 0.84    |
+| 22    | 0.80                | 0.7%           | 21%               | 19%    | 0.83    |
+| 24    | 0.75                | 1.0%           | 21%               | 19%    | 0.92    |
+| 26    | 1.04                | 0.5%           | 16%               | 19%    | 0.82    |
+Conclusion: the reader is the main failure. Its attention is near uniform
+and finds the answer node at chance rate; it adds a small content-
+dependent average of the nodes. The encoder keeps most of the identity
+(node_proj + GNN lose about half: 90% -> 49%, still 10x chance).
+Likely cause: mixed training gives the backbone a shortcut (the LoRA fits
+"bare question -> abstain"), so nothing forces retrieval. The zero gate
+start is not the main cause (AdamW rescales the small gradients).
+Scripts: scratchpad r7/probe.py (not in the repo).
+
+## Step 1e: two-arm reader test (plan, 2026-10-26)
+Backbone + LoRA + adapter + heads frozen (from the r7 final model). Only
+the cross-attention trains, fresh (gate 0). Data: graph-only respond rows
+only (6,726 train), so the graph is the only way to lower the loss.
+- Arm A: the reader reads the current 256-d node features (node_proj + GNN
+  frozen)
+- Arm B: the reader reads the 1024-d adapter states at the same positions
+  (xattn_source="adapter")
+Same steps, lr and data for both arms. eval_graph_only.py on each.
+Outcome map:
+- Both null: this reader design cannot learn retrieval here. A KG needs
+  another reader
+- B works, A null: widen the node path, then go back to mixed training
+- Both work: the shortcut in mixed training was the problem. Fix the mix /
+  curriculum (e.g. a reader warm-up stage before mixed training)
+Step 1e build (2026-10-26):
+- [x] Model: xattn_source="node" | "adapter" (adapter: kv reads the
+      adapter states at the node positions, 1024 wide; _select_node_states)
+- [x] train_causal: stage "reader" (injection modules only, lr = --lr),
+      --init-full (also the backbone + LoRA), --fresh-injection,
+      --xattn-source. Tests: 5 new in tests/test_xattn.py; suite 220 pass
+- [x] Local smoke run on the real model (CPU, 6 rows): 745 tensors loaded
+      with the backbone, 30 fresh xattn tensors, 21.0M trainable (adapter
+      arm), checkpoint reloads as adapter
+- [x] Pod scripts (scratchpad r7/pod/run_r7e.sh, pod_reaper_r7e.sh): both
+      arms 2 epochs, lr 2e-4, batch 2 x accum 2, gradient checkpointing,
+      then eval_graph_only.py per arm; R7E_EXIT. No separate memory test:
+      the backbone is frozen and r7 used about 7 GB with checkpointing

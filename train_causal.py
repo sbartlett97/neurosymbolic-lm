@@ -110,6 +110,10 @@ def parse_args(argv=None):
     model_group.add_argument("--max-input-length", type=int, default=None)
     model_group.add_argument("--max-output-length", type=int, default=None)
     model_group.add_argument("--no-gradient-checkpointing", action="store_true")
+    model_group.add_argument("--xattn-source", choices=["node", "adapter"], default=None,
+                             help="What the cross-attention reads: node features "
+                                  "(node_proj + GNN) or the adapter states at the "
+                                  "node positions")
     model_group.add_argument("--gradient-checkpointing", action="store_true",
                              help="Force it on (presets set their own default)")
 
@@ -118,7 +122,7 @@ def parse_args(argv=None):
                              choices=["pretrain", "chat", "both"])
     train_group.add_argument("--stages", type=str, nargs="+",
                              default=["symbolic", "decoder", "joint"],
-                             choices=["symbolic", "decoder", "joint"])
+                             choices=["symbolic", "decoder", "joint", "reader"])
     train_group.add_argument("--epochs", type=int, default=5)
     train_group.add_argument("--chat-epochs", type=int, default=3)
     train_group.add_argument("--batch-size", type=int, default=4,
@@ -165,6 +169,12 @@ def parse_args(argv=None):
                                 "heads, GNN, injector) and label maps start this "
                                 "run. The backbone comes from --preset, so a "
                                 "LoRA preset can reuse a stage_symbolic.pt")
+    out_group.add_argument("--init-full", action="store_true",
+                           help="With --init-from: also load the backbone weights "
+                                "(with LoRA), so the run starts from the whole model")
+    out_group.add_argument("--fresh-injection", action="store_true",
+                           help="With --init-from: do not load the injection "
+                                "weights (injector / cross-attention start fresh)")
     out_group.add_argument("--log-dir", type=str, default="runs")
     out_group.add_argument("--hub-repo", type=str, default=None,
                            help="Push stage checkpoints, the final model and the "
@@ -200,6 +210,8 @@ def build_model_config(args) -> CausalModelConfig:
         config.gradient_checkpointing = False
     if args.gradient_checkpointing:
         config.gradient_checkpointing = True
+    if args.xattn_source is not None:
+        config.xattn_source = args.xattn_source
     return config
 
 
@@ -399,6 +411,7 @@ def build_model(config: CausalModelConfig, backbone, tokenizer,
         injection=config.injection,
         xattn_every=config.xattn_every,
         xattn_heads=config.xattn_heads,
+        xattn_source=config.xattn_source,
         node_dropout=config.node_dropout,
         gradient_checkpointing=config.gradient_checkpointing,
         max_input_length=config.max_input_length,
@@ -444,7 +457,7 @@ def load_causal_checkpoint(path: str, device: str = "cpu"):
 BACKBONE_TRAINING_FIELDS = ("use_lora", "lora_r", "lora_alpha", "lora_dropout",
                             "gradient_checkpointing", "injection",
                             "injection_gate_init", "xattn_every", "xattn_heads",
-                            "node_dropout")
+                            "xattn_source", "node_dropout")
 
 
 def init_config(preset: CausalModelConfig, ckpt_config: Dict) -> CausalModelConfig:
@@ -473,21 +486,24 @@ def _final_norm(state: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
 INJECTION_PREFIXES = ("injector.", "xattn.")
 
 
-def load_init_weights(model: NeuroSymbolicCausalLM, ckpt: Dict) -> None:
-    """--init-from: load every weight except the backbone. If the checkpoint
-    used the other injection mode, its injection weights are skipped and
-    this model's injection modules keep their fresh init."""
+def load_init_weights(model: NeuroSymbolicCausalLM, ckpt: Dict,
+                      include_backbone: bool = False,
+                      fresh_injection: bool = False) -> None:
+    """--init-from: load every weight except the backbone (include_backbone:
+    the backbone too, with its LoRA). If the checkpoint used the other
+    injection mode, or fresh_injection is set, its injection weights are
+    skipped and this model's injection modules keep their fresh init."""
     ours = {k for k in model.state_dict() if k.startswith(INJECTION_PREFIXES)}
     theirs = {k for k in ckpt["model_state_dict"] if k.startswith(INJECTION_PREFIXES)}
-    same_injection = bool(ours & theirs)
-    state = {k: v for k, v in ckpt["model_state_dict"].items()
-             if not k.startswith("backbone.")
-             and (same_injection or not k.startswith(INJECTION_PREFIXES))}
-    own = {k for k in model.state_dict() if not k.startswith("backbone.")
-           and (same_injection or k not in ours)}
-    if not same_injection:
-        print(f"  Injection mode differs from the checkpoint: skipped {len(theirs)} "
-              f"of its tensors, {len(ours)} start fresh ({model.injection})")
+    load_injection = bool(ours & theirs) and not fresh_injection
+    skip = lambda k: ((k.startswith("backbone.") and not include_backbone)
+                      or (k.startswith(INJECTION_PREFIXES) and not load_injection))
+    state = {k: v for k, v in ckpt["model_state_dict"].items() if not skip(k)}
+    own = {k for k in model.state_dict() if not skip(k)}
+    if not load_injection:
+        why = "fresh injection" if fresh_injection else "Injection mode differs from the checkpoint"
+        print(f"  {why}: skipped {len(theirs)} of its tensors, {len(ours)} start "
+              f"fresh ({model.injection})")
     result = model.load_state_dict(state, strict=False)
     missing = [k for k in result.missing_keys if k in own]
     if missing or result.unexpected_keys:
@@ -497,7 +513,10 @@ def load_init_weights(model: NeuroSymbolicCausalLM, ckpt: Dict) -> None:
             f"--init-from: {len(missing)} missing, {len(result.unexpected_keys)} "
             "unexpected non-backbone keys. The checkpoint does not fit this model."
         )
-    print(f"  Loaded {len(state)} non-backbone tensors")
+    print(f"  Loaded {len(state)} tensors (backbone included)" if include_backbone
+          else f"  Loaded {len(state)} non-backbone tensors")
+    if include_backbone:
+        return
     # Stage 1 freezes the backbone, so a stage_symbolic.pt holds the base
     # weights. Heads trained on another backbone read different features.
     theirs = _final_norm(ckpt["model_state_dict"])
@@ -840,6 +859,8 @@ def main(argv=None):
 
     if args.resume and args.init_from:
         raise SystemExit("Use --resume or --init-from, not both")
+    if (args.init_full or args.fresh_injection) and not args.init_from:
+        raise SystemExit("--init-full and --fresh-injection need --init-from")
     resume_ckpt = None
     init_ckpt = None
     if args.init_from:
@@ -942,7 +963,8 @@ def main(argv=None):
         )
         del resume_ckpt
     if init_ckpt is not None:
-        load_init_weights(model, init_ckpt)
+        load_init_weights(model, init_ckpt, include_backbone=args.init_full,
+                          fresh_injection=args.fresh_injection)
         del init_ckpt
     model = model.to(args.device)
     total = sum(p.numel() for p in model.parameters())
@@ -1078,7 +1100,7 @@ def main(argv=None):
                 val_key="symbolic", symbolic_eval=True)
 
         decoder_ds = stage2_dataset if stage2_dataset is not None else train_dataset
-        if ("decoder" in args.stages or "joint" in args.stages):
+        if any(st in args.stages for st in ("decoder", "joint", "reader")):
             n_respond = sum(int(s.get("should_respond", 0)) for s in decoder_ds)
             print(f"\nResponse data: {n_respond}/{len(decoder_ds)} samples "
                   "with should_respond=1")
@@ -1088,6 +1110,16 @@ def main(argv=None):
                     "model would only learn to abstain. Pass --stage2-dataset "
                     "with hybrid QA data."
                 )
+
+        if "reader" in args.stages:
+            # Only the graph injection trains: the backbone (with LoRA), the
+            # adapter, heads and node path stay as they are. With graph-only
+            # rows the graph is then the only way to lower the loss
+            print("\nStage R: Reader (injection modules only)")
+            set_stage_trainable(model, symbolic=False, backbone=False, injector=True)
+            run("Reader", Stage3_Decoder_Trainer, decoder_ds,
+                include_responses=True, lr=args.lr, epochs=args.epochs,
+                val_key="response")
 
         if "decoder" in args.stages:
             print("\nStage 2: Response (heads frozen, injector + backbone)")

@@ -109,6 +109,7 @@ class NeuroSymbolicCausalLM(nn.Module):
         injection: str = "prefix",
         xattn_every: int = 2,
         xattn_heads: int = 8,
+        xattn_source: str = "node",
         node_dropout: float = 0.0,
         gradient_checkpointing: bool = False,
         max_input_length: int = 2048,
@@ -195,11 +196,18 @@ class NeuroSymbolicCausalLM(nn.Module):
                 node_dim, self.hidden_size, gate_init=injection_gate_init
             )
         elif injection == "xattn":
+            # What the cross-attention reads: the node features after
+            # node_proj + GNN ("node"), or the adapter states at the same
+            # node positions ("adapter", hidden_size wide; no node_proj)
+            if xattn_source not in ("node", "adapter"):
+                raise ValueError(f"xattn_source must be 'node' or 'adapter', not {xattn_source!r}")
+            self.xattn_source = xattn_source
+            kv_dim = node_dim if xattn_source == "node" else self.hidden_size
             # Layers from the tap on: they do not change the tapped states,
             # so the read pass needs no graph
             self.xattn_layer_ids = list(range(self.tap_layer, n_layers, xattn_every))
             self.xattn = nn.ModuleList(
-                NodeCrossAttention(self.hidden_size, node_dim, xattn_heads)
+                NodeCrossAttention(self.hidden_size, kv_dim, xattn_heads)
                 for _ in self.xattn_layer_ids
             )
             # Set by _write / _generate, read by the layer hooks. _write
@@ -338,6 +346,41 @@ class NeuroSymbolicCausalLM(nn.Module):
             pad = node_feats.new_zeros(B, self.max_nodes - k, self.node_dim)
             node_feats = torch.cat([node_feats, pad], dim=1)
         return node_feats
+
+    def _select_node_states(
+        self,
+        enc: torch.Tensor,
+        token_ent_logits: torch.Tensor,
+        attention_mask: torch.Tensor,
+        spans: Optional[List[List[Tuple[int, int]]]] = None,
+    ) -> torch.Tensor:
+        """The adapter states at the node positions of _extract_node_features
+        (span means or top-K tokens), before node_proj. Empty slots are 0.
+        Returns (B, max_nodes, hidden)."""
+        B, L, H = enc.shape
+        out = enc.new_zeros(B, self.max_nodes, H)
+        if spans is not None:
+            for i in range(B):
+                for j, (s, e) in enumerate((spans[i] if i < len(spans) else [])[: self.max_nodes]):
+                    if int(s) < 0:
+                        continue
+                    s = max(0, min(int(s), L - 1))
+                    e = max(s, min(int(e), L - 1))
+                    out[i, j] = enc[i, s:e + 1].mean(dim=0)
+            return out
+        ent_scores = entity_node_scores(token_ent_logits, attention_mask)
+        k = min(self.max_nodes, L)
+        _, topk_idx = torch.topk(ent_scores, k=k, dim=-1)
+        gathered = torch.gather(enc, 1, topk_idx.unsqueeze(-1).expand(-1, -1, H))
+        real = torch.gather(attention_mask, 1, topk_idx).unsqueeze(-1)
+        out[:, :k] = gathered * real.to(gathered.dtype)
+        return out
+
+    def _xattn_nodes(self, enc, token_ent_logits, mask, spans, node_feats_refined):
+        """The nodes the cross-attention reads (see xattn_source)."""
+        if self.injection == "xattn" and self.xattn_source == "adapter":
+            return self._select_node_states(enc, token_ent_logits, mask, spans)
+        return node_feats_refined
 
     def _compute_node_entity_probs(
         self,
@@ -530,7 +573,9 @@ class NeuroSymbolicCausalLM(nn.Module):
         }
 
         if y_ids is not None:
-            inject, inject_valid = node_feats_refined, node_valid
+            inject = self._xattn_nodes(enc, token_ent_logits, g_mask, spans,
+                                       node_feats_refined)
+            inject_valid = node_valid
             if self.shuffle_nodes:
                 inject, inject_valid = inject.roll(1, dims=0), inject_valid.roll(1, dims=0)
             outputs["logits"] = self._write(
@@ -598,7 +643,8 @@ class NeuroSymbolicCausalLM(nn.Module):
             # is right only if each step adds one cached position
             if kwargs.get("use_cache") is False:
                 raise ValueError("injection='xattn' generation needs use_cache=True")
-            self._xattn_ctx = {"nodes": node_feats_refined,
+            self._xattn_ctx = {"nodes": self._xattn_nodes(enc, token_ent_logits, g_mask,
+                                                           None, node_feats_refined),
                                "valid": node_feats.abs().sum(dim=-1) > 0,
                                "pos_mask": None}
         elif use_soft_nodes:

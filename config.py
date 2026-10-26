@@ -210,6 +210,9 @@ class CausalModelConfig:
     injection_gate_init: float = 0.1  # prefix only. xattn gates start at 0
     xattn_every: int = 2
     xattn_heads: int = 8
+    # What the cross-attention reads: "node" (node_proj + GNN features) or
+    # "adapter" (the adapter states at the node positions, hidden_size wide)
+    xattn_source: str = "node"
     # xattn only: the share of training samples that get no graph
     node_dropout: float = 0.0
 

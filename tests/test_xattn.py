@@ -234,3 +234,88 @@ def test_shuffle_nodes_swaps_only_the_injected_content(injection):
     # The heads still see each sample's own nodes
     assert torch.equal(right["rel_logits_matrix"], wrong["rel_logits_matrix"])
     assert torch.equal(right["node_feats"], wrong["node_feats"])
+
+
+# --- xattn_source="adapter" and the reader stage (Round 7 Step 1e) ---------
+
+def test_adapter_source_reads_the_wide_states():
+    model = make_model(xattn_source="adapter").eval()
+    assert model.xattn[0].kv.in_features == HIDDEN
+    ids, mask = prompts()
+    y = torch.randint(2, VOCAB, (2, 5))
+    with torch.no_grad():
+        on = model(ids, mask, y_ids=y)["logits"]
+        off = model(ids, mask, y_ids=y, use_soft_nodes=False)["logits"]
+    assert torch.equal(on, off)  # gate 0: exactly the backbone
+    model = make_model(xattn_source="adapter", gate=1.0).train()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.p = 0.0
+    out = model(ids, mask, y_ids=y)["logits"]
+    torch.nn.functional.cross_entropy(out.reshape(-1, VOCAB), y.reshape(-1)).backward()
+    # The LM loss reaches the cross-attention, not node_proj / GNN
+    assert model.xattn[0].kv.weight.grad.abs().sum() > 0
+    assert model.node_proj.weight.grad is None or model.node_proj.weight.grad.abs().sum() == 0
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in model.gnn.parameters())
+
+
+def test_adapter_source_generate_agrees_with_training_pass():
+    model = make_model(xattn_source="adapter", gate=1.0).eval()
+    ids, mask = prompts()
+    out = model.generate(ids, mask, max_length=4, do_sample=False, pad_token_id=0,
+                         eos_token_id=None, output_logits=True, return_dict_in_generate=True)
+    gen_logits = torch.stack(out.logits, dim=1)
+    with torch.no_grad():
+        logits = model(ids, mask, y_ids=out.sequences)["logits"]
+        node = make_model(gate=1.0).eval()(ids, mask, y_ids=out.sequences)["logits"]
+    assert torch.allclose(gen_logits, logits, atol=1e-4)
+    assert not torch.allclose(logits, node, atol=1e-3)
+
+
+@pytest.mark.parametrize("use_spans", [False, True])
+def test_node_states_sit_at_the_node_positions(use_spans):
+    """node_proj of the selected adapter states = the node features."""
+    model = make_model().eval()
+    ids, mask = prompts()
+    spans = [[(0, 1), (-1, -1), (3, 5)], [(2, 2)]] if use_spans else None
+    with torch.no_grad():
+        enc = model._read(ids, mask)
+        logits = model.token_ent(enc)
+        feats = model._extract_node_features(enc, logits, mask, spans)
+        states = model._select_node_states(enc, logits, mask, spans)
+        empty = states.abs().sum(-1, keepdim=True) == 0
+        projected = model.node_proj(states).masked_fill(empty, 0.0)
+    assert states.shape == (2, model.max_nodes, HIDDEN)
+    assert torch.allclose(projected, feats, atol=1e-6)
+    assert torch.equal(empty[..., 0], feats.abs().sum(-1) == 0)
+
+
+def test_init_full_and_fresh_injection(capsys):
+    import train_causal
+    trained = make_model(seed=1, gate=0.5)
+    with torch.no_grad():
+        for p in trained.backbone.parameters():
+            p.add_(0.01)
+    ckpt = {"model_state_dict": trained.state_dict()}
+    model = make_model(seed=2)
+    train_causal.load_init_weights(model, ckpt, include_backbone=True, fresh_injection=True)
+    assert "fresh injection" in capsys.readouterr().out
+    first = next(iter(trained.backbone.state_dict()))
+    assert torch.equal(model.backbone.state_dict()[first], trained.backbone.state_dict()[first])
+    assert torch.equal(model.node_proj.weight, trained.node_proj.weight)
+    assert all(float(g) == 0.0 for g in model.injection_gates())  # fresh
+    assert not torch.equal(model.xattn[0].q.weight, trained.xattn[0].q.weight)
+    # Default: no backbone, injection loaded (same mode)
+    model = make_model(seed=2)
+    train_causal.load_init_weights(model, ckpt)
+    assert not torch.equal(model.backbone.state_dict()[first], trained.backbone.state_dict()[first])
+    assert torch.equal(model.xattn[0].q.weight, trained.xattn[0].q.weight)
+
+
+def test_reader_stage_trains_only_the_cross_attention():
+    import train_causal
+    model = make_model(xattn_source="adapter")
+    model._backbone_trainable = {n for n, _ in model.backbone.named_parameters()}
+    train_causal.set_stage_trainable(model, symbolic=False, backbone=False, injector=True)
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert trainable and all(n.startswith("xattn.") for n in trainable)
