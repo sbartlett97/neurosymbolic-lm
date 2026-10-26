@@ -267,5 +267,5 @@ python train.py --preset testing --epochs 2 --debug
 
 ## License
 
-No license is chosen yet. Model weights trained from Qwen3 follow the base
-model's Apache 2.0 license.
+Apache License 2.0. See [LICENSE](LICENSE). Model weights trained from Qwen3
+also follow the base model's Apache 2.0 license.
