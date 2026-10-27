@@ -823,4 +823,36 @@ Build:
       question_text modes, two new contrasts. Tests: 1 new; suite 227
       pass. Old texts unchanged (20 rows, W = 2 and 8: 0 differences).
       Mean tokens (20 rows): lead and question equal node within 1 token
-- [ ] Full run on a pod (scratchpad r7/step4/baselines_w{2,4,8}_r7.json)
+- [x] Full run on pod zbbqs8sre2dwjk (RTX PRO 4000, cuda fp32), 11:37-12:20
+      GMT 2026-10-27. Pod deleted 12:21. Hub: qwen3-0.6b-r7/eval/
+      baselines_w{2,4,8}_r7.json, qwen3-0.6b-r7/logs/s4.log. node_text
+      gives the Step 3 numbers again at every W
+
+### Step 4 results (220 rows; 139 respond rows for loss, 138 for recall)
+| W | tokens | node loss (gap) | lead loss (gap) | question loss (gap) | krf node / lead / question |
+|---|---|---|---|---|---|
+| 2 | 62 | 1.719 (17%) | 2.135 (-10%) | 1.618 (24%) | 0.386 / 0.309 / 0.488 |
+| 4 | 86 | 1.456 (34%) | 1.638 (22%) | 1.156 (54%) | 0.471 / 0.443 / 0.599 |
+| 8 | 121 | 1.141 (55%) | 1.304 (44%) | 0.897 (71%) | 0.589 / 0.549 / 0.669 |
+
+Paired contrasts (mean [95% CI]):
+| W | loss node - lead | loss node - question | krf node - question |
+|---|---|---|---|
+| 2 | -0.416 [-0.707, -0.136] | +0.102 [-0.230, +0.413] | -0.102 [-0.194, -0.012] |
+| 4 | -0.182 [-0.425, +0.053] | +0.300 [+0.046, +0.565] | -0.129 [-0.220, -0.044] |
+| 8 | -0.164 [-0.400, +0.059] | +0.243 [+0.048, +0.450] | -0.080 [-0.147, -0.013] |
+
+Read-out against the pre-registered criteria:
+- node vs lead: the node selector is better only at W = 2. At W = 4 and
+  8 the CI holds 0
+- node vs question: a match at W = 2 on loss; question_text is
+  significantly better at W = 4 and 8. On key_recall_forced it is
+  better at every W
+- question_text is not significantly better at every W on loss, so the
+  last rule does not apply strictly. But at the useful lengths (W = 4, 8)
+  a simple question-overlap selector beats the node selector
+- Conclusion: the node selector is better than random windows, but it is
+  no better than the start of the passage at W >= 4. A selector that sees
+  the question wins. The entity scores mark entities, not relevance to
+  the question
+
