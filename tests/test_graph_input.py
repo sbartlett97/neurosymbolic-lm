@@ -266,11 +266,33 @@ def test_budget_text_stops_at_the_token_budget():
     assert budget_text(text, ranges, 0, 99, WordTokenizer()) == "one; five; eight"
 
 
+def test_lead_and_question_baselines_keep_the_budget():
+    from eval_graph_only import cut, question_sentences
+
+    class WordTokenizer:  # one token per word or punctuation mark
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": re.findall(r"\w+|[^\w\s]", text)}
+
+    tok = WordTokenizer()
+    text = "Ada was born in 1815. She wrote notes on the engine. Bob liked tea."
+    assert cut(text, 3, tok) == "Ada was born"
+    assert cut(text, 6, tok) == "Ada was born in 1815."
+    assert cut(text, 99, tok) == text
+    # "engine" and "notes" match the second sentence; stop words do not count
+    assert question_sentences(text, "What did the notes say about the engine?", 7, tok) == \
+        "She wrote notes on the engine."
+    # Two sentences, back in text order
+    assert question_sentences(text, "When was Ada born and what notes?", 13, tok) == \
+        "Ada was born in 1815. She wrote notes on the engine."
+    assert question_sentences(text, "engine?", 3, tok) == "She wrote notes"
+
+
 def test_text_modes_put_the_text_before_the_question():
     from eval_graph_only import TEXT_FIELDS, TEXT_MODES, mode_row
     row = {"text": "Who won?", "graph_text": "Ada won the prize.", "kind": "graph_only_respond",
            "entity_spans": [[0, 3]], "entities": ["Ada"], "node_text": "Ada; prize",
-           "partner_node_text": "Bob", "random_text": "the", "gold_text": "Ada"}
+           "partner_node_text": "Bob", "random_text": "the", "gold_text": "Ada",
+           "lead_text": "Ada won", "question_text": "Ada won the prize."}
     for mode in TEXT_MODES:
         new = mode_row(row, mode)
         assert new["text"] == row[TEXT_FIELDS[mode]] + "\n\nWho won?"

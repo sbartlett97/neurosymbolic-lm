@@ -797,3 +797,30 @@ Read-out against the pre-registered criteria:
   of the answer. The value is in the context around the entities, not in
   the entities alone. The r7 model never trained on this text format
 
+
+## Step 4: baselines of the same length (plan, 2026-10-27)
+Question: is the node selector better than a simple text compressor of
+the same length? Random windows are a weak control. Two new text modes
+get the token budget of node_text in each row:
+- lead_text: the start of the passage, in whole words
+- question_text: the passage sentences with the most question words (not
+  stop words), in passage order, cut to the budget. This baseline sees
+  the question; the node selector does not
+Run: r7 final, 220 graph-only val rows, cuda fp32, --force-answer, modes
+closed_book, passage, node_text, lead_text, question_text, W = 2, 4, 8.
+node_text must give the Step 3 numbers again (a check of the run).
+Read-out (set before the run), per window, on loss_topk:
+- node vs lead: the node selector beats the start of the passage if the
+  95% upper bound of node_text - lead_text is below 0
+- node vs question: the node selector beats question overlap if the upper
+  bound of node_text - question_text is below 0. It matches it if the CI
+  holds 0
+- If question_text is significantly better at every W, the selector must
+  see the question before it can serve as the selector for a knowledge
+  store
+Build:
+- [x] eval_graph_only.py: cut, question_sentences, lead_text and
+      question_text modes, two new contrasts. Tests: 1 new; suite 227
+      pass. Old texts unchanged (20 rows, W = 2 and 8: 0 differences).
+      Mean tokens (20 rows): lead and question equal node within 1 token
+- [ ] Full run on a pod (scratchpad r7/step4/baselines_w{2,4,8}_r7.json)

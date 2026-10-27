@@ -25,6 +25,12 @@ grows by W words on each side, so a mode shows the words in context.
 Node windows overlap more than random ones. So random_text then takes
 random positions until it has as many tokens as node_text (same budget).
 
+Two baselines (Step 4) get the token budget of node_text in each row:
+
+  lead_text      the start of the passage
+  question_text  the passage sentences with the most question words, in
+                 passage order (the node selector does not see the question)
+
 Respond rows: answer loss (mean token cross-entropy per row, teacher
 forcing), with top-K nodes and, in the graph modes, with gold-span nodes
 (the channel capacity); greedy generation scored by token F1 against the
@@ -49,17 +55,19 @@ import torch.nn.functional as F
 
 from data.chat_template import ChatTemplate
 from data.collator_causal import CausalCognitiveCollator
-from data.mix_stage2 import answer_key, words
+from data.mix_stage2 import SENTENCE, STOP, answer_key, words
 from train_causal import load_causal_checkpoint, to_device
 from model.entity import entity_node_scores
 from training.trainers import graph_kwargs
 
 MODES = ("closed_book", "graph", "graph_shuffled", "passage")
-TEXT_MODES = ("node_text", "node_text_shuffled", "random_text", "gold_text")
+TEXT_MODES = ("node_text", "node_text_shuffled", "random_text", "gold_text",
+              "lead_text", "question_text")
 ALL_MODES = MODES + TEXT_MODES
 # The row field that holds the text of each text mode (add_text_fields)
 TEXT_FIELDS = {"node_text": "node_text", "node_text_shuffled": "partner_node_text",
-               "random_text": "random_text", "gold_text": "gold_text"}
+               "random_text": "random_text", "gold_text": "gold_text",
+               "lead_text": "lead_text", "question_text": "question_text"}
 
 
 def mode_row(row: dict, mode: str) -> dict:
@@ -112,6 +120,35 @@ def budget_text(text: str, char_ranges, window: int, budget: int, tokenizer) -> 
     return word_spans(text, ranges[:lo])
 
 
+def cut(text: str, budget: int, tokenizer) -> str:
+    """The longest start of `text`, in whole words, with at most `budget`
+    tokens (at least one word)."""
+    ends = [m.end() for m in re.finditer(r"\S+", text)]
+    lo, hi = 1, len(ends)
+    while lo < hi:  # the most words that fit the budget
+        mid = (lo + hi + 1) // 2
+        if n_tokens(tokenizer, text[:ends[mid - 1]]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:ends[lo - 1]] if ends else ""
+
+
+def question_sentences(text: str, question: str, budget: int, tokenizer) -> str:
+    """The sentences of `text` with the most question words (not stop
+    words), in text order, cut to `budget` tokens. Ties go to the earlier
+    sentence."""
+    q = set(words(question)) - STOP
+    sents = [s.strip() for s in SENTENCE.findall(text) if s.strip()]
+    order = sorted(range(len(sents)), key=lambda i: (-len(q & set(words(sents[i]))), i))
+    chosen: List[int] = []
+    for i in order:
+        chosen.append(i)
+        if n_tokens(tokenizer, " ".join(sents[j] for j in sorted(chosen))) >= budget:
+            break
+    return cut(" ".join(sents[j] for j in sorted(chosen)), budget, tokenizer)
+
+
 def word_spans(text: str, char_ranges) -> str:
     """The whole words that hold the given character ranges, in text order.
     Adjacent words join into one phrase. Phrases are separated by "; ",
@@ -146,7 +183,8 @@ def add_text_fields(model, collator, rows: List[dict], device: str,
     """Adds the text of each text mode to each row (in place). The node
     positions come from the read pass over graph_text, tokenized as the
     collator tokenizes it. Each range grows by `window` words on each side;
-    with a window, random_text gets the token budget of node_text.
+    with a window, random_text gets the token budget of node_text. lead_text
+    and question_text always get it.
     Partners are the pairs of evaluate()."""
     rng = random.Random(seed)
     k = model.max_nodes
@@ -181,6 +219,9 @@ def add_text_fields(model, collator, rows: List[dict], device: str,
                                                r.get("entities", []))
                 if 0 <= s < e <= len(g) and g[s:e].strip().lower() == ent.strip().lower()]
         r["gold_text"] = word_spans(g, widen(g, gold, window))
+        budget = n_tokens(collator.tokenizer, r["node_text"])
+        r["lead_text"] = cut(g, budget, collator.tokenizer)
+        r["question_text"] = question_sentences(g, r["text"], budget, collator.tokenizer)
     for i in range(0, len(rows) - 1, 2):
         rows[i]["partner_node_text"] = rows[i + 1]["node_text"]
         rows[i + 1]["partner_node_text"] = rows[i]["node_text"]
@@ -370,6 +411,8 @@ TEXT_CONTRASTS = [(m, a, b, None) for m in ("loss_topk", "key_recall", "key_reca
                                ("node_text", "node_text_shuffled"),
                                ("node_text", "random_text"),
                                ("gold_text", "node_text"),
+                               ("node_text", "lead_text"),
+                               ("node_text", "question_text"),
                                ("passage", "node_text"))]
 
 
