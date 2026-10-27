@@ -757,4 +757,43 @@ Build:
       output. Tests: 2 new; suite 226 pass. Window 0 gives the Step 2 texts
       (20 rows, 0 differences)
 - [x] Smoke run (4 rows, W = 4, MPS fp32): all six modes run
-- [ ] Full run on a pod (scratchpad r7/step3/context_w{2,4,8}_r7.json)
+- [x] Full run on pod ksrb8yjbrkynle (RTX PRO 4000, cuda fp32), 09:46-10:36
+      GMT 2026-10-27. Pod deleted 10:37. Hub: qwen3-0.6b-r7/eval/
+      context_w{2,4,8}_r7.json, qwen3-0.6b-r7/logs/s3.log
+
+### Step 3 results (220 rows; 139 respond rows for loss, 138 for recall)
+Mean tokens (passage 401): node 62 / 86 / 121, random 65 / 90 / 128,
+gold 85 / 112 / 148 for W = 2 / 4 / 8. closed_book and passage as Step 2.
+
+| W | node tokens / passage | node_text loss (gap) | random_text loss (gap) | gold_text loss (gap) | node krf |
+|---|---|---|---|---|---|
+| 0 (Step 2) | 6% | 2.174 (-13%) | 2.693 (-47%) | 1.791 (12%) | 0.268 |
+| 2 | 15% | 1.719 (17%) | 2.276 (-19%) | 1.405 (38%) | 0.386 |
+| 4 | 21% | 1.456 (34%) | 1.818 (10%) | 1.151 (54%) | 0.471 |
+| 8 | 30% | 1.141 (55%) | 1.358 (41%) | 0.960 (67%) | 0.589 |
+
+Paired contrasts on loss_topk (mean [95% CI]):
+| W | node - closed_book | node - random (same budget) | gold - node |
+|---|---|---|---|
+| 2 | -0.259 [-0.535, +0.021] | -0.557 [-0.805, -0.347] | -0.314 [-0.498, -0.128] |
+| 4 | -0.522 [-0.796, -0.245] | -0.363 [-0.578, -0.161] | -0.305 [-0.529, -0.076] |
+| 8 | -0.837 [-1.092, -0.571] | -0.217 [-0.410, -0.034] | -0.181 [-0.401, +0.044] |
+key_recall_forced node - random: +0.137 / +0.091 / +0.078 (all lower
+bounds above 0). node_text_shuffled is far worse than closed_book at
+every W (loss 3.6-3.7), so it is no useful control.
+
+Read-out against the pre-registered criteria:
+- Context helps: fails at W = 2 (upper bound +0.021), passes at W = 4, 8
+- Selection matters: passes at every W. The advantage over random
+  windows gets smaller as W grows (-0.56, -0.36, -0.22), because random
+  windows then cover more of the passage
+- The interface works: passes at W = 8. node_text closes 55% of the gap
+  with 30% of the passage tokens. Random windows of the same length
+  close 41%
+- gold_text is better than node_text at W = 2 and 4. At W = 8 the
+  difference is not significant. The extractor is near the gold spans
+  when it gets enough context
+- Conclusion: the node positions plus local context carry a large part
+  of the answer. The value is in the context around the entities, not in
+  the entities alone. The r7 model never trained on this text format
+
