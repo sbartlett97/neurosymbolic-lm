@@ -911,3 +911,94 @@ Read-out against the pre-registered criteria:
   the start of the passage (Step 4), and it cannot use the question
   (Step 5). A useful selector needs a relevance objective: Round 8
 
+
+# Round 8: a question-aware relevance selector (plan, 2026-10-27)
+Goal: a selector that picks the passage text a question needs, so a
+companion knowledge store can give the LM short, relevant context.
+Why (Round 7): the entity head finds entities, and their context carries
+answer content. But it selects no better than the start of the passage,
+and it cannot use the question. question_text (sentences with the most
+question words) closes 54% / 71% of the loss gap at 86 / 121 tokens.
+BM25 over the passage sentences is a stronger word baseline (word
+weights). The bar is the better of the two.
+
+## Design
+- Frozen r7 model: backbone, LoRA and all heads stay as they are. Only a
+  new relevance head trains. The LM, its generation and general text do
+  not change
+- Unit: the sentence (as question_text), so the comparison is direct
+- Labels: answer sentences = sentence_spans of the passage where
+  holds_answer(sentence, answer_key(question, response)). Respond rows
+  only (graph_only_respond: passage in graph_text; respond: passage and
+  question in text, split at the last blank line). Rows with an empty
+  answer key are skipped (the question holds all answer words; then
+  holds_answer marks every sentence). Rows without an answer sentence are
+  skipped. Counts (checked):
+  | split | kind | rows | empty key | labelled | answer sentences/row | share of sentences |
+  |---|---|---|---|---|---|---|
+  | train | graph_only_respond | 6726 | 43 | 5409 | 1.06 | 11% |
+  | train | respond | 6755 | 28 | 5503 | 1.07 | 11% |
+  | val | graph_only_respond | 139 | 1 | 108 | 0.91 | 12% |
+  | val | respond | 146 | 1 | 121 | 1.01 | 10% |
+  No val passage is in train (0 of 409)
+- Two arms (the same loss, the same data):
+  - A, late interaction (main): read the passage alone once (the r7 read
+    pass, adapter states); token key = k_proj(state). Read the question
+    alone; token query = q_proj(state). Sentence score = MaxSim: for each
+    question token, the best query . key / sqrt(d) over the sentence
+    tokens; the mean over the question tokens. Passage keys need no
+    question, so a store computes them once. MaxSim keeps the token-level
+    matching that word overlap has (a mean-pooled query loses it)
+  - B, joint read: read "question + passage" once; a linear head on the
+    passage token states; sentence score = max over its tokens. One read
+    per question. B is the upper bound for a question-aware head on this
+    backbone (Step 5 showed the entity head cannot do this untrained)
+- Loss: multi-positive softmax over the sentences of a passage:
+  -log(sum over answer sentences of softmax(scores))
+- Selection at eval: rel_text = the sentences with the highest scores,
+  in passage order, cut to the budget (question_sentences with the head
+  in place of word overlap)
+
+## Gates (set before the runs)
+- Gate 0, data: label spot check (20 train rows, printed); no val passage
+  in train (hash of the passage text)
+- Gate 1, retrieval (no LM; val, 108 labelled graph-only rows): answer-
+  sentence recall within the budgets of 86 and 121 tokens, for A, B,
+  question overlap, BM25 and lead. An arm goes to Gate 2 if its paired
+  95% lower bound against the better word baseline is above -0.05
+- Gate 2, LM (the main read-out; eval_graph_only, 220 rows, cuda fp32,
+  --force-answer): modes closed_book, passage, question_text, bm25_text,
+  rel_a_text, rel_b_text, oracle_text. Budgets: node_text tokens at W = 4
+  and 8 (86 / 121), as Step 4. Each text is cut to the budget
+  - oracle_text: the gold answer sentences first, then the next
+    sentences by BM25 rank, to the budget (the same length as the others).
+    The ceiling of this unit
+  - Contrasts on all 139 respond rows (as Steps 2-5). A row without an
+    answer sentence gets the BM25 order in oracle_text. Also report the
+    108 labelled rows on their own
+  - Pass: the 95% upper bound of loss_topk rel - best word baseline < 0
+    at both budgets
+  - Arm A matches the best word baseline (CI holds 0): a partial pass. A
+    store with keys computed once is as good as word retrieval, and later
+    rounds can improve it
+  - Both arms worse than the best word baseline at both budgets: a
+    trained head on the r7 states does not beat word retrieval. Then stop
+    this line and use BM25 for the store
+
+## Build
+- [ ] data/relevance.py: answer-sentence labels for a row (with the empty
+      key guard); BM25 sentence ranking; coverage and the val/train
+      overlap check (Gate 0)
+- [ ] model/relevance.py: RelevanceHead with arm "late" (A) and "joint"
+      (B); the multi-positive sentence loss. The r7 model does not change
+- [ ] train_relevance.py: loads r7 frozen, trains one arm, saves the head;
+      Gate 1 metrics on val at the end of each epoch
+- [ ] eval_graph_only.py: --relevance-a / --relevance-b head checkpoints;
+      bm25_text, rel_a_text, rel_b_text, oracle_text modes; contrasts
+      against question_text and bm25_text
+- [ ] Tests: labels (incl. the empty key), BM25 order, the loss (one
+      positive and several), the late arm gives the same keys with any
+      question, selection keeps the budget
+- [ ] Smoke run locally (MPS fp32, 200 train rows, a few steps)
+- [ ] Pod run (RTX 4000 Ada if free): train A and B (about 1 h together),
+      Gate 1, then Gate 2 (about 30 min). About $0.50 at $0.28/hr
