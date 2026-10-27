@@ -883,4 +883,31 @@ Build:
 - [x] eval_graph_only.py: read_nodes (shared read pass), node_q_text
       mode, two new contrasts. Tests: node_q_text words come only from
       the passage; suite 227 pass
-- [ ] Full run on a pod (scratchpad r7/step5/question_first_w{4,8}_r7.json)
+- [x] Full run on pod x4h1vz3xpkckyu (RTX 4000 Ada, $0.28/hr, cuda fp32),
+      12:56-13:27 GMT 2026-10-27. Pod deleted 13:28. Hub: qwen3-0.6b-r7/
+      eval/question_first_w{4,8}_r7.json, qwen3-0.6b-r7/logs/s5.log.
+      node_text and question_text give the Step 4 numbers again
+
+### Step 5 results (220 rows; 139 respond rows for loss, 138 for recall)
+| W | tokens | node loss (gap) | node_q loss (gap) | question loss (gap) | krf node / node_q / question |
+|---|---|---|---|---|---|
+| 4 | 86 | 1.456 (34%) | 1.658 (21%) | 1.156 (54%) | 0.471 / 0.433 / 0.599 |
+| 8 | 121 | 1.141 (55%) | 1.312 (44%) | 0.897 (71%) | 0.589 / 0.550 / 0.669 |
+
+Paired contrasts (mean [95% CI]):
+| W | loss node_q - node | loss node_q - question | krf node_q - node |
+|---|---|---|---|
+| 4 | +0.202 [+0.077, +0.352] | +0.502 [+0.226, +0.782] | -0.038 [-0.079, +0.001] |
+| 8 | +0.171 [+0.051, +0.321] | +0.414 [+0.190, +0.645] | -0.039 [-0.081, -0.004] |
+
+Read-out against the pre-registered criteria:
+- The question helps the selector: fails at both W. The question makes
+  the selection significantly worse (loss +0.20 and +0.17)
+- node_q_text matches question overlap: fails at both W
+- So the entity head does not use the question. It scores how much a
+  token looks like an entity, and the question in front only adds noise
+- Round 7 conclusion: the symbolic branch finds entities, and their local
+  context carries answer content (Step 3). But it selects no better than
+  the start of the passage (Step 4), and it cannot use the question
+  (Step 5). A useful selector needs a relevance objective: Round 8
+
