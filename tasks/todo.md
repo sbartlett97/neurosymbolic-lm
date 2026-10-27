@@ -856,3 +856,31 @@ Read-out against the pre-registered criteria:
   the question wins. The entity scores mark entities, not relevance to
   the question
 
+
+## Step 5: question-first node selection (plan, 2026-10-27)
+Question: does the entity head select text that is relevant to the
+question when the read pass sees the question? In Step 4 the read pass
+saw only the passage. In a causal model, passage tokens see the question
+only if it comes first.
+- node_q_text: read pass over "question + passage"; the top-K nodes of
+  the passage tokens only; the same windows as node_text. No training
+- Local check (40 rows, W = 4): the old texts do not change; node_q 79.7
+  tokens, node 79.1, question 78.8; no row truncated (max_length 4096);
+  the text changes in 31 of 40 rows
+Run: r7 final, 220 graph-only val rows, cuda fp32, --force-answer, modes
+closed_book, passage, node_text, node_q_text, question_text, W = 4, 8
+(the useful lengths of Step 4). node_text and question_text must give
+the Step 4 numbers again.
+Read-out (set before the run), per window, on loss_topk:
+- The question helps the selector if the 95% upper bound of node_q_text -
+  node_text is below 0
+- node_q_text matches question overlap if the CI of node_q_text -
+  question_text holds 0 or is below 0
+- If node_q_text is not better than node_text at both W, the entity head
+  does not use the question. Then a selector needs a relevance objective
+  (a training round: Round 8)
+Build:
+- [x] eval_graph_only.py: read_nodes (shared read pass), node_q_text
+      mode, two new contrasts. Tests: node_q_text words come only from
+      the passage; suite 227 pass
+- [ ] Full run on a pod (scratchpad r7/step5/question_first_w{4,8}_r7.json)

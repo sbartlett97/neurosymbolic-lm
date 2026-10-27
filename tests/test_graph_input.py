@@ -292,7 +292,8 @@ def test_text_modes_put_the_text_before_the_question():
     row = {"text": "Who won?", "graph_text": "Ada won the prize.", "kind": "graph_only_respond",
            "entity_spans": [[0, 3]], "entities": ["Ada"], "node_text": "Ada; prize",
            "partner_node_text": "Bob", "random_text": "the", "gold_text": "Ada",
-           "lead_text": "Ada won", "question_text": "Ada won the prize."}
+           "lead_text": "Ada won", "question_text": "Ada won the prize.",
+           "node_q_text": "Ada; prize"}
     for mode in TEXT_MODES:
         new = mode_row(row, mode)
         assert new["text"] == row[TEXT_FIELDS[mode]] + "\n\nWho won?"
@@ -326,6 +327,12 @@ def test_add_text_fields_uses_the_top_k_node_words():
     assert rows[1]["gold_text"] == ""  # the span does not point at the entity there
     assert rows[0]["partner_node_text"] == rows[1]["node_text"]
     assert rows[1]["partner_node_text"] == rows[0]["node_text"]
+    # Question first: the node words come from the passage, never the question
+    q_rows = [{"text": "Zed Quux ?", "graph_text": d} for d in docs]
+    add_text_fields(model, collator, q_rows, "cpu")
+    for r, d in zip(q_rows, docs):
+        q_words = set(r["node_q_text"].replace(";", " ").split())
+        assert q_words and q_words <= set(d.split())
 
 
 def test_gap_closed_and_text_contrasts():

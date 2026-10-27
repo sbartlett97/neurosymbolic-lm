@@ -31,6 +31,10 @@ Two baselines (Step 4) get the token budget of node_text in each row:
   question_text  the passage sentences with the most question words, in
                  passage order (the node selector does not see the question)
 
+And one more node mode (Step 5): node_q_text takes the top-K nodes of the
+passage tokens from a read pass over "question + passage". In a causal
+model, the passage tokens then see the question.
+
 Respond rows: answer loss (mean token cross-entropy per row, teacher
 forcing), with top-K nodes and, in the graph modes, with gold-span nodes
 (the channel capacity); greedy generation scored by token F1 against the
@@ -62,12 +66,13 @@ from training.trainers import graph_kwargs
 
 MODES = ("closed_book", "graph", "graph_shuffled", "passage")
 TEXT_MODES = ("node_text", "node_text_shuffled", "random_text", "gold_text",
-              "lead_text", "question_text")
+              "lead_text", "question_text", "node_q_text")
 ALL_MODES = MODES + TEXT_MODES
 # The row field that holds the text of each text mode (add_text_fields)
 TEXT_FIELDS = {"node_text": "node_text", "node_text_shuffled": "partner_node_text",
                "random_text": "random_text", "gold_text": "gold_text",
-               "lead_text": "lead_text", "question_text": "question_text"}
+               "lead_text": "lead_text", "question_text": "question_text",
+               "node_q_text": "node_q_text"}
 
 
 def mode_row(row: dict, mode: str) -> dict:
@@ -178,33 +183,41 @@ def word_spans(text: str, char_ranges) -> str:
 
 
 @torch.no_grad()
+def read_nodes(model, collator, text: str, device: str):
+    """The entity node score and the character range of each token of
+    `text`, from one read pass, tokenized as the collator tokenizes it."""
+    tok, offsets = collator._tokenize_inputs([text])
+    ids = tok["input_ids"].to(device)
+    mask = tok["attention_mask"].to(device)
+    scores = entity_node_scores(model.token_ent(model._read(ids, mask)), mask)[0]
+    if offsets is None:  # a slow tokenizer: offsets without tensors
+        offsets = [collator.tokenizer(
+            text, truncation=True, max_length=collator.max_length,
+            return_offsets_mapping=True)["offset_mapping"]]
+    offs = [tuple(o) for o in (offsets[0].tolist() if torch.is_tensor(offsets)
+                               else offsets[0])]
+    if len(offs) != ids.shape[1]:
+        raise ValueError("offsets do not match the graph input ids")
+    return scores, offs
+
+
+@torch.no_grad()
 def add_text_fields(model, collator, rows: List[dict], device: str,
                     seed: int = 0, window: int = 0) -> None:
     """Adds the text of each text mode to each row (in place). The node
     positions come from the read pass over graph_text, tokenized as the
     collator tokenizes it. Each range grows by `window` words on each side;
     with a window, random_text gets the token budget of node_text. lead_text
-    and question_text always get it.
+    and question_text always get it. node_q_text reads "question + passage"
+    and takes its nodes from the passage tokens only.
     Partners are the pairs of evaluate()."""
     rng = random.Random(seed)
     k = model.max_nodes
     for r in rows:
-        tok, offsets = collator._tokenize_inputs([r["graph_text"]])
-        ids = tok["input_ids"].to(device)
-        mask = tok["attention_mask"].to(device)
-        enc = model._read(ids, mask)
-        scores = entity_node_scores(model.token_ent(enc), mask)[0]
-        top = torch.topk(scores, k=min(k, ids.shape[1])).indices.tolist()
-        if offsets is None:  # a slow tokenizer: offsets without tensors
-            offsets = [collator.tokenizer(
-                r["graph_text"], truncation=True, max_length=collator.max_length,
-                return_offsets_mapping=True)["offset_mapping"]]
-        offs = [tuple(o) for o in (offsets[0].tolist() if torch.is_tensor(offsets)
-                                   else offsets[0])]
-        if len(offs) != ids.shape[1]:
-            raise ValueError("offsets do not match the graph input ids")
-        real = [i for i, (a, b) in enumerate(offs) if b > a]
         g = r["graph_text"]
+        scores, offs = read_nodes(model, collator, g, device)
+        top = torch.topk(scores, k=min(k, len(offs))).indices.tolist()
+        real = [i for i, (a, b) in enumerate(offs) if b > a]
         r["node_text"] = word_spans(g, widen(g, [offs[i] for i in top], window))
         if window:
             r["random_text"] = budget_text(g, [offs[i] for i in rng.sample(real, len(real))],
@@ -222,6 +235,13 @@ def add_text_fields(model, collator, rows: List[dict], device: str,
         budget = n_tokens(collator.tokenizer, r["node_text"])
         r["lead_text"] = cut(g, budget, collator.tokenizer)
         r["question_text"] = question_sentences(g, r["text"], budget, collator.tokenizer)
+        # The same read pass with the question first; only passage tokens count
+        start = len(r["text"]) + 2
+        scores, offs = read_nodes(model, collator, r["text"] + "\n\n" + g, device)
+        passage = [i for i, (a, b) in enumerate(offs) if a >= start and b > a]
+        top = sorted(passage, key=lambda i: -float(scores[i]))[:k]
+        r["node_q_text"] = word_spans(g, widen(
+            g, [(offs[i][0] - start, offs[i][1] - start) for i in top], window))
     for i in range(0, len(rows) - 1, 2):
         rows[i]["partner_node_text"] = rows[i + 1]["node_text"]
         rows[i + 1]["partner_node_text"] = rows[i]["node_text"]
@@ -413,6 +433,8 @@ TEXT_CONTRASTS = [(m, a, b, None) for m in ("loss_topk", "key_recall", "key_reca
                                ("gold_text", "node_text"),
                                ("node_text", "lead_text"),
                                ("node_text", "question_text"),
+                               ("node_q_text", "node_text"),
+                               ("node_q_text", "question_text"),
                                ("passage", "node_text"))]
 
 
